@@ -95,7 +95,8 @@ impl Notebook {
 
     /// `language` as a label (`Python`).
     pub fn language_label(&self) -> Option<String> {
-        let mut chars = self.language()?.chars();
+        // From the file, so kept short.
+        let mut chars = self.language()?.chars().take(32);
         Some(chars.next().into_iter().flat_map(char::to_uppercase).chain(chars).collect())
     }
 

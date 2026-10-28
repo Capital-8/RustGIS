@@ -7324,6 +7324,12 @@ fn jupyter_python_notebooks_survive_open_and_save() {
     let bare = json!({"nbformat": 4, "cells": [{"cell_type": "code", "source": "map.goToXY {\"lon\": 9, \"lat\": 9}"}]});
     s.run("notebook.open", &json!({"text": bare.to_string()})).unwrap();
     assert_eq!(s.project.notebooks.last().unwrap().language(), Some("code"));
+    // A language from the file is kept short when shown.
+    let long = json!({"nbformat": 4, "metadata": {"kernelspec": {"language": "q".repeat(1000)}}, "cells": []});
+    s.run("notebook.open", &json!({"text": long.to_string()})).unwrap();
+    assert_eq!(s.project.notebooks.last().unwrap().language_label().map(|l| l.chars().count()), Some(32));
+    s.run("notebook.remove", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
+    s.run("notebook.activate", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
     assert_eq!(s.run("notebook.run", &Value::Null).unwrap()["skipped"], 1);
     s.run("notebook.remove", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
     s.run("notebook.activate", &json!({"notebook": nb.name.as_str()})).unwrap();

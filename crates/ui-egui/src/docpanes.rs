@@ -410,7 +410,12 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let waiting = app.docs.images.values().any(|e| matches!(e, NotebookImage::Waiting(_)));
     if waiting {
         let live: std::collections::HashSet<u64> = app.docs.image_keys.values().copied().collect();
+        let before = app.docs.images.len();
         app.docs.images.retain(|k, _| live.contains(k));
+        // The waiting images try the freed room on the next frame.
+        if app.docs.images.len() < before {
+            ui.ctx().request_repaint();
+        }
     }
     ui.horizontal(|ui| {
         let add = match &language {
@@ -454,7 +459,7 @@ fn cell_images(
             png.hash(&mut h);
             h.finish()
         });
-        let bytes = match docs.images.get(&key) {
+        let (bytes, png) = match docs.images.get(&key) {
             Some(NotebookImage::Shown(tex)) => {
                 out.push(tex.clone());
                 continue;
@@ -466,11 +471,12 @@ fn cell_images(
                     hidden += 1;
                     continue;
                 }
-                *bytes
+                (*bytes, png_bytes(png))
             }
             None => {
                 // The header gives the size, so an image that can't fit isn't decoded.
-                let Some((w, h)) = png_dimensions(png, max_side) else {
+                let png = png_bytes(png);
+                let Some((w, h)) = png.as_deref().and_then(|p| png_dimensions(p, max_side)) else {
                     docs.images.insert(key, NotebookImage::Unreadable);
                     continue;
                 };
@@ -481,10 +487,10 @@ fn cell_images(
                     hidden += 1;
                     continue;
                 }
-                bytes
+                (bytes, png)
             }
         };
-        let entry = match decode_png(png, max_side) {
+        let entry = match png.as_deref().and_then(|p| decode_png(p, max_side)) {
             Some(img) if img.width() * img.height() * 4 == bytes => {
                 let tex = ctx.load_texture("notebook_image", img, egui::TextureOptions::LINEAR);
                 out.push(tex.clone());
@@ -505,7 +511,7 @@ fn png_bytes(b64: &str) -> Option<Vec<u8>> {
 }
 
 /// A PNG reader that refuses images over `max_side` pixels a side (at most `MAX_IMAGE_SIDE`).
-fn png_reader(bytes: Vec<u8>, max_side: u32) -> image::ImageReader<std::io::Cursor<Vec<u8>>> {
+fn png_reader(bytes: &[u8], max_side: u32) -> image::ImageReader<std::io::Cursor<&[u8]>> {
     let max_side = max_side.min(MAX_IMAGE_SIDE);
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
     let mut limits = image::Limits::default();
@@ -516,16 +522,16 @@ fn png_reader(bytes: Vec<u8>, max_side: u32) -> image::ImageReader<std::io::Curs
     reader
 }
 
-/// The size a base64 PNG's header gives, if within `max_side` pixels a side; nothing is decoded.
-fn png_dimensions(b64: &str, max_side: u32) -> Option<(u32, u32)> {
-    let (w, h) = png_reader(png_bytes(b64)?, max_side).into_dimensions().ok()?;
+/// The size a PNG's header gives, if within `max_side` pixels a side; nothing is decoded.
+fn png_dimensions(png: &[u8], max_side: u32) -> Option<(u32, u32)> {
+    let (w, h) = png_reader(png, max_side).into_dimensions().ok()?;
     (w <= max_side.min(MAX_IMAGE_SIDE) && h <= max_side.min(MAX_IMAGE_SIDE)).then_some((w, h))
 }
 
-/// A base64 PNG from a notebook file (hostile input): `None` unless it decodes within
-/// `max_side` pixels a side (at most `MAX_IMAGE_SIDE`, and what the GPU takes).
-fn decode_png(b64: &str, max_side: u32) -> Option<egui::ColorImage> {
-    let img = png_reader(png_bytes(b64)?, max_side).decode().ok()?.to_rgba8();
+/// A PNG from a notebook file (hostile input): `None` unless it decodes within `max_side`
+/// pixels a side (at most `MAX_IMAGE_SIDE`, and what the GPU takes).
+fn decode_png(png: &[u8], max_side: u32) -> Option<egui::ColorImage> {
+    let img = png_reader(png, max_side).decode().ok()?.to_rgba8();
     let size = [img.width() as usize, img.height() as usize];
     Some(egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
 }
@@ -614,17 +620,19 @@ mod tests {
     fn notebook_images_decode_within_limits() {
         use base64::Engine;
         let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-        let small = decode_png(&format!("{}\n", b64(&png(1, 1))), MAX_IMAGE_SIDE).expect("a small PNG decodes, line break and all");
+        let decode = |b64: &str, side| png_bytes(b64).and_then(|p| decode_png(&p, side));
+        let dimensions = |b64: &str, side| png_bytes(b64).and_then(|p| png_dimensions(&p, side));
+        let small = decode(&format!("{}\n", b64(&png(1, 1))), MAX_IMAGE_SIDE).expect("a small PNG decodes, line break and all");
         assert_eq!(small.size, [1, 1]);
         // A header claiming a huge image is refused before anything that size is allocated.
-        assert!(decode_png(&b64(&png(100_000, 100_000)), MAX_IMAGE_SIDE).is_none());
+        assert!(decode(&b64(&png(100_000, 100_000)), MAX_IMAGE_SIDE).is_none());
         // Nor one over the GPU's largest texture.
-        assert!(decode_png(&b64(&png(1, 1)), 2048).is_some());
-        assert!(decode_png(&b64(&png(3000, 1)), 2048).is_none());
-        assert!(decode_png("not base64!", MAX_IMAGE_SIDE).is_none());
+        assert!(decode(&b64(&png(1, 1)), 2048).is_some());
+        assert!(decode(&b64(&png(3000, 1)), 2048).is_none());
+        assert!(decode("not base64!", MAX_IMAGE_SIDE).is_none());
         // The size is read from the header alone, and refused the same way.
-        assert_eq!(png_dimensions(&b64(&png(1, 1)), MAX_IMAGE_SIDE), Some((1, 1)));
-        assert_eq!(png_dimensions(&b64(&png(3000, 1)), 2048), None);
-        assert_eq!(png_dimensions(&b64(&png(100_000, 100_000)), MAX_IMAGE_SIDE), None);
+        assert_eq!(dimensions(&b64(&png(1, 1)), MAX_IMAGE_SIDE), Some((1, 1)));
+        assert_eq!(dimensions(&b64(&png(3000, 1)), 2048), None);
+        assert_eq!(dimensions(&b64(&png(100_000, 100_000)), MAX_IMAGE_SIDE), None);
     }
 }
