@@ -10,6 +10,15 @@ use crate::RustGisApp;
 use crate::theme::{Tokens, semibold};
 use rustgis_engine::cmd::notebook::{Cell, CellKind};
 
+/// A notebook cell's image output in the pane.
+pub enum NotebookImage {
+    Shown(egui::TextureHandle),
+    /// Not a PNG, or larger than the pane draws.
+    Unreadable,
+    /// Waiting for room in the image budget: its size as RGBA bytes.
+    Waiting(usize),
+}
+
 /// State of these panes.
 #[derive(Default)]
 pub struct DocState {
@@ -22,9 +31,8 @@ pub struct DocState {
     /// Cell text being edited, by (notebook, cell), with the cell text it started from: saved
     /// when the field loses focus, and dropped if the cell changed underneath (undo, a command).
     pub edits: HashMap<(usize, usize), (String, String)>,
-    /// Image outputs of notebook cells, decoded once, by a hash of their base64 PNG (`None`:
-    /// not a PNG, too large, or over the budget).
-    pub images: HashMap<u64, Option<egui::TextureHandle>>,
+    /// Image outputs of notebook cells, by a hash of their base64 PNG.
+    pub images: HashMap<u64, NotebookImage>,
     /// The hash of each (notebook, cell, image) at `image_revision`, so a payload is hashed once
     /// per change to the project rather than every frame.
     pub image_keys: HashMap<(usize, usize, usize), u64>,
@@ -417,10 +425,11 @@ fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usi
     if docs.image_revision != revision {
         docs.image_keys.clear();
         docs.image_revision = revision;
-        // Images refused for the budget get another try after each change.
-        docs.images.retain(|_, t| t.is_some());
     }
     let max_side = ctx.input(|i| i.max_texture_side).min(MAX_IMAGE_SIDE as usize) as u32;
+    let used = |docs: &DocState| -> usize {
+        docs.images.values().map(|e| if let NotebookImage::Shown(t) = e { t.size()[0] * t.size()[1] * 4 } else { 0 }).sum()
+    };
     let mut out = Vec::new();
     for (j, png) in cell.images().iter().enumerate() {
         let key = *docs.image_keys.entry((at.0, at.1, j)).or_insert_with(|| {
@@ -428,40 +437,80 @@ fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usi
             png.hash(&mut h);
             h.finish()
         });
-        if !docs.images.contains_key(&key) {
-            let img = decode_png(png, max_side);
-            let bytes = img.as_ref().map_or(0, |im| im.width() * im.height() * 4);
-            let used = |docs: &DocState| -> usize { docs.images.values().flatten().map(|t| t.size()[0] * t.size()[1] * 4).sum() };
-            if used(docs) + bytes > IMAGE_BUDGET {
-                // Images no longer in a notebook go first.
-                let live: std::collections::HashSet<u64> = docs.image_keys.values().copied().collect();
-                docs.images.retain(|k, _| live.contains(k));
+        let bytes = match docs.images.get(&key) {
+            Some(NotebookImage::Shown(tex)) => {
+                out.push(tex.clone());
+                continue;
             }
-            let fits = used(docs) + bytes <= IMAGE_BUDGET;
-            let tex = img.filter(|_| fits).map(|img| ctx.load_texture("notebook_image", img, egui::TextureOptions::LINEAR));
-            docs.images.insert(key, tex);
-        }
-        if let Some(Some(tex)) = docs.images.get(&key) {
-            out.push(tex.clone());
-        }
+            Some(NotebookImage::Unreadable) => continue,
+            // Retried once something else frees room.
+            Some(NotebookImage::Waiting(bytes)) => {
+                if used(docs) + bytes > IMAGE_BUDGET {
+                    continue;
+                }
+                *bytes
+            }
+            None => {
+                // The header gives the size, so an image that can't fit isn't decoded.
+                let Some((w, h)) = png_dimensions(png, max_side) else {
+                    docs.images.insert(key, NotebookImage::Unreadable);
+                    continue;
+                };
+                let bytes = w as usize * h as usize * 4;
+                if used(docs) + bytes > IMAGE_BUDGET {
+                    // Images no longer in a notebook go first.
+                    let live: std::collections::HashSet<u64> = docs.image_keys.values().copied().collect();
+                    docs.images.retain(|k, _| live.contains(k));
+                }
+                if used(docs) + bytes > IMAGE_BUDGET {
+                    docs.images.insert(key, NotebookImage::Waiting(bytes));
+                    continue;
+                }
+                bytes
+            }
+        };
+        let entry = match decode_png(png, max_side) {
+            Some(img) if img.width() * img.height() * 4 == bytes => {
+                let tex = ctx.load_texture("notebook_image", img, egui::TextureOptions::LINEAR);
+                out.push(tex.clone());
+                NotebookImage::Shown(tex)
+            }
+            _ => NotebookImage::Unreadable,
+        };
+        docs.images.insert(key, entry);
     }
     out
 }
 
-/// A base64 PNG from a notebook file (hostile input): `None` unless it decodes within
-/// `max_side` pixels a side (at most `MAX_IMAGE_SIDE`, and what the GPU takes).
-fn decode_png(b64: &str, max_side: u32) -> Option<egui::ColorImage> {
-    let max_side = max_side.min(MAX_IMAGE_SIDE);
+/// A base64 PNG from a notebook file (hostile input) as bytes.
+fn png_bytes(b64: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     let clean: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let bytes = base64::engine::general_purpose::STANDARD.decode(clean).ok()?;
+    base64::engine::general_purpose::STANDARD.decode(clean).ok()
+}
+
+/// A PNG reader that refuses images over `max_side` pixels a side (at most `MAX_IMAGE_SIDE`).
+fn png_reader(bytes: Vec<u8>, max_side: u32) -> image::ImageReader<std::io::Cursor<Vec<u8>>> {
+    let max_side = max_side.min(MAX_IMAGE_SIDE);
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(max_side);
     limits.max_image_height = Some(max_side);
     limits.max_alloc = Some(u64::from(max_side) * u64::from(max_side) * 8);
     reader.limits(limits);
-    let img = reader.decode().ok()?.to_rgba8();
+    reader
+}
+
+/// The size a base64 PNG's header gives, if within `max_side` pixels a side; nothing is decoded.
+fn png_dimensions(b64: &str, max_side: u32) -> Option<(u32, u32)> {
+    let (w, h) = png_reader(png_bytes(b64)?, max_side).into_dimensions().ok()?;
+    (w <= max_side.min(MAX_IMAGE_SIDE) && h <= max_side.min(MAX_IMAGE_SIDE)).then_some((w, h))
+}
+
+/// A base64 PNG from a notebook file (hostile input): `None` unless it decodes within
+/// `max_side` pixels a side (at most `MAX_IMAGE_SIDE`, and what the GPU takes).
+fn decode_png(b64: &str, max_side: u32) -> Option<egui::ColorImage> {
+    let img = png_reader(png_bytes(b64)?, max_side).decode().ok()?.to_rgba8();
     let size = [img.width() as usize, img.height() as usize];
     Some(egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
 }
@@ -558,5 +607,9 @@ mod tests {
         assert!(decode_png(&b64(&png(1, 1)), 2048).is_some());
         assert!(decode_png(&b64(&png(3000, 1)), 2048).is_none());
         assert!(decode_png("not base64!", MAX_IMAGE_SIDE).is_none());
+        // The size is read from the header alone, and refused the same way.
+        assert_eq!(png_dimensions(&b64(&png(1, 1)), MAX_IMAGE_SIDE), Some((1, 1)));
+        assert_eq!(png_dimensions(&b64(&png(3000, 1)), 2048), None);
+        assert_eq!(png_dimensions(&b64(&png(100_000, 100_000)), MAX_IMAGE_SIDE), None);
     }
 }

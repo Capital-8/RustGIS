@@ -27,7 +27,7 @@ rustgis-keychain = { path = "crates/keychain" }
 
 # foundation
 thiserror = "2"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 # float_roundtrip: projects must read back the exact coordinates they wrote, or source-edit
 # baselines (row hashes) see every reopened row as changed.
 serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
