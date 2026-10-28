@@ -7299,6 +7299,10 @@ fn jupyter_python_notebooks_survive_open_and_save() {
         assert_eq!(opened.cells[0].output.as_deref(), Some("2\nab"));
         s.run("notebook.remove", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
     }
+    // A notebook with more cells than RustGIS holds is refused rather than cut short.
+    let many = json!({"nbformat": 4, "cells": vec![json!({"cell_type": "markdown", "source": "x"}); 1001]});
+    let e = s.run("notebook.open", &json!({"text": many.to_string()})).unwrap_err();
+    assert!(e.contains("1001 cells"), "{e}");
     s.run("notebook.activate", &json!({"notebook": nb.name.as_str()})).unwrap();
     // Python cells aren't run as commands: running them all skips them, one alone says why.
     let r = s.run("notebook.run", &Value::Null).unwrap();

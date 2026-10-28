@@ -303,10 +303,7 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let Ok(i) = rustgis_engine::cmd::notebook::index(&app.session, &Value::Null) else { return };
     let names: Vec<String> = app.session.project.notebooks.iter().map(|r| r.name.clone()).collect();
     // A Python (or other language) notebook from Jupyter: its code cells are shown, not run.
-    let language = app.session.project.notebooks.get(i).and_then(|nb| nb.language()).map(|l| {
-        let mut chars = l.chars();
-        chars.next().into_iter().flat_map(char::to_uppercase).chain(chars).collect::<String>()
-    });
+    let language = app.session.project.notebooks.get(i).and_then(|nb| nb.language_label());
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt("nb_pick")
             .selected_text(names.get(i).map_or("", |s| s.as_str()))
@@ -420,7 +417,10 @@ fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usi
     if docs.image_revision != revision {
         docs.image_keys.clear();
         docs.image_revision = revision;
+        // Images refused for the budget get another try after each change.
+        docs.images.retain(|_, t| t.is_some());
     }
+    let max_side = ctx.input(|i| i.max_texture_side).min(MAX_IMAGE_SIDE as usize) as u32;
     let mut out = Vec::new();
     for (j, png) in cell.images().iter().enumerate() {
         let key = *docs.image_keys.entry((at.0, at.1, j)).or_insert_with(|| {
@@ -429,7 +429,7 @@ fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usi
             h.finish()
         });
         if !docs.images.contains_key(&key) {
-            let img = decode_png(png);
+            let img = decode_png(png, max_side);
             let bytes = img.as_ref().map_or(0, |im| im.width() * im.height() * 4);
             let used = |docs: &DocState| -> usize { docs.images.values().flatten().map(|t| t.size()[0] * t.size()[1] * 4).sum() };
             if used(docs) + bytes > IMAGE_BUDGET {
@@ -449,16 +449,17 @@ fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usi
 }
 
 /// A base64 PNG from a notebook file (hostile input): `None` unless it decodes within
-/// `MAX_IMAGE_SIDE` pixels a side.
-fn decode_png(b64: &str) -> Option<egui::ColorImage> {
+/// `max_side` pixels a side (at most `MAX_IMAGE_SIDE`, and what the GPU takes).
+fn decode_png(b64: &str, max_side: u32) -> Option<egui::ColorImage> {
+    let max_side = max_side.min(MAX_IMAGE_SIDE);
     use base64::Engine;
     let clean: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     let bytes = base64::engine::general_purpose::STANDARD.decode(clean).ok()?;
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_SIDE);
-    limits.max_image_height = Some(MAX_IMAGE_SIDE);
-    limits.max_alloc = Some(u64::from(MAX_IMAGE_SIDE) * u64::from(MAX_IMAGE_SIDE) * 8);
+    limits.max_image_width = Some(max_side);
+    limits.max_image_height = Some(max_side);
+    limits.max_alloc = Some(u64::from(max_side) * u64::from(max_side) * 8);
     reader.limits(limits);
     let img = reader.decode().ok()?.to_rgba8();
     let size = [img.width() as usize, img.height() as usize];
@@ -549,10 +550,13 @@ mod tests {
     fn notebook_images_decode_within_limits() {
         use base64::Engine;
         let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-        let small = decode_png(&format!("{}\n", b64(&png(1, 1)))).expect("a small PNG decodes, line break and all");
+        let small = decode_png(&format!("{}\n", b64(&png(1, 1))), MAX_IMAGE_SIDE).expect("a small PNG decodes, line break and all");
         assert_eq!(small.size, [1, 1]);
         // A header claiming a huge image is refused before anything that size is allocated.
-        assert!(decode_png(&b64(&png(100_000, 100_000))).is_none());
-        assert!(decode_png("not base64!").is_none());
+        assert!(decode_png(&b64(&png(100_000, 100_000)), MAX_IMAGE_SIDE).is_none());
+        // Nor one over the GPU's largest texture.
+        assert!(decode_png(&b64(&png(1, 1)), 2048).is_some());
+        assert!(decode_png(&b64(&png(3000, 1)), 2048).is_none());
+        assert!(decode_png("not base64!", MAX_IMAGE_SIDE).is_none());
     }
 }

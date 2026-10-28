@@ -89,6 +89,12 @@ impl Notebook {
         (!lang.eq_ignore_ascii_case("rustgis")).then_some(lang)
     }
 
+    /// `language` as a label (`Python`).
+    pub fn language_label(&self) -> Option<String> {
+        let mut chars = self.language()?.chars();
+        Some(chars.next().into_iter().flat_map(char::to_uppercase).chain(chars).collect())
+    }
+
     pub(crate) fn clamp(&mut self) {
         self.name = self.name.chars().take(200).collect();
         self.cells.truncate(MAX_CELLS);
@@ -285,10 +291,8 @@ fn run_cells(s: &mut Session, p: &Value) -> CmdResult {
             continue;
         }
         // Another language's cells (a Python notebook) are kept, not run as commands.
-        if let Some(lang) = s.project.notebooks.get(i).and_then(Notebook::language) {
+        if let Some(lang) = s.project.notebooks.get(i).and_then(Notebook::language_label) {
             if one {
-                let mut chars = lang.chars();
-                let lang: String = chars.next().into_iter().flat_map(char::to_uppercase).chain(chars).collect();
                 return Err(format!("this is a {lang} cell: RustGIS runs command cells only, so run it in Jupyter"));
             }
             skipped += 1;
@@ -436,7 +440,12 @@ fn parse(text: &str, fallback_name: &str) -> Result<Notebook, String> {
             j
         });
         let mut nb = Notebook { name, cells: Vec::new(), jupyter };
-        for c in v.get("cells").and_then(Value::as_array).into_iter().flatten().take(MAX_CELLS) {
+        let cells = v.get("cells").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+        // Dropping the extra cells would lose them on the next save.
+        if cells.len() > MAX_CELLS {
+            return Err(format!("this notebook has {} cells; RustGIS opens notebooks of up to {MAX_CELLS}", cells.len()));
+        }
+        for c in cells {
             let Some(fields) = c.as_object() else { continue };
             let kind = if c.get("cell_type").and_then(Value::as_str) == Some("code") { CellKind::Code } else { CellKind::Markdown };
             let mut cell = Cell::new(kind, &jupyter_text(c.get("source").unwrap_or(&Value::Null)));
