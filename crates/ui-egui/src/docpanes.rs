@@ -22,6 +22,8 @@ pub struct DocState {
     /// Cell text being edited, by (notebook, cell), with the cell text it started from: saved
     /// when the field loses focus, and dropped if the cell changed underneath (undo, a command).
     pub edits: HashMap<(usize, usize), (String, String)>,
+    /// Image outputs of notebook cells, decoded once, by their base64 PNG (`None`: not an image).
+    pub images: HashMap<String, Option<egui::TextureHandle>>,
     pub message: Option<(String, bool)>,
     /// The page whose fields are being edited, and their text and duration.
     pub editing: Option<(usize, usize)>,
@@ -316,6 +318,16 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let _ = app.run("ui.saveItem", json!({"kind": "notebook"}));
         }
     });
+    // A Python (or other language) notebook from Jupyter: its code cells are shown, not run.
+    let language = app.session.project.notebooks.get(i).and_then(|nb| nb.language()).map(|l| {
+        let mut chars = l.chars();
+        chars.next().into_iter().flat_map(char::to_uppercase).chain(chars).collect::<String>()
+    });
+    if let Some(lang) = &language {
+        let hint =
+            crate::i18n::fmt("{language} cells don't run here: open this notebook in Jupyter to run them.", &[("language", lang.as_str())]);
+        ui.label(egui::RichText::new(hint).small().color(t.text_dim));
+    }
     // One cell is copied at a time (the commands below need the app), not the whole notebook.
     let n = app.session.project.notebooks.get(i).map_or(0, |nb| nb.cells.len());
     for k in 0..n {
@@ -323,9 +335,13 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         egui::Frame::NONE.stroke(egui::Stroke::new(1.0, t.border)).corner_radius(4).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let kind = if cell.kind == CellKind::Code { tl!("Commands") } else { tl!("Text") };
+                let kind = match (cell.kind, &language) {
+                    (CellKind::Code, Some(lang)) => lang.clone(),
+                    (CellKind::Code, None) => tl!("Commands").to_string(),
+                    (CellKind::Markdown, _) => tl!("Text").to_string(),
+                };
                 ui.label(egui::RichText::new(kind).small().color(t.text_dim));
-                if cell.kind == CellKind::Code && ui.small_button(tl!("Run")).clicked() {
+                if cell.kind == CellKind::Code && language.is_none() && ui.small_button(tl!("Run")).clicked() {
                     // Save an edit in progress first.
                     if let Some((text, _)) = app.docs.edits.remove(&(i, k)) {
                         run(app, "notebook.editCell", json!({"notebook": i, "cell": k, "source": text}));
@@ -363,17 +379,50 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 let c = if cell.error { Color32::from_rgb(0xC0, 0x30, 0x30) } else { t.text_dim };
                 ui.label(egui::RichText::new(out.as_str()).small().monospace().color(c));
             }
+            for png in cell.images() {
+                cell_image(app, ui, png);
+            }
         });
         ui.add_space(4.0);
     }
     ui.horizontal(|ui| {
-        if ui.button(tl!("Add Commands")).clicked() {
+        let add = match &language {
+            Some(lang) => crate::i18n::fmt("Add {language}", &[("language", lang.as_str())]),
+            None => tl!("Add Commands").to_string(),
+        };
+        if ui.button(add).clicked() {
             run(app, "notebook.addCell", json!({"notebook": i, "kind": "code"}));
         }
         if ui.button(tl!("Add Text")).clicked() {
             run(app, "notebook.addCell", json!({"notebook": i, "kind": "markdown"}));
         }
     });
+}
+
+/// A cell's image output (base64 PNG), at most the pane's width.
+fn cell_image(app: &mut RustGisApp, ui: &mut Ui, png: String) {
+    if !app.docs.images.contains_key(&png) {
+        // Notebooks can hold many images; keep the cache from growing without end.
+        if app.docs.images.len() >= 64 {
+            app.docs.images.clear();
+        }
+        use base64::Engine;
+        let tex = base64::engine::general_purpose::STANDARD
+            .decode(png.as_bytes())
+            .ok()
+            .and_then(|bytes| image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).ok())
+            .map(|img| {
+                let img = img.to_rgba8();
+                let size = [img.width() as usize, img.height() as usize];
+                let img = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+                ui.ctx().load_texture("notebook_image", img, egui::TextureOptions::LINEAR)
+            });
+        app.docs.images.insert(png.clone(), tex);
+    }
+    let Some(Some(tex)) = app.docs.images.get(&png) else { return };
+    let size = tex.size_vec2();
+    let w = size.x.min(ui.available_width()).max(1.0);
+    ui.image((tex.id(), vec2(w, w * size.y / size.x.max(1.0))));
 }
 
 /// Shared items (Publish › Share As › Jobs) with their Manage tools, and the data stores.
