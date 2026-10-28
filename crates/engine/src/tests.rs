@@ -7316,6 +7316,8 @@ fn jupyter_python_notebooks_survive_open_and_save() {
     // Nor is a cell longer than RustGIS keeps.
     let long = json!({"nbformat": 4, "cells": [{"cell_type": "code", "source": "x".repeat(200_001)}]});
     assert!(s.run("notebook.open", &json!({"text": long.to_string()})).unwrap_err().contains("cell 1"));
+    let long = json!({"name": "Long", "cells": [{"kind": "code", "source": "x".repeat(200_001)}]});
+    assert!(s.run("notebook.open", &json!({"text": long.to_string()})).unwrap_err().contains("cell 1"));
     // A cell that removes an earlier one writes its result to itself, not to the cell that moved
     // into its place.
     s.run("notebook.new", &json!({"name": "Shift"})).unwrap();

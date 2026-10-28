@@ -488,6 +488,9 @@ fn parse(text: &str, fallback_name: &str) -> Result<Notebook, String> {
         return Err(format!("this notebook has {cells} cells; RustGIS opens notebooks of up to {MAX_CELLS}"));
     }
     let mut nb: Notebook = serde_json::from_value(v).map_err(|e| format!("not a RustGIS notebook: {e}"))?;
+    if let Some(n) = nb.cells.iter().position(|c| c.source.chars().nth(MAX_SOURCE).is_some()) {
+        return Err(format!("cell {} of this notebook is longer than {MAX_SOURCE} characters, the most RustGIS opens", n + 1));
+    }
     if nb.name.trim().is_empty() {
         nb.name = fallback_name.to_string();
     }

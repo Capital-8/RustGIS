@@ -624,6 +624,10 @@ mod tests {
     fn notebook_images_decode_within_limits() {
         use base64::Engine;
         let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        // A real 3000 x 1 image, so the side limit is what refuses it.
+        let mut wide = Vec::new();
+        image::RgbaImage::new(3000, 1).write_to(&mut std::io::Cursor::new(&mut wide), image::ImageFormat::Png).unwrap();
+        assert!(png_bytes(&b64(&wide)).and_then(|p| decode_png(&p, MAX_IMAGE_SIDE)).is_some());
         let decode = |b64: &str, side| png_bytes(b64).and_then(|p| decode_png(&p, side));
         let dimensions = |b64: &str, side| png_bytes(b64).and_then(|p| png_dimensions(&p, side));
         let small = decode(&format!("{}\n", b64(&png(1, 1))), MAX_IMAGE_SIDE).expect("a small PNG decodes, line break and all");
@@ -632,11 +636,11 @@ mod tests {
         assert!(decode(&b64(&png(100_000, 100_000)), MAX_IMAGE_SIDE).is_none());
         // Nor one over the GPU's largest texture.
         assert!(decode(&b64(&png(1, 1)), 2048).is_some());
-        assert!(decode(&b64(&png(3000, 1)), 2048).is_none());
+        assert!(decode(&b64(&wide), 2048).is_none());
         assert!(decode("not base64!", MAX_IMAGE_SIDE).is_none());
         // The size is read from the header alone, and refused the same way.
         assert_eq!(dimensions(&b64(&png(1, 1)), MAX_IMAGE_SIDE), Some((1, 1)));
-        assert_eq!(dimensions(&b64(&png(3000, 1)), 2048), None);
+        assert_eq!(dimensions(&b64(&wide), 2048), None);
         assert_eq!(dimensions(&b64(&png(100_000, 100_000)), MAX_IMAGE_SIDE), None);
     }
 }
