@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::RustGisApp;
 use crate::theme::{Tokens, semibold};
-use rustgis_engine::cmd::notebook::CellKind;
+use rustgis_engine::cmd::notebook::{Cell, CellKind};
 
 /// State of these panes.
 #[derive(Default)]
@@ -22,8 +22,13 @@ pub struct DocState {
     /// Cell text being edited, by (notebook, cell), with the cell text it started from: saved
     /// when the field loses focus, and dropped if the cell changed underneath (undo, a command).
     pub edits: HashMap<(usize, usize), (String, String)>,
-    /// Image outputs of notebook cells, decoded once, by their base64 PNG (`None`: not an image).
-    pub images: HashMap<String, Option<egui::TextureHandle>>,
+    /// Image outputs of notebook cells, decoded once, by a hash of their base64 PNG (`None`:
+    /// not a PNG, too large, or over the budget).
+    pub images: HashMap<u64, Option<egui::TextureHandle>>,
+    /// The hash of each (notebook, cell, image) at `image_revision`, so a payload is hashed once
+    /// per change to the project rather than every frame.
+    pub image_keys: HashMap<(usize, usize, usize), u64>,
+    pub image_revision: u64,
     pub message: Option<(String, bool)>,
     /// The page whose fields are being edited, and their text and duration.
     pub editing: Option<(usize, usize)>,
@@ -328,10 +333,14 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             crate::i18n::fmt("{language} cells don't run here: open this notebook in Jupyter to run them.", &[("language", lang.as_str())]);
         ui.label(egui::RichText::new(hint).small().color(t.text_dim));
     }
-    // One cell is copied at a time (the commands below need the app), not the whole notebook.
+    // One cell's shown fields are copied at a time (the commands below need the app), not the
+    // whole notebook, nor the cell's Jupyter fields, which can hold megabytes of outputs.
     let n = app.session.project.notebooks.get(i).map_or(0, |nb| nb.cells.len());
     for k in 0..n {
-        let Some(cell) = app.session.project.notebooks.get(i).and_then(|nb| nb.cells.get(k)).cloned() else { break };
+        let (session, docs) = (&app.session, &mut app.docs);
+        let Some(c) = session.project.notebooks.get(i).and_then(|nb| nb.cells.get(k)) else { break };
+        let images = cell_images(docs, ui.ctx(), session.revision, (i, k), c);
+        let cell = Cell { kind: c.kind, source: c.source.clone(), output: c.output.clone(), error: c.error, jupyter: None };
         egui::Frame::NONE.stroke(egui::Stroke::new(1.0, t.border)).corner_radius(4).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -379,8 +388,10 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 let c = if cell.error { Color32::from_rgb(0xC0, 0x30, 0x30) } else { t.text_dim };
                 ui.label(egui::RichText::new(out.as_str()).small().monospace().color(c));
             }
-            for png in cell.images() {
-                cell_image(app, ui, png);
+            for tex in images {
+                let size = tex.size_vec2();
+                let w = size.x.min(ui.available_width()).max(1.0);
+                ui.image((tex.id(), vec2(w, w * size.y / size.x.max(1.0))));
             }
         });
         ui.add_space(4.0);
@@ -399,30 +410,59 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     });
 }
 
-/// A cell's image output (base64 PNG), at most the pane's width.
-fn cell_image(app: &mut RustGisApp, ui: &mut Ui, png: String) {
-    if !app.docs.images.contains_key(&png) {
-        // Notebooks can hold many images; keep the cache from growing without end.
-        if app.docs.images.len() >= 64 {
-            app.docs.images.clear();
-        }
-        use base64::Engine;
-        let tex = base64::engine::general_purpose::STANDARD
-            .decode(png.as_bytes())
-            .ok()
-            .and_then(|bytes| image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).ok())
-            .map(|img| {
-                let img = img.to_rgba8();
-                let size = [img.width() as usize, img.height() as usize];
-                let img = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-                ui.ctx().load_texture("notebook_image", img, egui::TextureOptions::LINEAR)
-            });
-        app.docs.images.insert(png.clone(), tex);
+/// Longest side of a notebook image drawn, and the most image memory (RGBA) kept for them.
+const MAX_IMAGE_SIDE: u32 = 4096;
+const IMAGE_BUDGET: usize = 256 << 20;
+
+/// The textures of a cell's PNG outputs, decoded once and kept while the budget allows.
+fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usize, usize), cell: &Cell) -> Vec<egui::TextureHandle> {
+    use std::hash::{Hash, Hasher};
+    if docs.image_revision != revision {
+        docs.image_keys.clear();
+        docs.image_revision = revision;
     }
-    let Some(Some(tex)) = app.docs.images.get(&png) else { return };
-    let size = tex.size_vec2();
-    let w = size.x.min(ui.available_width()).max(1.0);
-    ui.image((tex.id(), vec2(w, w * size.y / size.x.max(1.0))));
+    let mut out = Vec::new();
+    for (j, png) in cell.images().iter().enumerate() {
+        let key = *docs.image_keys.entry((at.0, at.1, j)).or_insert_with(|| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            png.hash(&mut h);
+            h.finish()
+        });
+        if !docs.images.contains_key(&key) {
+            let img = decode_png(png);
+            let bytes = img.as_ref().map_or(0, |im| im.width() * im.height() * 4);
+            let used = |docs: &DocState| -> usize { docs.images.values().flatten().map(|t| t.size()[0] * t.size()[1] * 4).sum() };
+            if used(docs) + bytes > IMAGE_BUDGET {
+                // Images no longer in a notebook go first.
+                let live: std::collections::HashSet<u64> = docs.image_keys.values().copied().collect();
+                docs.images.retain(|k, _| live.contains(k));
+            }
+            let fits = used(docs) + bytes <= IMAGE_BUDGET;
+            let tex = img.filter(|_| fits).map(|img| ctx.load_texture("notebook_image", img, egui::TextureOptions::LINEAR));
+            docs.images.insert(key, tex);
+        }
+        if let Some(Some(tex)) = docs.images.get(&key) {
+            out.push(tex.clone());
+        }
+    }
+    out
+}
+
+/// A base64 PNG from a notebook file (hostile input): `None` unless it decodes within
+/// `MAX_IMAGE_SIDE` pixels a side.
+fn decode_png(b64: &str) -> Option<egui::ColorImage> {
+    use base64::Engine;
+    let clean: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(clean).ok()?;
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    limits.max_alloc = Some(u64::from(MAX_IMAGE_SIDE) * u64::from(MAX_IMAGE_SIDE) * 8);
+    reader.limits(limits);
+    let img = reader.decode().ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
 }
 
 /// Shared items (Publish › Share As › Jobs) with their Manage tools, and the data stores.
@@ -486,4 +526,33 @@ pub fn shares(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             run(app, "share.upload", json!({"path": f.display().to_string()}));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::RgbaImage::new(1, 1).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+        // Rewrite the header's size, and its checksum, so only the size is wrong.
+        bytes[16..20].copy_from_slice(&w.to_be_bytes());
+        bytes[20..24].copy_from_slice(&h.to_be_bytes());
+        let crc = !bytes[12..29]
+            .iter()
+            .fold(!0u32, |c, &b| (0..8).fold(c ^ u32::from(b), |c, _| (c >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(c & 1))));
+        bytes[29..33].copy_from_slice(&crc.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn notebook_images_decode_within_limits() {
+        use base64::Engine;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let small = decode_png(&format!("{}\n", b64(&png(1, 1)))).expect("a small PNG decodes, line break and all");
+        assert_eq!(small.size, [1, 1]);
+        // A header claiming a huge image is refused before anything that size is allocated.
+        assert!(decode_png(&b64(&png(100_000, 100_000))).is_none());
+        assert!(decode_png("not base64!").is_none());
+    }
 }

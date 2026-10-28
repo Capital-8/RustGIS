@@ -59,15 +59,19 @@ impl Cell {
         Cell { kind, source: source.chars().take(MAX_SOURCE).collect(), output: None, error: false, jupyter: None }
     }
 
-    /// The PNG images (base64) among the cell's Jupyter outputs.
-    pub fn images(&self) -> Vec<String> {
+    /// The PNG images (base64, possibly with line breaks) among the cell's Jupyter outputs,
+    /// borrowed where the file has them as one string.
+    pub fn images(&self) -> Vec<std::borrow::Cow<'_, str>> {
         let outputs = self.jupyter.as_ref().and_then(|j| j.get("outputs")).and_then(Value::as_array);
         outputs
             .into_iter()
             .flatten()
             .filter_map(|o| o.get("data").and_then(|d| d.get("image/png")))
-            .map(|png| jupyter_text(png).split_whitespace().collect::<String>())
-            .filter(|png| !png.is_empty())
+            .map(|png| match png {
+                Value::String(t) => std::borrow::Cow::Borrowed(t.as_str()),
+                other => std::borrow::Cow::Owned(jupyter_text(other)),
+            })
+            .filter(|png| !png.trim().is_empty())
             .collect()
     }
 }
@@ -77,13 +81,12 @@ impl Notebook {
     /// from its kernel; `None` for command notebooks.
     pub fn language(&self) -> Option<&str> {
         let meta = self.jupyter.as_ref()?.get("metadata")?;
-        let lang = meta
-            .get("kernelspec")
-            .and_then(|k| k.get("language"))
-            .and_then(Value::as_str)
-            .or_else(|| meta.get("language_info").and_then(|l| l.get("name")).and_then(Value::as_str))?
-            .trim();
-        (!lang.is_empty() && !lang.eq_ignore_ascii_case("rustgis")).then_some(lang)
+        let field = |a: &str, b: &str| meta.get(a).and_then(|v| v.get(b)).and_then(Value::as_str).map(str::trim).filter(|l| !l.is_empty());
+        // The kernel's language, else the language info's, else the kernel's name (`python3`).
+        let lang = field("kernelspec", "language")
+            .or_else(|| field("language_info", "name"))
+            .or_else(|| field("kernelspec", "name").map(|n| if n.to_ascii_lowercase().starts_with("python") { "python" } else { n }))?;
+        (!lang.eq_ignore_ascii_case("rustgis")).then_some(lang)
     }
 
     pub(crate) fn clamp(&mut self) {
@@ -382,13 +385,13 @@ fn strip_ansi(text: &str) -> String {
 fn jupyter_outputs(outputs: &[Value]) -> (String, bool) {
     let mut text = String::new();
     let mut error = false;
+    let mut after_stream = false;
     for o in outputs {
+        let stream = o.get("output_type").and_then(Value::as_str) == Some("stream");
         let piece = match o.get("output_type").and_then(Value::as_str) {
             Some("stream") => {
                 error |= o.get("name").and_then(Value::as_str) == Some("stderr");
-                // Streams carry on where the last one stopped.
-                text.push_str(&jupyter_text(o.get("text").unwrap_or(&Value::Null)));
-                continue;
+                jupyter_text(o.get("text").unwrap_or(&Value::Null))
             }
             Some("execute_result" | "display_data") => {
                 jupyter_text(o.get("data").and_then(|d| d.get("text/plain")).unwrap_or(&Value::Null))
@@ -409,10 +412,12 @@ fn jupyter_outputs(outputs: &[Value]) -> (String, bool) {
         if piece.is_empty() {
             continue;
         }
-        if !text.is_empty() && !text.ends_with('\n') {
+        // Streams carry on where the last stream stopped; anything else starts a line.
+        if !text.is_empty() && !text.ends_with('\n') && !(stream && after_stream) {
             text.push('\n');
         }
         text.push_str(&piece);
+        after_stream = stream;
     }
     (text, error)
 }

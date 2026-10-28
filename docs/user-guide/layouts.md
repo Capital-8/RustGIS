@@ -289,7 +289,7 @@ pane (at least 320 points where the window allows); drag its edge to give the no
 map more room.
 The cells of a RustGIS notebook contain RustGIS commands, not Python, even in an `.ipynb` file.
 A Jupyter notebook in another language, such as Python, opens with its cells and outputs (text,
-results, errors and images) but its code cells don't run here; saving it as `.ipynb` keeps its
+results, errors and PNG images) but its code cells don't run here; saving it as `.ipynb` keeps its
 kernel, metadata, cell ids and outputs, so it still opens and runs in Jupyter. Notebooks opened
 from a file or an existing project cannot run commands that read or write files or run other
 scripts.

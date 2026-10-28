@@ -7283,6 +7283,23 @@ fn jupyter_python_notebooks_survive_open_and_save() {
     assert_eq!(nb.cells[1].images(), vec![png]);
     let err = nb.cells[2].output.as_deref().unwrap_or_default();
     assert!(nb.cells[2].error && err.contains("ZeroDivisionError: division by zero") && !err.contains('\u{1b}'), "{err:?}");
+    // A stream after a result starts its own line; consecutive streams join.
+    let outputs = json!([
+        {"output_type": "execute_result", "data": {"text/plain": "2"}},
+        {"output_type": "stream", "name": "stdout", "text": "a"},
+        {"output_type": "stream", "name": "stdout", "text": "b"}
+    ]);
+    // A kernel known only by its name, or with a blank language, is still Python.
+    for meta in [json!({"kernelspec": {"name": "python3"}}), json!({"kernelspec": {"language": " "}, "language_info": {"name": "python"}})]
+    {
+        let text = json!({"nbformat": 4, "metadata": meta, "cells": [{"cell_type": "code", "source": "x", "outputs": outputs}]});
+        s.run("notebook.open", &json!({"text": text.to_string()})).unwrap();
+        let opened = s.project.notebooks.last().unwrap();
+        assert_eq!(opened.language(), Some("python"), "{meta}");
+        assert_eq!(opened.cells[0].output.as_deref(), Some("2\nab"));
+        s.run("notebook.remove", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
+    }
+    s.run("notebook.activate", &json!({"notebook": nb.name.as_str()})).unwrap();
     // Python cells aren't run as commands: running them all skips them, one alone says why.
     let r = s.run("notebook.run", &Value::Null).unwrap();
     assert_eq!(r["ran"], 0);
