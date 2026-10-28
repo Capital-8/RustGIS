@@ -466,7 +466,8 @@ fn parse(text: &str, fallback_name: &str) -> Result<Notebook, String> {
             return Err(format!("cell {} of this notebook is longer than {MAX_SOURCE} characters, the most RustGIS opens", n + 1));
         }
         for c in cells {
-            let Some(fields) = c.as_object() else { continue };
+            // Skipping a cell that isn't an object would lose it on the next save.
+            let Some(fields) = c.as_object() else { return Err("a cell of this notebook isn't a JSON object".into()) };
             let kind = if c.get("cell_type").and_then(Value::as_str) == Some("code") { CellKind::Code } else { CellKind::Markdown };
             let mut cell = Cell::new(kind, &jupyter_text(c.get("source").unwrap_or(&Value::Null)));
             let outputs = c.get("outputs").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
