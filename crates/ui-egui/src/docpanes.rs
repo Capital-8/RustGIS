@@ -297,6 +297,11 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     }
     let Ok(i) = rustgis_engine::cmd::notebook::index(&app.session, &Value::Null) else { return };
     let names: Vec<String> = app.session.project.notebooks.iter().map(|r| r.name.clone()).collect();
+    // A Python (or other language) notebook from Jupyter: its code cells are shown, not run.
+    let language = app.session.project.notebooks.get(i).and_then(|nb| nb.language()).map(|l| {
+        let mut chars = l.chars();
+        chars.next().into_iter().flat_map(char::to_uppercase).chain(chars).collect::<String>()
+    });
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt("nb_pick")
             .selected_text(names.get(i).map_or("", |s| s.as_str()))
@@ -310,18 +315,13 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             })
             .response
             .on_hover_text(tl!("Notebook"));
-        if ui.small_button(tl!("Run All")).clicked() {
+        if language.is_none() && ui.small_button(tl!("Run All")).clicked() {
             run(app, "notebook.run", json!({"notebook": i}));
             app.map.invalidate();
         }
         if ui.small_button(tl!("Save As…")).clicked() {
             let _ = app.run("ui.saveItem", json!({"kind": "notebook"}));
         }
-    });
-    // A Python (or other language) notebook from Jupyter: its code cells are shown, not run.
-    let language = app.session.project.notebooks.get(i).and_then(|nb| nb.language()).map(|l| {
-        let mut chars = l.chars();
-        chars.next().into_iter().flat_map(char::to_uppercase).chain(chars).collect::<String>()
     });
     if let Some(lang) = &language {
         let hint =
