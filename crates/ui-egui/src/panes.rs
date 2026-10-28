@@ -24,6 +24,9 @@ use crate::{LayersView, LeftPane, RightPane, RustGisApp, icons};
 
 /// The map's narrowest width beside a right pane dragged wide.
 const MIN_MAP_WIDTH: f32 = 320.0;
+/// How wide a right pane can always be dragged, as far as the window has room, even where that
+/// leaves the map less than `MIN_MAP_WIDTH`.
+const RIGHT_PANE_MAX: f32 = 640.0;
 
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
@@ -74,9 +77,9 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     if let Some(right) = app.ui.right {
         // The pane can take all the room right of the left pane but the map's minimum, so a
         // notebook or a table can be read side by side with the map (#1056). Where that is less
-        // than the 640 points a pane could always take, it keeps those 640 (as far as they fit).
+        // than `RIGHT_PANE_MAX`, the pane keeps that much (as far as it fits), as it always could.
         let room = ui.available_width();
-        let max = (room - MIN_MAP_WIDTH).max(640.0_f32.min(room)).max(260.0);
+        let max = (room - MIN_MAP_WIDTH).max(RIGHT_PANE_MAX.min(room)).max(260.0);
         // The Web Data pane's searches and lists want room, and the Notebook opens on half of
         // it, beside the map: each keeps its own width.
         let (id, width) = match right {

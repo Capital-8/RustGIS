@@ -74,7 +74,9 @@ fn a_right_pane_drags_past_640_and_leaves_the_map_room() {
     assert!((room - room_after).abs() < 0.5);
     assert!(room - pane.width() >= 320.0 - 1.0, "the map was left {} of {room}", room - pane.width());
 
+    // Other panes still open at their own width.
     let mut h = window("ui.pane.history");
+    assert!((rects(&h).0.width() - 320.0).abs() < 2.0, "the History pane opened {} wide", rects(&h).0.width());
     drag_edge(&mut h, 600.0);
     let (pane, _) = rects(&h);
     assert!(pane.width() > 700.0, "the History pane stopped at {} wide", pane.width());
