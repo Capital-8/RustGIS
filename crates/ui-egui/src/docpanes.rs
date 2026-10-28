@@ -37,6 +37,10 @@ pub struct DocState {
     /// per change to the project rather than every frame.
     pub image_keys: HashMap<(usize, usize, usize), u64>,
     pub image_revision: u64,
+    /// The revision whose unused textures were last dropped.
+    pub image_pruned: u64,
+    /// Keys the image hashes per run, so a notebook can't make two images collide on purpose.
+    pub image_hasher: std::collections::hash_map::RandomState,
     pub message: Option<(String, bool)>,
     /// The page whose fields are being edited, and their text and duration.
     pub editing: Option<(usize, usize)>,
@@ -405,10 +409,12 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         });
         ui.add_space(4.0);
     }
-    // Every cell has now named its images: drop the textures of images no longer in the
-    // notebook, so waiting ones get their room.
+    // Every cell has now named its images: after a change, or when some wait for room, drop the
+    // textures of images not in this notebook (a closed one's, or another's: they decode again
+    // when shown).
     let waiting = app.docs.images.values().any(|e| matches!(e, NotebookImage::Waiting(_)));
-    if waiting {
+    if waiting || app.docs.image_pruned != app.session.revision {
+        app.docs.image_pruned = app.session.revision;
         let live: std::collections::HashSet<u64> = app.docs.image_keys.values().copied().collect();
         let before = app.docs.images.len();
         app.docs.images.retain(|k, _| live.contains(k));
@@ -443,7 +449,7 @@ fn cell_images(
     at: (usize, usize),
     cell: &Cell,
 ) -> (Vec<egui::TextureHandle>, usize) {
-    use std::hash::{Hash, Hasher};
+    use std::hash::BuildHasher;
     if docs.image_revision != revision {
         docs.image_keys.clear();
         docs.image_revision = revision;
@@ -454,11 +460,7 @@ fn cell_images(
     };
     let (mut out, mut hidden) = (Vec::new(), 0);
     for (j, png) in cell.images().iter().enumerate() {
-        let key = *docs.image_keys.entry((at.0, at.1, j)).or_insert_with(|| {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            png.hash(&mut h);
-            h.finish()
-        });
+        let key = *docs.image_keys.entry((at.0, at.1, j)).or_insert_with(|| docs.image_hasher.hash_one(png.as_ref()));
         let (bytes, png) = match docs.images.get(&key) {
             Some(NotebookImage::Shown(tex)) => {
                 out.push(tex.clone());

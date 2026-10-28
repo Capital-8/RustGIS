@@ -288,9 +288,10 @@ either format. The Notebook pane opens beside the map, on half of the room right
 pane (at least 320 points where the window allows); drag its edge to give the notebook or the
 map more room.
 The cells of a RustGIS notebook contain RustGIS commands, not Python, even in an `.ipynb` file.
-A Jupyter notebook in another language, such as Python, or that names no language, opens with its cells and outputs (text,
-results, errors and PNG images) but its code cells don't run here; saving it as `.ipynb` keeps its
-kernel, metadata, cell ids and outputs, so it still opens and runs in Jupyter. A notebook holds up
-to 1,000 cells; a larger one is refused rather than opened in part. Notebooks opened
-from a file or an existing project cannot run commands that read or write files or run other
-scripts.
+A Jupyter notebook in another language, such as Python, or one that names no language, opens with
+its cells and outputs (text, results, errors and PNG images) but its code cells don't run here;
+saving it as `.ipynb` keeps its kernel, metadata, cell ids and outputs, so it still opens and runs
+in Jupyter. RustGIS marks the `.ipynb` files it saves with the `rustgis` language, so their command
+cells run when opened again. A notebook holds up to 1,000 cells of up to 200,000 characters each;
+a larger one is refused rather than opened in part. Notebooks opened from a file or an existing
+project cannot run commands that read or write files or run other scripts.

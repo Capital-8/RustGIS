@@ -365,7 +365,7 @@ fn untrusted_line(script: &str) -> Option<usize> {
 }
 
 /// Text of a Jupyter field: a string or a list of lines.
-pub fn jupyter_text(v: &Value) -> String {
+pub(crate) fn jupyter_text(v: &Value) -> String {
     match v {
         Value::String(t) => t.clone(),
         Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
