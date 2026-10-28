@@ -330,10 +330,13 @@ fn run_cells(s: &mut Session, p: &Value) -> CmdResult {
             }
             Err(e) => e,
         };
-        // Only into the cell that ran: a command that removed an earlier cell moved it.
-        if let Some(c) =
-            find(s).and_then(|i| s.project.notebooks.get_mut(i)).and_then(|nb| nb.cells.get_mut(k)).filter(|c| c.source == script)
-        {
+        // Into the cell that ran, which a command removing or adding cells may have moved: the
+        // cell with its source nearest to where it was.
+        let ran_cell = find(s).and_then(|i| s.project.notebooks.get_mut(i)).and_then(|nb| {
+            let at = nb.cells.iter().enumerate().filter(|(_, c)| c.source == script).min_by_key(|(n, _)| n.abs_diff(k))?.0;
+            nb.cells.get_mut(at)
+        });
+        if let Some(c) = ran_cell {
             c.output = Some(text.chars().take(MAX_OUTPUT).collect());
             c.error = failed;
             // The Jupyter outputs are from an earlier run; this one's output replaces them.
@@ -437,6 +440,10 @@ fn jupyter_outputs(outputs: &[Value]) -> (String, bool) {
 /// A RustGIS or Jupyter notebook.
 fn parse(text: &str, fallback_name: &str) -> Result<Notebook, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("not a notebook: {e}"))?;
+    // nbformat 3 keeps its cells in worksheets: opened as 4, they'd be lost on save.
+    if let Some(major) = v.get("nbformat").and_then(Value::as_u64).filter(|n| *n < 4) {
+        return Err(format!("this is an nbformat {major} notebook; RustGIS opens nbformat 4 notebooks (Jupyter converts older ones)"));
+    }
     if v.get("nbformat").is_some() {
         let meta = v.get("metadata").filter(|m| m.is_object());
         let name = meta.and_then(|m| m.get("title")).and_then(Value::as_str).unwrap_or(fallback_name).to_string();

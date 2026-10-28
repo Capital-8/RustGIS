@@ -304,6 +304,8 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
 pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     message(app, ui, t);
     if app.session.project.notebooks.is_empty() {
+        // No notebook left to show the images of.
+        app.docs.images.clear();
         ui.label(
             egui::RichText::new(tl!("No notebooks yet. Analyze › New Notebook starts one, or Add and Open Notebook opens one.")).weak(),
         );

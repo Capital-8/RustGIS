@@ -7307,6 +7307,9 @@ fn jupyter_python_notebooks_survive_open_and_save() {
     // So is one too large in RustGIS's own format.
     let many = json!({"name": "Big", "cells": vec![json!({"kind": "markdown", "source": "x"}); 1001]});
     assert!(s.run("notebook.open", &json!({"text": many.to_string()})).unwrap_err().contains("1001 cells"));
+    // Nor is an nbformat 3 notebook, whose cells are in worksheets.
+    let v3 = json!({"nbformat": 3, "worksheets": [{"cells": [{"cell_type": "code", "input": "1"}]}]});
+    assert!(s.run("notebook.open", &json!({"text": v3.to_string()})).unwrap_err().contains("nbformat 3"));
     // Nor is a cell longer than RustGIS keeps.
     let long = json!({"nbformat": 4, "cells": [{"cell_type": "code", "source": "x".repeat(200_001)}]});
     assert!(s.run("notebook.open", &json!({"text": long.to_string()})).unwrap_err().contains("cell 1"));
@@ -7319,6 +7322,7 @@ fn jupyter_python_notebooks_survive_open_and_save() {
     let shift = s.project.notebooks.last().unwrap();
     assert_eq!(shift.cells.len(), 2);
     assert_eq!(shift.cells[1].output, None, "the cell that moved up keeps its own (empty) output");
+    assert!(shift.cells[0].output.as_deref().is_some_and(|o| o.starts_with("notebook.removeCell")), "{:?}", shift.cells[0].output);
     s.run("notebook.remove", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
     // Junk where a Jupyter notebook has its parts is skipped or refused, never a panic.
     for junk in [
