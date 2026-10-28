@@ -72,7 +72,7 @@ fn a_right_pane_drags_past_640_and_leaves_the_map_room() {
     drag_edge(&mut h, 2000.0);
     let (pane, room_after) = rects(&h);
     assert!((room - room_after).abs() < 0.5);
-    assert!(room - pane.width() >= 300.0, "the map was left {} of {room}", room - pane.width());
+    assert!(room - pane.width() >= 320.0 - 1.0, "the map was left {} of {room}", room - pane.width());
 
     let mut h = window("ui.pane.history");
     drag_edge(&mut h, 600.0);

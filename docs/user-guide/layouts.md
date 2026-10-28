@@ -284,7 +284,7 @@ previews, edits and plays it.
 **Analyze › New Notebook** starts a notebook of text and command cells; **Add and Open** opens a
 RustGIS (`.rgisnb`) or Jupyter (`.ipynb`) notebook. A command cell runs one command per line
 (`id {json}`, as in scripts) and shows each command's result beneath it. Notebooks save in
-either format. The Notebook pane opens beside the map on half of the window; drag its edge to
-give the notebook or the map more room.
+either format. The Notebook pane opens beside the map, on half of the room right of the left pane; drag
+its edge to give the notebook or the map more room.
 The cells contain RustGIS commands, not Python, even in an `.ipynb` file. Notebooks opened from
 a file or an existing project cannot run commands that read or write files or run other scripts.

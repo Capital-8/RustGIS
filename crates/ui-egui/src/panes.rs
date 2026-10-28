@@ -73,14 +73,15 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     }
     if let Some(right) = app.ui.right {
         // The pane can take all the room right of the left pane but the map's minimum, so a
-        // notebook or a table can be read side by side with the map (#1056).
+        // notebook or a table can be read side by side with the map (#1056). Where that is less
+        // than the 640 points a pane could always take, it keeps those 640 (as far as they fit).
         let room = ui.available_width();
         let max = (room - MIN_MAP_WIDTH).max(640.0_f32.min(room)).max(260.0);
         // The Web Data pane's searches and lists want room, and the Notebook opens on half of
         // it, beside the map: each keeps its own width.
         let (id, width) = match right {
             RightPane::WebData => ("right_pane_web", 440.0),
-            RightPane::Notebook => ("right_pane_notebook", (room / 2.0).clamp(320.0, max)),
+            RightPane::Notebook => ("right_pane_notebook", (room / 2.0).max(320.0).min(max)),
             _ => ("right_pane", 320.0),
         };
         let pane = egui::Panel::right(id).resizable(true).default_size(width).size_range(260.0..=max).frame(frame).show(ui, |ui| {
