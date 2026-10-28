@@ -7307,6 +7307,19 @@ fn jupyter_python_notebooks_survive_open_and_save() {
     // So is one too large in RustGIS's own format.
     let many = json!({"name": "Big", "cells": vec![json!({"kind": "markdown", "source": "x"}); 1001]});
     assert!(s.run("notebook.open", &json!({"text": many.to_string()})).unwrap_err().contains("1001 cells"));
+    // Nor is a cell longer than RustGIS keeps.
+    let long = json!({"nbformat": 4, "cells": [{"cell_type": "code", "source": "x".repeat(200_001)}]});
+    assert!(s.run("notebook.open", &json!({"text": long.to_string()})).unwrap_err().contains("cell 1"));
+    // A cell that removes an earlier one writes its result to itself, not to the cell that moved
+    // into its place.
+    s.run("notebook.new", &json!({"name": "Shift"})).unwrap();
+    s.run("notebook.editCell", &json!({"cell": 1, "source": "notebook.removeCell {\"notebook\": \"Shift\", \"cell\": 0}"})).unwrap();
+    s.run("notebook.addCell", &json!({"source": "map.goToXY {\"lon\": 1, \"lat\": 1}"})).unwrap();
+    s.run("notebook.run", &json!({"cell": 1})).unwrap();
+    let shift = s.project.notebooks.last().unwrap();
+    assert_eq!(shift.cells.len(), 2);
+    assert_eq!(shift.cells[1].output, None, "the cell that moved up keeps its own (empty) output");
+    s.run("notebook.remove", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
     // A Jupyter notebook that names no language isn't run as commands either.
     let bare = json!({"nbformat": 4, "cells": [{"cell_type": "code", "source": "map.goToXY {\"lon\": 9, \"lat\": 9}"}]});
     s.run("notebook.open", &json!({"text": bare.to_string()})).unwrap();

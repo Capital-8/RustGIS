@@ -329,7 +329,10 @@ fn run_cells(s: &mut Session, p: &Value) -> CmdResult {
             }
             Err(e) => e,
         };
-        if let Some(c) = find(s).and_then(|i| s.project.notebooks.get_mut(i)).and_then(|nb| nb.cells.get_mut(k)) {
+        // Only into the cell that ran: a command that removed an earlier cell moved it.
+        if let Some(c) =
+            find(s).and_then(|i| s.project.notebooks.get_mut(i)).and_then(|nb| nb.cells.get_mut(k)).filter(|c| c.source == script)
+        {
             c.output = Some(text.chars().take(MAX_OUTPUT).collect());
             c.error = failed;
             // The Jupyter outputs are from an earlier run; this one's output replaces them.
@@ -448,6 +451,11 @@ fn parse(text: &str, fallback_name: &str) -> Result<Notebook, String> {
         // Dropping the extra cells would lose them on the next save.
         if cells.len() > MAX_CELLS {
             return Err(format!("this notebook has {} cells; RustGIS opens notebooks of up to {MAX_CELLS}", cells.len()));
+        }
+        // Cutting a cell short would lose its end on the next save.
+        if let Some(n) = cells.iter().position(|c| jupyter_text(c.get("source").unwrap_or(&Value::Null)).chars().nth(MAX_SOURCE).is_some())
+        {
+            return Err(format!("cell {} of this notebook is longer than {MAX_SOURCE} characters, the most RustGIS opens", n + 1));
         }
         for c in cells {
             let Some(fields) = c.as_object() else { continue };

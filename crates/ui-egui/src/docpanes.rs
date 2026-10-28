@@ -344,7 +344,7 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     for k in 0..n {
         let (session, docs) = (&app.session, &mut app.docs);
         let Some(c) = session.project.notebooks.get(i).and_then(|nb| nb.cells.get(k)) else { break };
-        let images = cell_images(docs, ui.ctx(), session.revision, (i, k), c);
+        let (images, hidden) = cell_images(docs, ui.ctx(), session.revision, (i, k), c);
         let cell = Cell { kind: c.kind, source: c.source.clone(), output: c.output.clone(), error: c.error, jupyter: None };
         egui::Frame::NONE.stroke(egui::Stroke::new(1.0, t.border)).corner_radius(4).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -398,8 +398,19 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 let w = size.x.min(ui.available_width()).max(1.0);
                 ui.image((tex.id(), vec2(w, w * size.y / size.x.max(1.0))));
             }
+            if hidden > 0 {
+                let note = tl!("Some images aren't shown: the notebook's images use all the memory set aside for them.");
+                ui.label(egui::RichText::new(note).small().color(t.text_dim));
+            }
         });
         ui.add_space(4.0);
+    }
+    // Every cell has now named its images: drop the textures of images no longer in the
+    // notebook, so waiting ones get their room.
+    let waiting = app.docs.images.values().any(|e| matches!(e, NotebookImage::Waiting(_)));
+    if waiting {
+        let live: std::collections::HashSet<u64> = app.docs.image_keys.values().copied().collect();
+        app.docs.images.retain(|k, _| live.contains(k));
     }
     ui.horizontal(|ui| {
         let add = match &language {
@@ -419,8 +430,14 @@ pub fn notebook(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
 const MAX_IMAGE_SIDE: u32 = 4096;
 const IMAGE_BUDGET: usize = 256 << 20;
 
-/// The textures of a cell's PNG outputs, decoded once and kept while the budget allows.
-fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usize, usize), cell: &Cell) -> Vec<egui::TextureHandle> {
+/// The textures of a cell's PNG outputs, and how many are waiting for room in the budget.
+fn cell_images(
+    docs: &mut DocState,
+    ctx: &egui::Context,
+    revision: u64,
+    at: (usize, usize),
+    cell: &Cell,
+) -> (Vec<egui::TextureHandle>, usize) {
     use std::hash::{Hash, Hasher};
     if docs.image_revision != revision {
         docs.image_keys.clear();
@@ -430,7 +447,7 @@ fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usi
     let used = |docs: &DocState| -> usize {
         docs.images.values().map(|e| if let NotebookImage::Shown(t) = e { t.size()[0] * t.size()[1] * 4 } else { 0 }).sum()
     };
-    let mut out = Vec::new();
+    let (mut out, mut hidden) = (Vec::new(), 0);
     for (j, png) in cell.images().iter().enumerate() {
         let key = *docs.image_keys.entry((at.0, at.1, j)).or_insert_with(|| {
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -446,6 +463,7 @@ fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usi
             // Retried once something else frees room.
             Some(NotebookImage::Waiting(bytes)) => {
                 if used(docs) + bytes > IMAGE_BUDGET {
+                    hidden += 1;
                     continue;
                 }
                 *bytes
@@ -457,13 +475,10 @@ fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usi
                     continue;
                 };
                 let bytes = w as usize * h as usize * 4;
-                if used(docs) + bytes > IMAGE_BUDGET {
-                    // Images no longer in a notebook go first.
-                    let live: std::collections::HashSet<u64> = docs.image_keys.values().copied().collect();
-                    docs.images.retain(|k, _| live.contains(k));
-                }
+                // Evicting happens after every cell has named its images (in `notebook`).
                 if used(docs) + bytes > IMAGE_BUDGET {
                     docs.images.insert(key, NotebookImage::Waiting(bytes));
+                    hidden += 1;
                     continue;
                 }
                 bytes
@@ -479,7 +494,7 @@ fn cell_images(docs: &mut DocState, ctx: &egui::Context, revision: u64, at: (usi
         };
         docs.images.insert(key, entry);
     }
-    out
+    (out, hidden)
 }
 
 /// A base64 PNG from a notebook file (hostile input) as bytes.
