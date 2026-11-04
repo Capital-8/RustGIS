@@ -2,13 +2,44 @@
 //! properties. Unknown nested content and foreign notebook cells remain opaque, with honest
 //! notices. Logs deliberately have a separate, stricter policy.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::durable::{self, Durable, Kept, Report};
+
+/// A replayable parameter's durable-output role. Permission policy does not consume roles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParamRole {
+    pub key: &'static str,
+    pub role: Role,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Address,
+    Path,
+    Secret,
+    Dataset,
+    Configuration,
+    Sql,
+    ToolParams,
+    Script,
+    TaskSteps,
+    ModelSteps,
+    ModelGraph,
+    Document(Document),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Document {
+    Project,
+    Map,
+    Task,
+    Notebook,
+    Presentation,
+    Model,
+}
 
 const WITHHELD: &str = "[parameters withheld]";
 const NESTED: &str = "[withheld: nested too deep]";
@@ -40,10 +71,11 @@ const ADDRESS: &[&str] =
     &["url", "urls", "href", "source", "template", "tiles", "store", "endpoint", "address", "uri", "connection", "database"];
 const CONFIG: &[&str] = &["headers", "options", "auth", "connection", "source", "sources"];
 
-/// Registered commands are classified once; plugin commands keep their nested content opaque.
-fn known(id: &str) -> bool {
-    static IDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    IDS.get_or_init(|| crate::cmd::all().into_iter().map(|c| c.id).collect()).contains(id)
+/// Durable output reads its own field from the immutable command registry. An explicit empty
+/// declaration retains the reviewed common scalar/address/configuration rules below.
+fn metadata(id: &str) -> Option<&'static [ParamRole]> {
+    static ROLES: OnceLock<HashMap<&'static str, &'static [ParamRole]>> = OnceLock::new();
+    ROLES.get_or_init(|| crate::cmd::all().into_iter().filter_map(|c| c.roles.map(|r| (c.id, r))).collect()).get(id).copied()
 }
 
 /// A conservative bounded read-only check, used solely to announce unchecked/withheld content.
@@ -69,7 +101,7 @@ fn invalid(value: &Value, report: &mut Report) -> Option<Value> {
 /// Cleans one command without treating parameter JSON strings as executor envelopes.
 pub(crate) fn command(id: &str, params: &Value, depth: usize) -> (Option<Value>, Report) {
     let mut report = Report::default();
-    let changed = object(id, params, depth, 0, known(id), &mut report);
+    let changed = object(id, params, depth, 0, metadata(id).is_some(), &mut report);
     (changed, report)
 }
 
@@ -95,26 +127,22 @@ fn object(id: &str, value: &Value, depth: usize, config_depth: usize, registered
     for (key, v) in obj {
         unchecked |= !matches!(durable::public_address(key), Kept::Unchanged);
         let k = rustgis_data::address::normalized_name(key).unwrap_or_else(|| key.to_ascii_lowercase());
-        let executable = registered
-            && matches!(
-                (id, k.as_str()),
-                ("gp.run", "params")
-                    | ("script.run", "script")
-                    | ("task.new", "steps")
-                    | ("model.new" | "model.save" | "model.run" | "model.validate" | "model.export", "graph")
-                    | ("model.new", "steps")
-            );
-        let document = registered
-            && k == "text"
-            && matches!(id, "project.openText" | "map.import" | "task.import" | "notebook.open" | "presentation.import" | "model.import");
-        let clean = if executable || document {
+        let role = if registered && config_depth == 0 {
+            metadata(id).and_then(|roles| roles.iter().find(|r| r.key == k).map(|r| r.role))
+        } else {
+            None
+        };
+        let clean = if let Some(
+            role @ (Role::ToolParams | Role::Script | Role::TaskSteps | Role::ModelSteps | Role::ModelGraph | Role::Document(_)),
+        ) = role
+        {
             if depth >= 4 {
                 report.withheld = report.withheld.saturating_add(1);
                 Some(Value::String(NESTED.into()))
             } else {
-                envelope(id, &k, v, obj, depth + 1, report)
+                envelope(role, v, obj, depth + 1, report)
             }
-        } else if rustgis_data::address::secret_key(key)
+        } else if (role == Some(Role::Secret) || rustgis_data::address::secret_key(key))
             && (k != "key"
                 || crate::sources::looks_like_a_key(v.as_str().unwrap_or(""))
                 || obj.iter().any(|(other, value)| other != key && !DATA.contains(&other.as_str()) && address_like(value)))
@@ -124,20 +152,20 @@ fn object(id: &str, value: &Value, depth: usize, config_depth: usize, registered
                 Value::Number(_) => Some(Value::String(String::new())),
                 _ => None,
             }
-        } else if DATA.contains(&k.as_str()) {
+        } else if role == Some(Role::Dataset) || DATA.contains(&k.as_str()) {
             None
-        } else if registered && id.starts_with("sql.") && matches!(k.as_str(), "sql" | "query") {
+        } else if role == Some(Role::Sql) {
             v.as_str().and_then(|s| {
                 let clean = crate::project_log::sql_secrets_removed(s);
                 (clean != s).then_some(Value::String(clean))
             })
-        } else if ADDRESS.contains(&k.as_str()) || address_like(v) {
-            if v.is_object() && registered && CONFIG.contains(&k.as_str()) {
+        } else if matches!(role, Some(Role::Address | Role::Path)) || ADDRESS.contains(&k.as_str()) || address_like(v) {
+            if v.is_object() && registered && (role == Some(Role::Configuration) || CONFIG.contains(&k.as_str())) {
                 object("", v, depth, config_depth + 1, true, report)
             } else {
                 address(v, report)
             }
-        } else if registered && CONFIG.contains(&k.as_str()) && v.is_object() {
+        } else if registered && (role == Some(Role::Configuration) || CONFIG.contains(&k.as_str())) && v.is_object() {
             object("", v, depth, config_depth + 1, true, report)
         } else {
             unchecked |= suspicious(v);
@@ -199,14 +227,14 @@ fn address(v: &Value, report: &mut Report) -> Option<Value> {
 }
 
 /// Explicit executable and document roles are the only route into nested executable content.
-fn envelope(id: &str, key: &str, v: &Value, siblings: &serde_json::Map<String, Value>, depth: usize, report: &mut Report) -> Option<Value> {
-    match (id, key) {
-        ("gp.run", "params") => {
+fn envelope(role: Role, v: &Value, siblings: &serde_json::Map<String, Value>, depth: usize, report: &mut Report) -> Option<Value> {
+    match role {
+        Role::ToolParams => {
             let (clean, r) = tool(siblings.get("tool").and_then(Value::as_str).unwrap_or(""), v, depth);
             report.merge(&r);
             clean
         }
-        ("script.run", "script") => match v.as_str() {
+        Role::Script => match v.as_str() {
             Some(s) => {
                 let (clean, r) = script(s, depth);
                 report.merge(&r);
@@ -214,10 +242,10 @@ fn envelope(id: &str, key: &str, v: &Value, siblings: &serde_json::Map<String, V
             }
             None => invalid(v, report),
         },
-        ("task.new", "steps") => typed_value::<VecTask>(v, depth, report),
-        ("model.new", "steps") => typed_value::<VecSteps>(v, depth, report),
-        (_, "graph") => typed_value::<crate::project::ModelGraph>(v, depth, report),
-        (_, "text") => document(id, v, depth, report),
+        Role::TaskSteps => typed_value::<VecTask>(v, depth, report),
+        Role::ModelSteps => typed_value::<VecSteps>(v, depth, report),
+        Role::ModelGraph => typed_value::<crate::project::ModelGraph>(v, depth, report),
+        Role::Document(kind) => document(kind, v, depth, report),
         _ => None,
     }
 }
@@ -280,22 +308,21 @@ impl Durable for VecSteps {
 
 /// Reads documents at the existing reader bound, without normalization, trust or restore-cache
 /// access. Unchanged documents keep their exact text; only changed typed copies are serialized.
-fn document(id: &str, v: &Value, depth: usize, report: &mut Report) -> Option<Value> {
+fn document(kind: Document, v: &Value, depth: usize, report: &mut Report) -> Option<Value> {
     let Some(text) = v.as_str().filter(|s| s.len() as u64 <= crate::project::MAX_BYTES) else { return invalid(v, report) };
-    let result = match id {
-        "project.openText" => text_document::<crate::Project>(text, depth),
-        "map.import" => {
+    let result = match kind {
+        Document::Project => text_document::<crate::Project>(text, depth),
+        Document::Map => {
             if serde_json::from_str::<crate::Project>(text).is_ok() {
                 text_document::<crate::Project>(text, depth)
             } else {
                 text_document::<rustgis_map::Map>(text, depth)
             }
         }
-        "task.import" => text_document::<crate::project::Task>(text, depth),
-        "presentation.import" => text_document::<rustgis_map::presentation::Presentation>(text, depth),
-        "notebook.open" => crate::cmd::notebook::durable_document(text, depth),
-        "model.import" => model_document(text, depth),
-        _ => return None,
+        Document::Task => text_document::<crate::project::Task>(text, depth),
+        Document::Presentation => text_document::<rustgis_map::presentation::Presentation>(text, depth),
+        Document::Notebook => crate::cmd::notebook::durable_document(text, depth),
+        Document::Model => model_document(text, depth),
     };
     match result {
         Ok((clean, r)) => {

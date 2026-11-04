@@ -1,0 +1,111 @@
+use crate::CommandSpec;
+use serde_json::Value;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effect {
+    Edits,
+    Files,
+    Network,
+    Plugin,
+    Automation,
+    Reserved,
+    Replaces,
+    History,
+    Unreviewed,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Effects(u16);
+impl Effects {
+    pub const NONE: Self = Self(0);
+    pub const UNREVIEWED: Self = Self::NONE.with(Effect::Unreviewed);
+    /// Adds an effect without removing any previously declared reach.
+    pub const fn with(self, effect: Effect) -> Self {
+        Self(self.0 | 1 << effect as u16)
+    }
+    /// Tests one additive effect without treating the set as a trust level.
+    pub const fn contains(self, effect: Effect) -> bool {
+        self.0 & (1 << effect as u16) != 0
+    }
+    /// Combines reviewed effects from a command and its nested operations.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+    /// Enumerates every declared effect so mixed Files/Network/Replaces remain additive.
+    pub(super) fn iter(self) -> impl Iterator<Item = Effect> {
+        [
+            Effect::Edits,
+            Effect::Files,
+            Effect::Network,
+            Effect::Plugin,
+            Effect::Automation,
+            Effect::Reserved,
+            Effect::Replaces,
+            Effect::History,
+            Effect::Unreviewed,
+        ]
+        .into_iter()
+        .filter(move |e| self.contains(*e))
+    }
+}
+pub(crate) const PLACE_KEYS: &[&str] = &["path", "folder", "dir", "file", "url", "uri", "source", "output", "connection", "database"];
+/// State-dependent additions to a reviewed declaration. Effects add; they never remove authority.
+pub(super) fn declared(spec: &CommandSpec, params: &Value) -> Effects {
+    let mut effects = spec.effects;
+    if spec.mutates {
+        effects = effects.with(Effect::Edits);
+    }
+    if spec.id == "cube.open" && crate::cmd::cube_catalog::opens_zarr(params) {
+        effects = effects.with(Effect::Files).with(Effect::Network);
+    }
+    let params = crate::cmd::items::layer_name_left_out(spec.id, params);
+    if !effects.contains(Effect::Network) && crate::cmd::items::names_place(&params, PLACE_KEYS, 0) {
+        effects = effects.with(Effect::Files);
+    }
+    // In-memory georeferencing/projecting is an edit; a named output reaches the file system.
+    if matches!(spec.id, "raster.georeference" | "raster.project") && crate::cmd::items::names_place(&params, PLACE_KEYS, 0) {
+        effects = effects.with(Effect::Files);
+    }
+    effects
+}
+/// Adds only source reach of the actual current execution targets, without opening them.
+pub(super) fn command(s: &crate::cmd::InputContext<'_>, spec: &CommandSpec, params: &Value) -> Effects {
+    let mut effects = declared(spec, params);
+    if spec.id == "layer.loadAll"
+        && let Ok(id) = s.layer_id(params)
+        && let Some(layer) = s.map().layer(id)
+        && let Some(source) = &layer.source
+    {
+        if source.path.is_some() || source.gdal.is_some() || source.duckdb.is_some() {
+            effects = effects.with(Effect::Files);
+        }
+        if source.path.as_deref().is_some_and(rustgis_data::source::is_remote_name)
+            || source.postgis.is_some()
+            || source.mysql.is_some()
+            || source.sqlserver.is_some()
+            || source.gdal.is_some()
+            || source.duckdb.is_some()
+        {
+            effects = effects.with(Effect::Network);
+        }
+    }
+    if crate::cmd::time::follows_sources(spec.id) {
+        for (_, _, source) in crate::cmd::time::following_sources(s) {
+            effects = effects.with(Effect::Files);
+            if source.starts_with("https://") || source.starts_with("http://") {
+                effects = effects.with(Effect::Network);
+            }
+        }
+    }
+    effects
+}
+/// Legacy imported-item deny heuristic, retained in addition to declared effects.
+pub(super) fn imported(command: &str, params: &Value) -> bool {
+    const KEYS: &[&str] =
+        &["path", "folder", "dir", "file", "url", "uri", "source", "output", "connection", "database", "data", "text", "poster", "locator"];
+    let id = command.to_ascii_lowercase();
+    let verb = id.split('.').nth(1).unwrap_or("");
+    ["script.", "notebook.", "model.", "project.", "task.", "share.", "offline.", "cache.", "locator."].iter().any(|p| id.starts_with(p))
+        || ["import", "export", "open", "save", "add", "package", "upload", "download"].iter().any(|w| verb.starts_with(w))
+        || id == "raster.mosaic"
+        || crate::cmd::items::names_place(&crate::cmd::items::layer_name_left_out(command, params), KEYS, 0)
+}

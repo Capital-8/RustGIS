@@ -576,6 +576,50 @@ mod tests {
         plugins::unload("ui-url");
     }
 
+    /// The real deferred request and probe loop refuse a withdrawn plugin before a fallback send.
+    #[test]
+    fn permission_policy_plugin_deferred_probe_refuses_before_fallback() {
+        let _turn = crate::fetching::turn();
+        use rustgis_engine::{plugins, render::rustgis_tiles::cache};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let sent = Arc::new(AtomicUsize::new(0));
+        let count = sent.clone();
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let callbacks = held.clone();
+        cache::set_fetcher(move |_, done| {
+            count.fetch_add(1, Ordering::SeqCst);
+            callbacks.lock().unwrap().push(done);
+        });
+        let mut app = RustGisApp::with_sample();
+        let load = || {
+            plugins::load(plugins::Package::from_zip(&plugins::testing::package("ui-policy-probe", &["edit", "network"])).unwrap(), "test")
+                .unwrap()
+        };
+        let p = json!({"url":"http://127.0.0.1:9/policy-held.fgb","name":"Held source"});
+        load();
+        app.run("plugin:ui-policy-probe/f", json!({"op":"layer.addUrl","params":p})).unwrap();
+        plugins::unload("ui-policy-probe");
+        assert!(app.session.take_url_requests().is_empty());
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        load();
+        app.run("plugin:ui-policy-probe/f", json!({"op":"layer.addUrl","params":p})).unwrap();
+        let request = app.session.take_url_requests().pop().unwrap();
+        app.add_url(request.params(), Some(&request), None).unwrap();
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "the actual probe starts under the live owner");
+        assert_eq!(app.ui.cog_probes.len(), 1);
+        plugins::unload("ui-policy-probe");
+        *app.ui.cog_probes[0].2.lock().unwrap() = Some(Ok(false));
+        app.poll_data_downloads();
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "revoked probe starts no whole-file fallback");
+        assert!(app.session.map().layer_by_name("Held source").is_none());
+        for done in std::mem::take(&mut *held.lock().unwrap()) {
+            done(Err("probe revoked".into()));
+        }
+    }
+
     /// A GeoTIFF asked for as a scan keeps only its pixels: the app downloads it whole, once,
     /// without first reading its header to see whether it could be read in place.
     #[test]

@@ -41,6 +41,10 @@ Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
 - **Everything is a command**: a `CommandSpec` in `crates/engine/src/cmd/*.rs`. UI-only
   commands (`ui.*`) live in `crates/ui-egui/src/lib.rs`. The ribbon, shortcuts, command search
   and CLI dispatch by id. Commands never open dialogs.
+- **Command ingress**: root `Session::run` is trusted native User dispatch. Assistant, MCP,
+  plugin, imported-item and continuation adapters carry their named opaque policy scope;
+  scopes inherit or narrow, and `with_scope` rejects nested ingress. Peer project text uses
+  `open_peer_text`. Generic embedding-parent `ui.*` RUN authority remains deferred D12.
 - **Ribbon placement** follows the
   [ribbon guidelines](docs/contributing.md#ribbon-guidelines): the tab's purpose, one button per
   destination, labels that say what happens, and what a ribbon pull request states.

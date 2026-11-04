@@ -365,29 +365,36 @@ pub fn poll_pages(app: &mut RustGisApp, ctx: &egui::Context) {
 /// The next answer fetched, or the collection added (with a note when some features were left
 /// unread), or why it couldn't be fetched said.
 fn go_on(app: &mut RustGisApp, landed: Landed, left: usize, step: Step) {
-    match step {
-        // Not given by `ogc::begin`, which reads in GeoJSON.
-        Step::Decoded(..) => go_on(app, landed, left, Step::Failed("the pages were read as protocol buffers".into())),
-        Step::Failed(e) => {
-            app.session.download_failed(landed.id);
-            let url = &landed.url;
-            app.session.notify(if e.starts_with(url.as_str()) { e } else { format!("{url}: {e}") }, true);
-        }
-        Step::Fetch(pages) => {
-            let slot = match rustgis_engine::render::rustgis_tiles::address::check(pages.next_url(), Some(pages.referrer())) {
-                // A layer's description: small, and soon given up on.
-                Ok(()) if pages.describing() => fetch_description(pages.next_url(), left.min(ogc::DESCRIPTION_MAX)),
-                Ok(()) => fetch_into_limited(pages.next_url(), left),
-                Err(e) => Slot::new(std::sync::Mutex::new(Some(Err(e)))),
-            };
-            app.ui.service_pages.push(PageRead { landed, pages, left, slot, asked: web_time::Instant::now() });
-        }
-        Step::Done(bytes, note) => {
-            if let Some(note) = note {
-                let name = landed.params.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(&landed.url);
-                app.session.notify(format!("{name}: {note}"), false);
-            }
-            app.add_landed(landed, bytes);
-        }
+    if let Err(e) = app.session.download_continues(landed.id) {
+        app.session.notify(e, true);
+        return;
     }
+    let still = app.session.download_still(landed.id);
+    rustgis_engine::render::rustgis_tiles::cache::with_optional_still(still, || {
+        match step {
+            // Not given by `ogc::begin`, which reads in GeoJSON.
+            Step::Decoded(..) => go_on(app, landed, left, Step::Failed("the pages were read as protocol buffers".into())),
+            Step::Failed(e) => {
+                app.session.download_failed(landed.id);
+                let url = &landed.url;
+                app.session.notify(if e.starts_with(url.as_str()) { e } else { format!("{url}: {e}") }, true);
+            }
+            Step::Fetch(pages) => {
+                let slot = match rustgis_engine::render::rustgis_tiles::address::check(pages.next_url(), Some(pages.referrer())) {
+                    // A layer's description: small, and soon given up on.
+                    Ok(()) if pages.describing() => fetch_description(pages.next_url(), left.min(ogc::DESCRIPTION_MAX)),
+                    Ok(()) => fetch_into_limited(pages.next_url(), left),
+                    Err(e) => Slot::new(std::sync::Mutex::new(Some(Err(e)))),
+                };
+                app.ui.service_pages.push(PageRead { landed, pages, left, slot, asked: web_time::Instant::now() });
+            }
+            Step::Done(bytes, note) => {
+                if let Some(note) = note {
+                    let name = landed.params.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(&landed.url);
+                    app.session.notify(format!("{name}: {note}"), false);
+                }
+                app.add_landed(landed, bytes);
+            }
+        }
+    });
 }

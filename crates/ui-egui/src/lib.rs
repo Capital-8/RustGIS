@@ -11,6 +11,7 @@ pub mod i18n;
 #[cfg(not(target_arch = "wasm32"))]
 mod agentthreads;
 mod analysispane;
+mod approvalcard;
 mod arcgisui;
 #[cfg(not(target_arch = "wasm32"))]
 mod assistantkeys;
@@ -676,7 +677,7 @@ pub struct UiState {
     /// GeoTIFFs, FlatGeobufs and GeoParquets by address whose headers are being read: those
     /// that can be read in place are added so, others downloaded (the `ui.addUrl` parameters,
     /// and the answer).
-    pub cog_probes: Vec<(Value, Slot<Result<bool, String>>)>,
+    pub cog_probes: Vec<(Value, Option<u64>, Slot<Result<bool, String>>)>,
     /// Service layers whose features are being read page by page (an ArcGIS layer's description
     /// first).
     pub service_pages: Vec<serviceui::PageRead>,
@@ -1612,7 +1613,7 @@ impl RustGisApp {
             if let Err(error) = &delivered {
                 params["error"] = json!(error);
             }
-            let completed = self.session.run("gp.fileDelivered", &params);
+            let completed = self.session.acknowledge_gp_file(id, params.get("error").and_then(Value::as_str));
             let result = delivered.and(completed);
             self.gp.last = Some(match &result {
                 Ok(_) => (true, self.session.project.gp_history.last().map(|h| h.messages.clone()).unwrap_or_default()),
@@ -1975,6 +1976,26 @@ impl RustGisApp {
         let name = active.and_then(|l| map.layer(l)).map(|l| l.name.clone())?;
         let shared = map.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(&name)).count() > 1;
         Some((name, shared))
+    }
+
+    /// Applies the engine-held background tool owner, then records the completed operation.
+    pub(crate) fn finish_gp(&mut self, id: u64) -> rustgis_engine::CmdResult {
+        let result = self.session.finish_gp(id);
+        if result.is_ok() {
+            self.record_step("gp.finish", &json!({"id":id}), None);
+        }
+        result
+    }
+
+    /// Applies a workflow's admitted raster completion and records its replayable command.
+    pub(crate) fn finish_raster(&mut self, command: &str, id: u64, params: &Value) -> rustgis_engine::CmdResult {
+        let result = self.session.finish_raster(command, id, params);
+        if result.is_ok() {
+            let mut recorded = params.clone();
+            recorded["ran"] = json!(id);
+            self.record_step(command, &recorded, None);
+        }
+        result
     }
 
     /// Record Task: adds a command that ran from the app and changed the project as a step. Not
@@ -2588,130 +2609,7 @@ impl RustGisApp {
             }
             // Data by its web address: the dialog, then (with an address) the download, off the
             // frame; it's added when it lands. A PMTiles archive is a tile layer, never downloaded.
-            "ui.addUrl" => {
-                if p.get("geolibreZarr").and_then(Value::as_bool) == Some(true) {
-                    if let Err(e) = geolibreui::start(self, p) {
-                        rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, p);
-                        return Err(e);
-                    }
-                    return Ok(Value::Null);
-                }
-                // The connection a Connections tree add is for (named in Recent once it is added).
-                let origin = connectiontree::take_origin(self);
-                let Some(url) = p.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()) else {
-                    return self.run("ui.dialog", json!({"name": "addUrl"}));
-                };
-                if url.to_ascii_lowercase().split(['?', '#']).next().is_some_and(|u| u.ends_with(".pmtiles")) {
-                    return connectiontree::run_named(self, "layer.addUrl", p.clone(), origin.as_deref());
-                }
-                // A GeoTIFF, FlatGeobuf or GeoParquet: its header (or footer) first, off the
-                // frame; one that can be read in place is, another is downloaded (see
-                // `poll_downloads`). An address without a file name (an API answering with a
-                // file, such as Vantor's `…/geotiff?…`) is probed as a GeoTIFF too, and downloaded
-                // as before when it doesn't answer as one.
-                let remote = rustgis_engine::data::source::is_remote_name(url);
-                let tiff = rustgis_engine::cmd::layer::is_tiff_url(url);
-                // A scan (`"as"`, a plugin's or a script's) keeps only the pixels: downloaded
-                // whole.
-                let scan = p.get("as").and_then(Value::as_str) == Some("scan");
-                let unnamed = !remote
-                    && !tiff
-                    && rustgis_engine::cmd::layer::is_unnamed_url(url)
-                    && ["service", "coverage"].iter().all(|k| p.get(*k).and_then(Value::as_bool) != Some(true));
-                if (remote || tiff || unnamed) && !scan && p.get("whole").and_then(Value::as_bool) != Some(true) {
-                    let slot: Slot<Result<bool, String>> = Slot::default();
-                    let land = slot.clone();
-                    if remote {
-                        rustgis_engine::data::source::open_url(
-                            url,
-                            Box::new(move |r| {
-                                let r = match r {
-                                    Ok(_) => Ok(true),
-                                    Err(e) if e.to_string().contains(rustgis_engine::data::source::remote::READ_WHOLE) => Ok(false),
-                                    Err(e) => Err(e.to_string()),
-                                };
-                                *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-                            }),
-                        );
-                    } else {
-                        rustgis_engine::render::rustgis_tiles::cog::probe(
-                            url,
-                            Box::new(move |r| {
-                                let r = if unnamed { Ok(r.unwrap_or(false)) } else { r };
-                                *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-                            }),
-                        );
-                    }
-                    // An address read through a saved S3 connection is said as the address it wraps.
-                    let shown = rustgis_engine::data::s3_address::inner(url);
-                    self.session.notify(i18n::fmt("Reading {url}…", &[("url", shown)]), false);
-                    let mut probe = p.clone();
-                    if let Some(o) = probe.as_object_mut() {
-                        o.remove(connectiontree::ORIGIN);
-                        if let Some(origin) = &origin {
-                            o.insert(connectiontree::ORIGIN.into(), json!(origin));
-                        }
-                    }
-                    self.ui.cog_probes.push((probe, slot));
-                    return Ok(Value::Null);
-                }
-                let url = url.to_string();
-                let mut q = json!({});
-                for k in ["name", "layer", "crs"] {
-                    if let Some(v) = p.get(k).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
-                        q[k] = v.clone();
-                    }
-                }
-                // How the bytes are read, as `layer.addData` takes it (a command asking by
-                // address, such as a plugin's: the dialog gives none of these).
-                for k in ["x", "y", "wkt", "delimiter", "paperSpace", "stream", "as"] {
-                    if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
-                        q[k] = v.clone();
-                    }
-                }
-                if p.get("zoom").and_then(Value::as_bool) == Some(true) {
-                    q["zoom"] = json!(true);
-                }
-                for k in ["service", "coverage"] {
-                    if p.get(k).and_then(Value::as_bool) == Some(true) {
-                        q[k] = json!(true);
-                    }
-                }
-                for key in ["geolibreProject", "geolibreLayer"] {
-                    if let Some(value) = p.get(key) {
-                        q[key] = value.clone();
-                    }
-                }
-                // A service layer's bounds, which its features' axes are checked against.
-                if let Some(b) = p.get("bounds").filter(|b| b.is_array()) {
-                    q["bounds"] = b.clone();
-                }
-                if let Some(origin) = &origin {
-                    q[connectiontree::ORIGIN] = json!(origin);
-                }
-                let shown = rustgis_engine::data::s3_address::inner(&url);
-                self.session.notify(i18n::fmt("Downloading {url}…", &[("url", shown)]), false);
-                let id = self.session.download_started();
-                // A service's features: read page by page from the start, off the frame (an ArcGIS
-                // layer's description first).
-                if q.get("service").and_then(Value::as_bool) == Some(true) {
-                    let origin = connectiontree::take_origin_key(&mut q);
-                    serviceui::read_pages(self, serviceui::Landed { id, url, params: q, origin });
-                    return Ok(Value::Null);
-                }
-                let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
-                let land = slot.clone();
-                rustgis_engine::render::rustgis_tiles::cache::download_limited(
-                    &url,
-                    if q.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
-                        rustgis_engine::map::geolibre::MAX_TEXT
-                    } else {
-                        rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD
-                    },
-                    Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
-                );
-                self.ui.downloads.push((id, url, q, slot));
-            }
+            "ui.addUrl" => return self.add_url(p, None, None),
             "ui.connection" => {
                 if let Some(id) = p.get("id").and_then(Value::as_str) {
                     connectionui::open_edit(self, id)?;
@@ -3682,18 +3580,166 @@ impl RustGisApp {
 
     /// Consumes completed probes and downloads on the app frame, finalizing imports in their
     /// reserved map or discarding failed reservations even when another map is active.
+    /// A native dialog or an engine-issued deferred request. The claim rides outside JSON.
+    fn add_url(&mut self, p: &Value, request: Option<&rustgis_engine::UrlRequest>, existing: Option<u64>) -> Result<Value, String> {
+        let claim = match request {
+            Some(request) => Some(self.session.download_started_for(request)?),
+            None => existing,
+        };
+        if let Some(id) = claim {
+            self.session.download_continues(id)?;
+        }
+        let still = claim.and_then(|id| self.session.download_still(id));
+        rustgis_engine::render::rustgis_tiles::cache::with_optional_still(still, || {
+            if p.get("geolibreZarr").and_then(Value::as_bool) == Some(true) {
+                if let Err(e) = geolibreui::start(self, p, claim) {
+                    rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, p);
+                    return Err(e);
+                }
+                return Ok(Value::Null);
+            }
+            // The connection a Connections tree add is for (named in Recent once it is added).
+            let origin = connectiontree::take_origin(self);
+            let Some(url) = p.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()) else {
+                return self.run("ui.dialog", json!({"name": "addUrl"}));
+            };
+            if url.to_ascii_lowercase().split(['?', '#']).next().is_some_and(|u| u.ends_with(".pmtiles")) {
+                return if let Some(id) = claim {
+                    self.session.add_in_place_for(id, p)
+                } else {
+                    connectiontree::run_named(self, "layer.addUrl", p.clone(), origin.as_deref())
+                };
+            }
+            // A GeoTIFF, FlatGeobuf or GeoParquet: its header (or footer) first, off the
+            // frame; one that can be read in place is, another is downloaded (see
+            // `poll_downloads`). An address without a file name (an API answering with a
+            // file, such as Vantor's `…/geotiff?…`) is probed as a GeoTIFF too, and downloaded
+            // as before when it doesn't answer as one.
+            let remote = rustgis_engine::data::source::is_remote_name(url);
+            let tiff = rustgis_engine::cmd::layer::is_tiff_url(url);
+            // A scan (`"as"`, a plugin's or a script's) keeps only the pixels: downloaded
+            // whole.
+            let scan = p.get("as").and_then(Value::as_str) == Some("scan");
+            let unnamed = !remote
+                && !tiff
+                && rustgis_engine::cmd::layer::is_unnamed_url(url)
+                && ["service", "coverage"].iter().all(|k| p.get(*k).and_then(Value::as_bool) != Some(true));
+            if (remote || tiff || unnamed) && !scan && p.get("whole").and_then(Value::as_bool) != Some(true) {
+                let slot: Slot<Result<bool, String>> = Slot::default();
+                let land = slot.clone();
+                if remote {
+                    rustgis_engine::data::source::open_url(
+                        url,
+                        Box::new(move |r| {
+                            let r = match r {
+                                Ok(_) => Ok(true),
+                                Err(e) if e.to_string().contains(rustgis_engine::data::source::remote::READ_WHOLE) => Ok(false),
+                                Err(e) => Err(e.to_string()),
+                            };
+                            *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                        }),
+                    );
+                } else {
+                    rustgis_engine::render::rustgis_tiles::cog::probe(
+                        url,
+                        Box::new(move |r| {
+                            let r = if unnamed { Ok(r.unwrap_or(false)) } else { r };
+                            *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                        }),
+                    );
+                }
+                // An address read through a saved S3 connection is said as the address it wraps.
+                let shown = rustgis_engine::data::s3_address::inner(url);
+                self.session.notify(i18n::fmt("Reading {url}…", &[("url", shown)]), false);
+                let mut probe = p.clone();
+                if let Some(o) = probe.as_object_mut() {
+                    o.remove(connectiontree::ORIGIN);
+                    if let Some(origin) = &origin {
+                        o.insert(connectiontree::ORIGIN.into(), json!(origin));
+                    }
+                }
+                self.ui.cog_probes.push((probe, claim, slot));
+                return Ok(Value::Null);
+            }
+            let url = url.to_string();
+            let mut q = json!({});
+            for k in ["name", "layer", "crs"] {
+                if let Some(v) = p.get(k).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
+                    q[k] = v.clone();
+                }
+            }
+            // How the bytes are read, as `layer.addData` takes it (a command asking by
+            // address, such as a plugin's: the dialog gives none of these).
+            for k in ["x", "y", "wkt", "delimiter", "paperSpace", "stream", "as"] {
+                if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
+                    q[k] = v.clone();
+                }
+            }
+            if p.get("zoom").and_then(Value::as_bool) == Some(true) {
+                q["zoom"] = json!(true);
+            }
+            for k in ["service", "coverage"] {
+                if p.get(k).and_then(Value::as_bool) == Some(true) {
+                    q[k] = json!(true);
+                }
+            }
+            for key in ["geolibreProject", "geolibreLayer"] {
+                if let Some(value) = p.get(key) {
+                    q[key] = value.clone();
+                }
+            }
+            // A service layer's bounds, which its features' axes are checked against.
+            if let Some(b) = p.get("bounds").filter(|b| b.is_array()) {
+                q["bounds"] = b.clone();
+            }
+            if let Some(origin) = &origin {
+                q[connectiontree::ORIGIN] = json!(origin);
+            }
+            let shown = rustgis_engine::data::s3_address::inner(&url);
+            self.session.notify(i18n::fmt("Downloading {url}…", &[("url", shown)]), false);
+            let id = claim.unwrap_or_else(|| self.session.download_started());
+            // A service's features: read page by page from the start, off the frame (an ArcGIS
+            // layer's description first).
+            if q.get("service").and_then(Value::as_bool) == Some(true) {
+                let origin = connectiontree::take_origin_key(&mut q);
+                serviceui::read_pages(self, serviceui::Landed { id, url, params: q, origin });
+                return Ok(Value::Null);
+            }
+            let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
+            let land = slot.clone();
+            rustgis_engine::render::rustgis_tiles::cache::download_limited(
+                &url,
+                if q.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
+                    rustgis_engine::map::geolibre::MAX_TEXT
+                } else {
+                    rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD
+                },
+                Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
+            );
+            self.ui.downloads.push((id, url, q, slot));
+
+            Ok(Value::Null)
+        })
+    }
+
     fn poll_data_downloads(&mut self) {
         // GeoTIFFs, FlatGeobufs and GeoParquets whose headers are in: read in place, or
         // downloaded whole.
         let mut probed = Vec::new();
-        self.ui.cog_probes.retain(|(p, slot)| match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        self.ui.cog_probes.retain(|(p, claim, slot)| match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
             Some(r) => {
-                probed.push((p.clone(), r));
+                probed.push((p.clone(), *claim, r));
                 false
             }
             None => true,
         });
-        for (mut p, r) in probed {
+        for (mut p, claim, r) in probed {
+            if let Some(id) = claim
+                && let Err(e) = self.session.download_continues(id)
+            {
+                self.session.notify(e, true);
+                continue;
+            }
             let origin = connectiontree::take_origin_key(&mut p);
             let url = p.get("url").and_then(Value::as_str).unwrap_or("").to_string();
             match r {
@@ -3703,16 +3749,26 @@ impl RustGisApp {
                         p["cog"] = json!(true);
                     }
                     let before = self.session.sources.generation;
-                    if self.run("layer.addUrl", p).is_ok() {
+                    let added = if let Some(id) = claim { self.session.add_in_place_for(id, &p) } else { self.run("layer.addUrl", p) };
+                    if added.is_ok() {
                         connectiontree::name_recent(self, before, origin.as_deref());
                         self.map.invalidate();
                     }
                 }
                 Ok(false) => {
                     p["whole"] = json!(true);
-                    let _ = connectiontree::run_add_url(self, p, origin.as_deref());
+                    if claim.is_some() {
+                        let _ = self.add_url(&p, None, claim);
+                    } else {
+                        let _ = connectiontree::run_add_url(self, p, origin.as_deref());
+                    }
                 }
-                Err(e) => self.session.notify(if e.starts_with(&url) { e } else { format!("{url}: {e}") }, true),
+                Err(e) => {
+                    if let Some(id) = claim {
+                        self.session.download_failed(id);
+                    }
+                    self.session.notify(if e.starts_with(&url) { e } else { format!("{url}: {e}") }, true)
+                }
             }
         }
         let mut landed = Vec::new();
@@ -3752,7 +3808,7 @@ impl RustGisApp {
         }
         let before = self.session.sources.generation;
         let pending = p.clone();
-        match self.run("layer.addDownload", p) {
+        match self.session.complete_download(id, &p) {
             Ok(r) => {
                 connectiontree::name_recent(self, before, origin.as_deref());
                 if r.get("zoomed").and_then(Value::as_bool) == Some(true) {
@@ -3941,8 +3997,8 @@ impl RustGisApp {
         }
         // Addresses commands asked for where they couldn't download themselves (the browser):
         // fetched off the frame and added when they land, as Home › Add › Add Data › From URL does.
-        for p in self.session.take_url_requests() {
-            if let Err(e) = self.run("ui.addUrl", p) {
+        for request in self.session.take_url_requests() {
+            if let Err(e) = self.add_url(request.params(), Some(&request), None) {
                 self.session.notify(e, true);
             }
         }
@@ -4740,13 +4796,13 @@ mod peer_output_tests {
         let mut app = RustGisApp::with_sample();
         app.session.project.maps[0].layers[0].dataset.source = Some("https://h.invalid/?token=RGSYNTH_4".into());
         let (text, _) = app.session.project.saved_text(None).unwrap();
-        app.session.trusted_tasks.insert("prior".into());
+        app.session.run("task.new", &json!({"name":"prior","steps":[]})).unwrap();
         app.assistant.queued = Some("old project action".into());
         app.ui.web_file = Some("prior.rgis".into());
         let generation = app.session.opened;
         app.open_peer_text(&text).unwrap();
         assert_ne!(app.session.opened, generation);
-        assert!(app.session.trusted_tasks.is_empty());
+        assert!(app.session.project.tasks.is_empty());
         assert!(app.ui.web_file.is_none() && app.assistant.queued.is_none());
         assert!(!serde_json::to_string(&app.session.project).unwrap().contains("RGSYNTH_4"));
     }

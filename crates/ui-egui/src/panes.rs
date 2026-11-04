@@ -2751,7 +2751,7 @@ pub fn poll_tool_run(app: &mut RustGisApp, ctx: &egui::Context) {
     };
     let (id, tool) = (job.id, job.tool);
     app.gp.tool_run = None;
-    let r = rustgis_engine::cmd::gp::tool_complete(&mut app.session, id, done).and_then(|_| app.run("gp.finish", json!({"id": id})));
+    let r = rustgis_engine::cmd::gp::tool_complete(&mut app.session, id, done).and_then(|_| app.finish_gp(id));
     finished(app, tool, r);
 }
 
@@ -2802,7 +2802,7 @@ pub fn poll_plugin_run(app: &mut RustGisApp, ctx: &egui::Context) {
     };
     let (id, tool) = (job.id, job.tool);
     app.gp.plugin_run = None;
-    let r = rustgis_engine::cmd::gp::plugin_complete(&mut app.session, id, result).and_then(|_| app.run("gp.finish", json!({"id": id})));
+    let r = rustgis_engine::cmd::gp::plugin_complete(&mut app.session, id, result).and_then(|_| app.finish_gp(id));
     finished(app, tool, r);
 }
 
@@ -2861,7 +2861,7 @@ pub fn poll_geolibre(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     if let Some((id, tool, out)) = app.gp.web_run.as_ref().and_then(|(id, tool, slot)| take(slot).map(|o| (*id, *tool, o))) {
         app.gp.web_run = None;
-        let r = rustgis_engine::cmd::gp::external_complete(&mut app.session, id, out).and_then(|_| app.run("gp.finish", json!({"id": id})));
+        let r = rustgis_engine::cmd::gp::external_complete(&mut app.session, id, out).and_then(|_| app.finish_gp(id));
         finished(app, tool, r);
     }
     if app.gp.web_load.is_some() || app.gp.web_run.is_some() {

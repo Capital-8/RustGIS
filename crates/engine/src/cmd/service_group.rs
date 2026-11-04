@@ -9,16 +9,16 @@ use super::{C, CmdResult, MAX_GROUP_BYTES, Session, capabilities, ps, service_js
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("service.import", "Import Service", "Home › Add", import).params(
+        C::new("service.import", "Import Service", "Home › Add", import).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"url": "an OGC API landing page or collections address", "type"?, "name"?: "group name (default My OGC Layer)", "text"?, "documents"?: "as service.layers", "responses"?: [{"url": "features URL", "text": "downloaded GeoJSON"}]} ("group" and "layer" are rejected: use service.refresh)"#,
         ),
-        C::new("service.refresh", "Refresh", "Layers", refresh).params(
+        C::new("service.refresh", "Refresh", "Layers", refresh).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"group"?: id, "layer"?: "one child layer id or name", "text"?, "documents"?, "responses"?: "as service.import"}"#,
         ),
-        C::new("service.groupPlan", "Service Import Requests", "Layers", plan).view().params(
+        C::new("service.groupPlan", "Service Import Requests", "Layers", plan).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).view().params(
             r#"{"url"?, "type"?, "name"?, "group"?: id, "layer"?: "one child layer", "sourceOnly"?: "return the connection without fetching", "text"?, "documents"?} → request, layers, and next while discovery is incomplete"#,
         ),
-        C::new("service.group", "Service Group", "Layers", set_group).params(
+        C::new("service.group", "Service Group", "Layers", set_group).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"group"?: id, "layer"?: "a child identifying its group", "name"?: text, "expanded"?: bool, "visible"?: "set all children", "remove"?: "remove the group and its children"}"#,
         ),
     ]

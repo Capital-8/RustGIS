@@ -54,6 +54,12 @@ pub enum State {
 pub type Done = Box<dyn FnOnce(Result<Vec<u8>, String>) + Send>;
 /// Called once with a download's bytes or what is known of its failure (#509).
 pub type DoneDetailed = Box<dyn FnOnce(Result<Vec<u8>, Failure>) + Send>;
+// The carrier lives with source I/O so lower-layer workers inherit the same context.
+pub use rustgis_data::source::remote::{Still, check_still, current_still, with_optional_still, with_still};
+fn check_current() -> Result<(), String> {
+    check_still(&current_still())
+}
+
 type Fetcher = Box<dyn Fn(String, Done, &'static [u16]) + Send + Sync>;
 /// Hands back a decoded picture: [`RAW`] pixels, or the encoded bytes it was given when it
 /// couldn't decode them (they are decoded here then).
@@ -765,6 +771,12 @@ pub fn download_detailed(url: &str, max: usize, done: DoneDetailed) {
 
 /// Like [`download_detailed`], giving up after `timeout` natively.
 fn download_detailed_within(url: &str, max: usize, timeout: std::time::Duration, done: DoneDetailed) {
+    if let Err(e) = check_current() {
+        done(Err(Failure::new(url, e)));
+        return;
+    }
+    let still = current_still();
+    let done: DoneDetailed = Box::new(move |r| with_optional_still(still, || done(r)));
     if let Err(e) = crate::address::check(url, None) {
         done(Err(Failure::new(url, e)));
         return;
@@ -936,6 +948,12 @@ pub fn tiff_header_length(value: &str) -> Option<u64> {
 /// the web), counted as a fetch under way. A request signed for S3 isn't made (its signature is
 /// for a GET): it answers with nothing known.
 pub fn head(url: &str, done: HeadDone) {
+    if let Err(e) = check_current() {
+        done(Err(e));
+        return;
+    }
+    let still = current_still();
+    let done: HeadDone = Box::new(move |r| with_optional_still(still, || done(r)));
     if let Err(e) = crate::address::check(url, None) {
         done(Err(e));
         return;
@@ -956,6 +974,12 @@ pub fn head(url: &str, done: HeadDone) {
 /// A status in `omit` is an expected answer: its failure isn't recorded, only noted once per
 /// server (a tile past a map's edge).
 pub(crate) fn fetch_bytes(url: String, done: Done, omit: &'static [u16]) {
+    if let Err(e) = check_current() {
+        done(Err(e));
+        return;
+    }
+    let still = current_still();
+    let done: Done = Box::new(move |r| with_optional_still(still, || done(r)));
     let f = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone();
     match f {
         Some(f) => f(url, done, omit),
@@ -1154,7 +1178,7 @@ mod native {
     struct Jobs {
         /// Waiting, oldest first: the address, its server, callback, initiating owner, and the statuses
         /// whose failures the caller expects.
-        waiting: Vec<(String, String, Done, Capture, &'static [u16])>,
+        waiting: Vec<(String, String, Done, Capture, &'static [u16], Option<super::Still>)>,
         /// Fetches under way, by server.
         active: HashMap<String, usize>,
     }
@@ -1221,13 +1245,13 @@ mod native {
         let dropped = {
             let mut jobs = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
             let host = host(&url);
-            jobs.waiting.push((url, host, done, capture, omit));
+            jobs.waiting.push((url, host, done, capture, omit, super::current_still()));
             (jobs.waiting.len() > QUEUE).then(|| jobs.waiting.remove(0))
         };
         // Every worker may be waiting for a server at its cap, and only some can take this one.
         q.ready.notify_all();
         // Answered once the queue is unlocked: `done` takes the cache's lock and wakes the app.
-        if let Some((_, _, done, _, _)) = dropped {
+        if let Some((_, _, done, _, _, _)) = dropped {
             done(Err(DROPPED.into()));
         }
     }
@@ -1315,11 +1339,14 @@ mod native {
             return;
         }
         let capture = Capture::current();
+        let still = super::current_still();
         std::thread::spawn(move || {
-            let _scope = capture.enter();
-            let r = head_with(AGENT.get_or_init(agent), &url);
-            HEADS.fetch_sub(1, Relaxed);
-            done(r);
+            super::with_optional_still(still, || {
+                let _scope = capture.enter();
+                let r = super::check_current().and_then(|_| head_with(AGENT.get_or_init(agent), &url));
+                HEADS.fetch_sub(1, Relaxed);
+                done(r);
+            })
         });
     }
 
@@ -1341,6 +1368,7 @@ mod native {
                     }
                 }
                 diagnostics.sending();
+                super::check_current()?;
                 let resp = req.call().map_err(unanswered)?;
                 diagnostics.answered(resp.status().as_u16());
                 let header = |k: &str| resp.headers().get(k).and_then(|v| v.to_str().ok());
@@ -1379,9 +1407,12 @@ mod native {
     pub(super) fn post(url: String, body: String, done: Done) {
         // Internet addresses only: a name that resolves into the local network gets no body.
         let capture = Capture::current();
+        let still = super::current_still();
         std::thread::spawn(move || {
-            let _scope = capture.enter();
-            done(post_with(&public_agent(std::time::Duration::from_secs(60)), &url, &body));
+            super::with_optional_still(still, || {
+                let _scope = capture.enter();
+                done(super::check_current().and_then(|_| post_with(&public_agent(std::time::Duration::from_secs(60)), &url, &body)));
+            });
         });
     }
 
@@ -1391,6 +1422,7 @@ mod native {
         use std::io::Read;
         let mut diagnostics = super::RequestDiagnostics::new(url, "POST");
         let answer = (|| -> Result<Vec<u8>, Failure> {
+            super::check_current()?;
             let mut resp = agent
                 .post(url)
                 .header("Content-Type", "application/json")
@@ -1426,9 +1458,13 @@ mod native {
 
     pub(super) fn download_within(url: String, timeout: std::time::Duration, done: DoneDetailed) {
         let capture = Capture::current();
+        let still = super::current_still();
         std::thread::spawn(move || {
-            let _scope = capture.enter();
-            done(get_detailed(&download_agent(timeout), &url));
+            super::with_optional_still(still, || {
+                let _scope = capture.enter();
+                let r = super::check_current().map_err(Failure::from).and_then(|_| get_detailed(&download_agent(timeout), &url));
+                done(r);
+            })
         });
     }
 
@@ -1436,20 +1472,23 @@ mod native {
         let agent = shared_agent();
         let q = queue();
         loop {
-            let (url, done, host, capture, omit) = {
+            let (url, done, host, capture, omit, still) = {
                 let mut jobs = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
-                    let hosts: Vec<&str> = jobs.waiting.iter().map(|(_, h, _, _, _)| h.as_str()).collect();
+                    let hosts: Vec<&str> = jobs.waiting.iter().map(|(_, h, _, _, _, _)| h.as_str()).collect();
                     if let Some(i) = pick(&hosts, &jobs.active) {
-                        let (url, host, done, capture, omit) = jobs.waiting.remove(i);
+                        let (url, host, done, capture, omit, still) = jobs.waiting.remove(i);
                         *jobs.active.entry(host.clone()).or_insert(0) += 1;
-                        break (url, done, host, capture, omit);
+                        break (url, done, host, capture, omit, still);
                     }
                     jobs = q.ready.wait(jobs).unwrap_or_else(|e| e.into_inner());
                 }
             };
             let _scope = capture.enter();
-            let result = get(agent, &url, omit);
+            let result = super::with_optional_still(still.clone(), || {
+                super::check_current()?;
+                get(agent, &url, omit)
+            });
             {
                 let mut jobs = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(n) = jobs.active.get_mut(&host) {
@@ -1461,7 +1500,7 @@ mod native {
             }
             // A job waiting for this server may go now.
             q.ready.notify_all();
-            done(result);
+            super::with_optional_still(still, || done(result));
         }
     }
 
@@ -1527,6 +1566,7 @@ mod native {
         let mut diagnostics = super::RequestDiagnostics::new(url, "GET");
         diagnostics.omit_statuses(omit);
         let answer = (|| -> Result<Vec<u8>, Failure> {
+            super::check_current()?;
             if crate::mbtiles::is_tile(url) {
                 return crate::mbtiles::read_local(url).map_err(Failure::from);
             }
@@ -1578,6 +1618,7 @@ mod native {
                     req = req.header("X-Esri-Authorization", &auth);
                 }
                 diagnostics.sending();
+                super::check_current()?;
                 let mut resp = req.call().map_err(unanswered)?;
                 let status = resp.status().as_u16();
                 diagnostics.answered(status);
@@ -1737,6 +1778,46 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Queued fetches and dedicated download threads recheck authority on actual start.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn revoked_workers_send_nothing_and_callbacks_inherit_context() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        for kind in 0..2 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/held", listener.local_addr().unwrap());
+            let live = Arc::new(AtomicBool::new(true));
+            let first = Arc::new(AtomicBool::new(true));
+            let (entered, entry) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let released = Mutex::new(released);
+            let flag = live.clone();
+            let still: Still = Arc::new(move || {
+                if first.swap(false, SeqCst) {
+                    entered.send(()).unwrap();
+                    released.lock().unwrap().recv().unwrap();
+                }
+                flag.load(SeqCst)
+            });
+            let (done, result) = std::sync::mpsc::channel();
+            let callback = Box::new(move |r: Result<Vec<u8>, String>| {
+                assert!(check_still(&current_still()).is_err(), "a follow-on request inherits revocation");
+                done.send(r).unwrap();
+            });
+            with_still(still, || match kind {
+                0 => native::fetch(url, callback, &[]),
+                _ => native::download(url, Box::new(move |r| callback(r.map_err(|e| e.message)))),
+            });
+            entry.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            live.store(false, SeqCst);
+            release.send(()).unwrap();
+            assert!(result.recv_timeout(std::time::Duration::from_secs(10)).unwrap().unwrap_err().contains("cancelled"));
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            assert!(current_still().is_none());
+        }
+    }
 
     fn network_records(history: &rustgis_data::diagnostics::History, url: &str) -> Vec<rustgis_data::diagnostics::Record> {
         history.records().into_iter().filter(|record| record.network.as_ref().is_some_and(|network| network.url == url)).collect()

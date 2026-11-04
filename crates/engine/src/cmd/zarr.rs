@@ -18,16 +18,16 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("raster.zarrInfo", "Zarr Variables", "Home › Add › Add Data › Zarr", info)
+        C::new("raster.zarrInfo", "Zarr Variables", "Home › Add › Add Data › Zarr", info).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"path": "a Zarr store's folder" | "url": "https://… a store with consolidated metadata"}"#),
-        C::new("zarr.series", "Time Series at a Point", "View › Time Series", series).view().params(
+        C::new("zarr.series", "Time Series at a Point", "View › Time Series", series).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).view().params(
             r#"{"lon", "lat", "layer"? (a Zarr layer: its store, variable and steps; default the active layer) | "path": folder | "url": "https://…", "variable"?, "index"?: {"level": 0} (the other dimensions' steps), "start"?, "end"?: dates (default: the layer's period, else the whole axis), "crs"?: for a projected store that doesn't say} → dates, values (null for no data) and labels along the variable's time dimension at the cell holding the point (desktop)"#,
         ),
-        C::new("zarr.reduce", "Summarise Zarr Over Time", "View › Time Series", reduce).params(
+        C::new("zarr.reduce", "Summarise Zarr Over Time", "View › Time Series", reduce).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
             r#"{"layer"? (a Zarr layer: its store, variable and steps; default the active layer) | "path": folder | "url": "https://…", "variable"?, "index"?, "stat": "mean"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove", "above"?: number (countAbove's threshold), "start"?, "end"?: dates (default: the layer's period, else the whole axis), "months"?: [1–12] (a season across years: [12, 1, 2]), "minValid"?: 0–1 (a cell with a smaller share of values is left empty; default 0), "name"?: text, "crs"?} → a raster layer of the statistic (desktop)"#,
         ),
-        C::new("layer.addZarr", "Add Zarr Variable", "Home › Add › Add Data", add).params(
+        C::new("layer.addZarr", "Add Zarr Variable", "Home › Add › Add Data", add).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
             r#"{"path": folder | "url": "https://…", "variable"?: "its path in the store (default: the first)", "index"?: {"time": 3, "level": 0} (other dimensions' steps, default 0), "crs"?: "EPSG:… for a store that doesn't say", "name"?: text, "time"?: bool (follow the time slider: the layer shows the step the slider is at, and turns the slider on over the variable's dates when it is off; desktop), "start"?, "end"?: dates (with time: the period to take, for an axis longer than the slider's 20,000 steps), "ran"?: (internal: a slice the app has read), "summary"?: bool (internal: with ran, a summary over time rather than a slice)}"#,
         ),
     ]
@@ -93,46 +93,52 @@ fn fetch(root: &str, keys: &[String]) -> Result<(HashMap<String, Vec<u8>>, usize
     let failure: Mutex<Option<String>> = Mutex::new(None);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let capture = rustgis_data::diagnostics::Capture::current();
+    let still = crate::render::rustgis_tiles::cache::current_still();
     std::thread::scope(|scope| {
         for _ in 0..8.min(keys.len().max(1)) {
             scope.spawn(|| {
-                let _diagnostic_scope = capture.enter();
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(k) = keys.get(i) else { break };
-                    if failure.lock().is_ok_and(|f| f.is_some()) {
-                        break;
-                    }
-                    // A missing file is an expected answer here (see `is_absent`), not a failure: its 404
-                    // or 403 isn't recorded one by one (one note per server says the
-                    // omission, and a store refusing everything still says "access denied"), while
-                    // a real one (a 500, a timeout) does, with its address, status and duration.
-                    let got = crate::render::rustgis_tiles::cache::download_blocking_omitting(&format!("{root}/{k}"), &[404, 403]);
-                    match got {
-                        Ok(b) => {
-                            let len = b.len() as u64;
-                            if total.fetch_add(len, std::sync::atomic::Ordering::Relaxed).saturating_add(len) > zarr::MAX_READ {
-                                if let Ok(mut f) = failure.lock() {
-                                    f.get_or_insert(format!("{root}: more than {} GB to read: take a smaller part", zarr::MAX_READ >> 30));
+                crate::render::rustgis_tiles::cache::with_optional_still(still.clone(), || {
+                    let _diagnostic_scope = capture.enter();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(k) = keys.get(i) else { break };
+                        if failure.lock().is_ok_and(|f| f.is_some()) {
+                            break;
+                        }
+                        // A missing file is an expected answer here (see `is_absent`), not a failure: its 404
+                        // or 403 isn't recorded one by one (one note per server says the
+                        // omission, and a store refusing everything still says "access denied"), while
+                        // a real one (a 500, a timeout) does, with its address, status and duration.
+                        let got = crate::render::rustgis_tiles::cache::download_blocking_omitting(&format!("{root}/{k}"), &[404, 403]);
+                        match got {
+                            Ok(b) => {
+                                let len = b.len() as u64;
+                                if total.fetch_add(len, std::sync::atomic::Ordering::Relaxed).saturating_add(len) > zarr::MAX_READ {
+                                    if let Ok(mut f) = failure.lock() {
+                                        f.get_or_insert(format!(
+                                            "{root}: more than {} GB to read: take a smaller part",
+                                            zarr::MAX_READ >> 30
+                                        ));
+                                    }
+                                    break;
                                 }
-                                break;
+                                if let Ok(mut o) = out.lock() {
+                                    o.insert(k.clone(), b);
+                                }
                             }
-                            if let Ok(mut o) = out.lock() {
-                                o.insert(k.clone(), b);
+                            Err(e) if is_absent(&e) => {
+                                if crate::render::rustgis_tiles::cache::http_status(&e) == Some(403) {
+                                    forbidden.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
-                        }
-                        Err(e) if is_absent(&e) => {
-                            if crate::render::rustgis_tiles::cache::http_status(&e) == Some(403) {
-                                forbidden.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                        Err(e) => {
-                            if let Ok(mut f) = failure.lock() {
-                                f.get_or_insert(format!("{root}/{k}: {e}"));
+                            Err(e) => {
+                                if let Ok(mut f) = failure.lock() {
+                                    f.get_or_insert(format!("{root}/{k}: {e}"));
+                                }
                             }
                         }
                     }
-                }
+                })
             });
         }
     });
@@ -141,6 +147,58 @@ fn fetch(root: &str, keys: &[String]) -> Result<(HashMap<String, Vec<u8>>, usize
     }
     let out = out.into_inner().map_err(|_| "a fetch failed".to_string())?;
     Ok((out, forbidden.into_inner()))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod transport_tests {
+    /// Drive the real chunk-fetch scoped thread and its blocking native sender. The listening
+    /// socket spies on sends; no portal or remote endpoint is involved.
+    #[test]
+    fn permission_transport_zarr_chunk_thread_sends_nothing_after_revocation() {
+        use crate::render::rustgis_tiles::cache;
+        use std::{
+            io::Write,
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicBool, Ordering::SeqCst},
+                mpsc::channel,
+            },
+            time::Duration,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let root = format!("http://{}/synthetic.zarr", listener.local_addr().unwrap());
+        let live = Arc::new(AtomicBool::new(true));
+        let (entered, entry) = channel();
+        let (release, released) = channel();
+        let released = Mutex::new(released);
+        let first = AtomicBool::new(true);
+        let flag = live.clone();
+        let still: cache::Still = Arc::new(move || {
+            if first.swap(false, SeqCst) {
+                entered.send(()).unwrap();
+                released.lock().unwrap().recv().unwrap();
+            }
+            flag.load(SeqCst)
+        });
+        let worker = std::thread::spawn(move || cache::with_still(still, || super::fetch(&root, &["a/0.0".into()])));
+        let held = entry.recv_timeout(Duration::from_secs(10)).is_ok();
+        live.store(false, SeqCst);
+        let _ = release.send(());
+        // On a broken propagation path, answer a mistakenly sent request before failing, so
+        // the regression doesn't leave a blocking HTTP worker behind in the test suite.
+        let sent = listener.accept();
+        let mut sends = 0;
+        if let Ok((mut stream, _)) = sent {
+            sends += 1;
+            let _ = stream.write_all(b"HTTP/1.1 500 Synthetic\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+        let result = worker.join().unwrap();
+        assert!(held, "the real chunk worker must inherit the initiating predicate");
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert_eq!(sends, 0);
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
 }
 
 /// A store's metadata from its web address.
@@ -396,16 +454,19 @@ fn read_ahead(zt: ZarrTime, i: usize) {
     }
     let ids: Vec<String> = keys.iter().map(|(_, k)| k.clone()).collect();
     let capture = rustgis_data::diagnostics::Capture::current();
+    let still = crate::render::rustgis_tiles::cache::current_still();
     let spawned = std::thread::Builder::new().name("zarr-read-ahead".into()).spawn(move || {
-        let _diagnostic_scope = capture.enter();
-        let _done = Done(keys.iter().map(|(_, k)| k.clone()).collect());
-        for (n, (j, k)) in keys.iter().enumerate() {
-            let ok = read_step(&zt, *j, k.clone()).is_ok();
-            release(&keys[n..=n]);
-            if !ok {
-                break;
+        crate::render::rustgis_tiles::cache::with_optional_still(still, || {
+            let _diagnostic_scope = capture.enter();
+            let _done = Done(keys.iter().map(|(_, k)| k.clone()).collect());
+            for (n, (j, k)) in keys.iter().enumerate() {
+                let ok = read_step(&zt, *j, k.clone()).is_ok();
+                release(&keys[n..=n]);
+                if !ok {
+                    break;
+                }
             }
-        }
+        })
     });
     // No thread to be had: nothing is read ahead, and its keys and place are given back.
     if spawned.is_err() {

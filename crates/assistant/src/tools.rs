@@ -6,7 +6,7 @@
 //! beyond the project (files, the network, the user's own automation) need the user's approval
 //! first ([`gate`]).
 
-use rustgis_engine::cmd::plugins::{Reach, reaches, user_only};
+use rustgis_engine::policy::{Call, Outcome, Permit, Scope};
 use rustgis_engine::{Session, analysis, project};
 use serde_json::{Value, json};
 
@@ -142,99 +142,63 @@ pub fn defs() -> Vec<ToolDef> {
 }
 
 /// The command a call runs and its parameters (`gp.run` for a tool), if it runs one.
+/// Use execution's strict envelope parser for policy too: malformed input has no runnable target.
 pub fn target(call: &ToolCall) -> Option<(String, Value)> {
     match call.name.as_str() {
-        "run_command" => Some((str_arg(&call.args, "command").unwrap_or_default(), obj_arg(&call.args, "params"))),
+        "run_command" => Some((str_arg(&call.args, "command").unwrap_or_default(), params_arg(&call.args).ok()?)),
         "run_tool" => Some((
             "gp.run".to_string(),
-            json!({"tool": str_arg(&call.args, "tool").unwrap_or_default(), "params": obj_arg(&call.args, "params")}),
+            json!({"tool": str_arg(&call.args, "tool").unwrap_or_default(), "params": params_arg(&call.args).ok()?}),
         )),
         _ => None,
     }
 }
 
-/// Whether a call needs the user's approval, and why.
-pub fn gate(s: &Session, call: &ToolCall) -> Option<String> {
-    // MCP's snapshot, saved to a file.
-    if call.name == "snapshot" {
-        return call
-            .args
-            .get("save_path")
-            .and_then(Value::as_str)
-            .filter(|p| !p.trim().is_empty())
-            .map(|_| "it writes a file on this computer".into());
-    }
-    // A script asks once, for every line that needs it, each named.
-    if call.name == "run" {
-        let script = call.args.get("script").and_then(Value::as_str).unwrap_or("");
-        let reasons: Vec<String> = rustgis_engine::cmd::workflows::script_commands(script)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(n, id, params)| {
-                let line = ToolCall { id: String::new(), name: "run_command".into(), args: json!({"command": id, "params": params}) };
-                gate(s, &line).map(|why| format!("line {n} ({id}): {why}"))
-            })
-            .collect();
-        return (!reasons.is_empty()).then(|| reasons.join("; "));
-    }
-    let (id, params) = target(call)?;
-    if id.starts_with(rustgis_engine::plugins::PREFIX) {
-        return Some("it runs a plugin's command".into());
-    }
-    if id == "ui.addUrl" && ["geolibreProject", "geolibreLayer", "geolibreZarr"].iter().any(|key| params.get(key).is_some()) {
-        return Some("it adds the files and web addresses a GeoLibre project names".into());
-    }
-    if user_only(&id) && !matches!(id.as_str(), "edit.undo" | "edit.redo") {
-        return Some(match id.as_str() {
-            "project.new" | "project.open" | "project.openText" | "project.sample" | "project.fromTemplate" => {
-                "it replaces the open project".into()
-            }
-            // Whether given a path, text or data: the project names the files and web addresses
-            // its layers are added from.
-            "layer.addDownload" => "it completes a download that may import a project and its referenced sources".into(),
-            "project.importGeolibre" => "it adds the files and web addresses a GeoLibre project names".into(),
-            "project.importQgis" => "it adds the files and web addresses a QGIS project names".into(),
-            _ => "it is reserved to you (plugins, scripts, tasks, models and the GeoLibre runner)".into(),
-        });
-    }
-    let spec = s.registry.get(&id)?;
-    if id == rustgis_engine::cmd::plugins::SQL || id == "sql.query" {
-        let why = "it runs an SQL query, which can read files on this computer and addresses on the internet";
-        // Views in a database the query opens run too, though the query doesn't show them.
-        return Some(match params.get("database").and_then(Value::as_str).filter(|d| !d.trim().is_empty()) {
-            Some(d) => format!("{why} (as can views in the database {d})"),
-            None => why.into(),
-        });
-    }
-    match reaches(spec, &params) {
-        Some(Reach::Files) => Some("it reads or writes files on this computer".into()),
-        Some(Reach::Network) => Some("it connects to an address on the internet".into()),
-        None => None,
-    }
-}
-
-/// What "allow for this conversation" remembers for a call: its command (a tool's id for
-/// `gp.run`) with its exact parameters, so allowing one file or address allows no other. Only file
-/// and network access can be allowed for good: plugin commands, the user's own automation and
-/// replacing the project are asked about every time.
-pub fn approval_key(s: &Session, call: &ToolCall) -> Option<String> {
-    let (command, key) = match call.name.as_str() {
-        "run_command" => {
-            let id = str_arg(&call.args, "command")?;
-            (id.clone(), id)
+/// The executor's strict envelope is the only input to engine planning.
+pub fn policy_call(call: &ToolCall) -> Result<Option<Call>, String> {
+    let c = match call.name.as_str() {
+        "run_command" => Some(Call::command(&str_arg(&call.args, "command").ok_or("command is required")?, params_arg(&call.args)?)),
+        "run_tool" => Some(Call::tool(&str_arg(&call.args, "tool").ok_or("tool is required")?, params_arg(&call.args)?)),
+        "run" => Some(Call::script(call.args.get("script").and_then(Value::as_str).ok_or("script is required")?)),
+        "snapshot" | "view_map" => {
+            let files = call.name == "snapshot" && call.args.get("save_path").and_then(Value::as_str).is_some_and(|p| !p.trim().is_empty());
+            let effects = if files {
+                rustgis_engine::policy::Effects::NONE.with(rustgis_engine::policy::Effect::Files)
+            } else {
+                rustgis_engine::policy::Effects::NONE
+            };
+            Some(Call::adapter(if call.name == "snapshot" { "snapshot" } else { "view_map" }, effects, call.args.clone()))
         }
-        "run_tool" => ("gp.run".to_string(), format!("gp.run:{}", str_arg(&call.args, "tool")?)),
-        _ => return None,
+        _ => None,
     };
-    if command.starts_with(rustgis_engine::plugins::PREFIX) || user_only(&command) || s.registry.get(&command).is_none() {
-        return None;
-    }
-    // Object keys serialise sorted, so the same parameters always make the same key.
-    // Parameters that won't run make no key.
-    let params = params_arg(&call.args).ok()?;
-    Some(format!("{key} {params}"))
+    Ok(c.map(|c| c.with_request(&call.id)))
 }
-
+/// A mapping of the engine outcome for callers that display the reason only.
+pub fn gate(s: &Session, call: &ToolCall) -> Option<String> {
+    let call = match policy_call(call) {
+        Ok(Some(call)) => call,
+        Ok(None) => return None,
+        Err(error) => return Some(error),
+    };
+    let scope = Scope::assistant(0, std::sync::Arc::new(Live::default()));
+    match s.review(&scope, &call) {
+        Outcome::Allowed => None,
+        Outcome::NeedsApproval(p) => Some(p.review().why.clone()),
+        Outcome::Refused(e) => Some(e),
+    }
+}
+/// A revocable assistant lifetime. A stopped lifetime is never re-enabled.
+pub(crate) struct Live(pub(crate) std::sync::atomic::AtomicBool);
+impl Default for Live {
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(true))
+    }
+}
+impl rustgis_engine::policy::Revocation for Live {
+    fn allows(&self, _: rustgis_engine::policy::Effects) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 /// A one-line description of a call for the transcript and the approval prompt.
 pub fn summary(call: &ToolCall) -> String {
     let short = |v: Value| {
@@ -253,12 +217,35 @@ pub fn summary(call: &ToolCall) -> String {
 }
 
 /// Runs a call; `Err` is a result the model is told failed.
-pub fn run(s: &mut Session, call: &ToolCall) -> Result<String, String> {
-    run_with_budget(s, call, DEFAULT_OUTPUT_TOKENS)
+pub fn run(s: &mut Session, call: &ToolCall, scope: Scope, permit: Option<Permit>) -> Result<String, String> {
+    run_with_budget(s, call, DEFAULT_OUTPUT_TOKENS, scope, permit)
 }
 
 /// Runs a call with a per-result token estimate, capped by the absolute ceiling.
-pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Result<String, String> {
+pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize, scope: Scope, permit: Option<Permit>) -> Result<String, String> {
+    if matches!(call.name.as_str(), "run_command" | "run_tool") {
+        if call.name == "run_command" && str_arg(&call.args, "command").is_some_and(|id| id.starts_with("ui.")) {
+            return Err("ui.* commands only open panes and dialogs; the assistant can't use them".into());
+        }
+        let engine = policy_call(call)?.ok_or("missing executable call")?;
+        let (before, mark) = (layer_snap(s), s.notice_mark());
+        let result = match permit {
+            Some(p) => s.run_permitted(scope, p, &engine),
+            None => s.run_scoped(scope, &engine),
+        }
+        .map_err(|e| error_with_notices(e, s, mark))?;
+        return Ok(bounded_json(&with_notices(with_new_layers(result, s, &before), s, mark), tokens));
+    }
+    if call.name == "run" {
+        return run_script(s, call, tokens, scope, permit);
+    }
+    if permit.is_some() {
+        return Err("this approval is for an executable call".into());
+    }
+    s.with_scope(scope, |s| run_read(s, call, tokens))?
+}
+
+fn run_read(s: &mut Session, call: &ToolCall, tokens: usize) -> Result<String, String> {
     let max_bytes = output_bytes(tokens);
     let a = &call.args;
     let v = match call.name.as_str() {
@@ -269,27 +256,9 @@ pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Resul
         "search_commands" => search_commands(s, a)?,
         "search_tools" => search_tools(a)?,
         "describe_tool" => describe_tool(a)?,
-        "run_command" => {
-            let id = str_arg(a, "command").ok_or("command is required")?;
-            if id.starts_with("ui.") {
-                return Err("ui.* commands only open panes and dialogs; the assistant can't use them".into());
-            }
-            if s.registry.get(&id).is_none() && !id.starts_with(rustgis_engine::plugins::PREFIX) {
-                return Err(format!("unknown command '{id}'; find ids with search_commands"));
-            }
-            let (before, mark) = (layer_snap(s), s.notice_mark());
-            let r = s.run(&id, &params_arg(a)?).map_err(|e| error_with_notices(e, s, mark))?;
-            with_notices(with_new_layers(r, s, &before), s, mark)
-        }
-        "run_tool" => {
-            let tool = str_arg(a, "tool").ok_or("tool is required")?;
-            let (before, mark) = (layer_snap(s), s.notice_mark());
-            let r = s.run("gp.run", &json!({"tool": tool, "params": params_arg(a)?})).map_err(|e| error_with_notices(e, s, mark))?;
-            with_notices(with_new_layers(r, s, &before), s, mark)
-        }
         "read_features" => read_features(s, a)?,
         // MCP's `run` (not offered to the in-app assistant): a script in one call.
-        "run" => return run_script(s, a, tokens),
+
         "search_docs" => crate::docs::search(&str_arg(a, "query").unwrap_or_default(), limit_arg(a, 8, 30))?,
         "read_doc" => {
             return crate::docs::read_with_budget(
@@ -434,7 +403,8 @@ fn with_new_layers(r: Value, s: &Session, before: &[(String, Vec<u32>)]) -> Valu
 /// kept (files it wrote stay). The answer is `{success, result, lines, layersAdded, notices,
 /// error, duration_s}`, where `result`
 /// is the last command's; a failure is an `Err` holding the same JSON.
-fn run_script(s: &mut Session, a: &Value, tokens: usize) -> Result<String, String> {
+fn run_script(s: &mut Session, call: &ToolCall, tokens: usize, scope: Scope, permit: Option<Permit>) -> Result<String, String> {
+    let a = &call.args;
     // Untrimmed, so errors name the same lines the caller wrote.
     let script = a
         .get("script")
@@ -443,7 +413,11 @@ fn run_script(s: &mut Session, a: &Value, tokens: usize) -> Result<String, Strin
         .ok_or("script is required: one `command-id {json}` per line")?;
     let start = web_time::Instant::now();
     let (before, mark) = (layer_snap(s), s.notice_mark());
-    let r = s.run("script.run", &json!({"script": script}));
+    let engine = Call::script(script).with_request(&call.id);
+    let r = match permit {
+        Some(p) => s.run_permitted(scope, p, &engine),
+        None => s.run_scoped(scope, &engine),
+    };
     let secs = (start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
     let notices: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
     match r {
@@ -546,7 +520,7 @@ fn search_commands(s: &Session, a: &Value) -> Result<Value, String> {
 fn search_tools(a: &Value) -> Result<Value, String> {
     let words = words(a)?;
     let limit = limit_arg(a, 12, 40);
-    let mut hits: Vec<(usize, Value)> = analysis::tools()
+    let mut hits: Vec<(usize, Value)> = analysis::published_tools()
         .filter_map(|t| {
             let (id, name, tb, summary) = (t.id.to_lowercase(), t.name.to_lowercase(), t.toolbox.to_lowercase(), t.summary.to_lowercase());
             let sc = score(&words, &[&id, &name, &tb, &summary]);
@@ -560,7 +534,9 @@ fn search_tools(a: &Value) -> Result<Value, String> {
 
 fn describe_tool(a: &Value) -> Result<Value, String> {
     let id = str_arg(a, "tool").ok_or("tool is required")?;
-    let t = analysis::tool(&id).ok_or_else(|| format!("no tool '{id}'; find ids with search_tools"))?;
+    let t = analysis::resolve_published(&id)
+        .map(|r| r.spec())
+        .ok_or_else(|| format!("no published tool '{id}'; open the tools or load the suite first"))?;
     let params: Vec<Value> = t
         .params
         .iter()

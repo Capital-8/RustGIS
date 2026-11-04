@@ -274,6 +274,7 @@ impl Calls {
 
 /// A plugin command waiting for its fetches before it runs again (the browser).
 pub(crate) struct Retry {
+    continuation: crate::policy::Continuation,
     id: String,
     params: Value,
     urls: Vec<String>,
@@ -301,7 +302,13 @@ impl Session {
         // the addresses.
         let fetching: Vec<&str> = urls.iter().map(|k| k.split_once(' ').map_or(k.as_str(), |(_, u)| u)).collect();
         let answer = json!({"pending": true, "fetching": fetching});
-        self.plugin_retries.push(Retry { id: id.to_string(), params: params.clone(), urls, tries: tries + 1 });
+        self.plugin_retries.push(Retry {
+            id: id.to_string(),
+            params: params.clone(),
+            urls,
+            tries: tries + 1,
+            continuation: self.continuation()?,
+        });
         Ok(answer)
     }
 
@@ -326,7 +333,7 @@ impl Session {
             .into_iter()
             .map(|r| {
                 self.retry_tries = r.tries;
-                let res = self.run(&r.id, &r.params);
+                let res = self.retry_continuation(&r.continuation, &r.params);
                 self.retry_tries = 0;
                 (r.id, res)
             })

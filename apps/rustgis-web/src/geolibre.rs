@@ -17,10 +17,12 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen(inline_js = r#"
 const BASE = "https://cdn.jsdelivr.net/npm/geolibre-wasm@1.8.0";
 let ready = null;
-function tools() {
+function tools(still = () => true) {
   if (!ready) {
     ready = (async () => {
+      if (!still()) throw new Error("GeoLibre run cancelled before loading");
       const mod = await import(`${BASE}/tools.mjs/+esm`);
+      if (!still()) throw new Error("GeoLibre run cancelled before initialization");
       await mod.initTools(`${BASE}/geolibre-cli.wasm`);
       return mod;
     })();
@@ -66,8 +68,10 @@ export async function geolibre_manifests() {
   }
   return text;
 }
-export async function geolibre_run(tool, argv, names, datas) {
-  const t = await tools();
+export async function geolibre_run(tool, argv, names, datas, still) {
+  if (!still()) throw new Error("GeoLibre run cancelled before preparation");
+  const t = await tools(still);
+  if (!still()) throw new Error("GeoLibre run cancelled before starting");
   const input = {};
   for (let i = 0; i < names.length; i++) input[names[i]] = datas[i];
   const r = await t.runTool(tool, { args: argv, input });
@@ -79,7 +83,13 @@ extern "C" {
     #[wasm_bindgen(catch)]
     async fn geolibre_manifests() -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch)]
-    async fn geolibre_run(tool: &str, argv: js_sys::Array, names: js_sys::Array, datas: js_sys::Array) -> Result<JsValue, JsValue>;
+    async fn geolibre_run(
+        tool: &str,
+        argv: js_sys::Array,
+        names: js_sys::Array,
+        datas: js_sys::Array,
+        still: &js_sys::Function,
+    ) -> Result<JsValue, JsValue>;
 }
 
 fn js_error(e: &JsValue) -> String {
@@ -114,10 +124,19 @@ pub fn manifests(slot: Slot<Result<String, String>>, ctx: egui::Context) {
 /// Runs one tool and puts its new files and printed lines (or its error) in `slot`.
 pub fn run(job: ExternalRun, slot: Slot<ExternalOutput>, ctx: egui::Context) {
     wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = job.can_start() {
+            if let Ok(mut out) = slot.lock() {
+                *out = Some(Err(e));
+            }
+            ctx.request_repaint();
+            return;
+        }
         let argv: js_sys::Array = job.argv.iter().map(|a| JsValue::from_str(a)).collect();
         let names: js_sys::Array = job.files.iter().map(|(n, _)| JsValue::from_str(n)).collect();
         let datas: js_sys::Array = job.files.iter().map(|(_, b)| JsValue::from(js_sys::Uint8Array::from(b.as_slice()))).collect();
-        let r = match geolibre_run(&job.tool, argv, names, datas).await {
+        let still = job.still();
+        let check = wasm_bindgen::closure::Closure::<dyn Fn() -> bool>::new(move || still());
+        let r = match geolibre_run(&job.tool, argv, names, datas, check.as_ref().unchecked_ref()).await {
             Err(e) => Err(js_error(&e)),
             Ok(out) => {
                 let lines = strings(&get(&out, "stdout"));

@@ -2,6 +2,9 @@ use serde_json::{Value, json};
 
 use crate::{Project, Session, sample};
 
+#[path = "tests/permission_policy.rs"]
+mod permission_policy;
+
 #[path = "tests/task_reentry.rs"]
 mod task_reentry;
 
@@ -2184,6 +2187,78 @@ fn geotiff_parts_open_and_survive_a_saved_project() {
     assert_eq!(value(&s), Some(244.0));
 }
 
+/// File-supplied items reject implicit network and reserved actions before their handlers run,
+/// while ordinary in-project cells still run. This uses the existing Wasm plugin fixture.
+#[test]
+fn imported_tasks_and_notebooks_reject_network_and_reserved_actions() {
+    let mut s = world();
+    plugin("eng-item-containment", &[]);
+    for (command, params) in [
+        ("layer.geocode", json!({"layer": "Cities", "address": "name"})),
+        ("connection.test", json!({"id": "saved-connection"})),
+        ("plugin.uninstall", json!({"id": "eng-item-containment"})),
+    ] {
+        let steps = json!([{"title": "Outside", "command": command, "params": params}]);
+        let task = json!({"name": "From a file", "steps": steps});
+        let why = s.run("task.import", &json!({"text": task.to_string()})).unwrap_err();
+        assert!(why.contains("network") && why.contains("imported"), "{why}");
+        // Opened projects and later edits reach the execution check without task.import.
+        s.run("task.new", &json!({"name": command, "steps": steps, "imported": true})).unwrap();
+        let why = s.run("task.run", &json!({"task": command})).unwrap_err();
+        assert!(why.contains("from a file"), "{why}");
+    }
+    let text = json!({"name": "Shared", "cells": [
+        {"kind": "code", "source": "select.all {\"layer\":\"Cities\"}"},
+        {"kind": "code", "source": "plugin.uninstall {\"id\":\"eng-item-containment\"}"},
+        {"kind": "code", "source": "layer.geocode {\"layer\":\"Cities\",\"address\":\"name\"}"}
+    ]})
+    .to_string();
+    s.run("notebook.open", &json!({"text": text})).unwrap();
+    let result = s.run("notebook.run", &json!({"notebook": "Shared"})).unwrap();
+    assert_eq!(result["error"], 1);
+    let notebook = s.project.notebooks.iter().find(|n| n.name == "Shared").unwrap();
+    assert!(!notebook.cells[0].error);
+    assert!(notebook.cells[1].error && notebook.cells[1].output.as_deref().unwrap().contains("from a file"));
+    assert!(!s.map().layer_by_name("Cities").unwrap().selection.is_empty());
+    let result = s.run("notebook.run", &json!({"notebook": "Shared", "cell": 2})).unwrap();
+    assert_eq!(result["error"], 2);
+    assert!(rustgis_plugins::get("eng-item-containment").is_some(), "no uninstall handler ran");
+    rustgis_plugins::unload("eng-item-containment");
+}
+
+/// Plugin tools are rejected through all imported item runners, including models' direct tool
+/// paths. A locally authored model still runs the same real plugin tool.
+#[test]
+fn imported_items_reject_resolved_plugin_tools() {
+    let mut s = world();
+    plugin("eng-tool-containment", &[]);
+    let tool = "plugin:eng-tool-containment/m";
+    let params = json!({"input": "Cities"});
+    let gp = json!({"tool": tool, "params": params});
+    let before = s.map().layers.len();
+    let task = json!({"name": "Plugin task", "steps": [{"title": "Run", "command": "gp.run", "params": gp}]});
+    assert!(s.run("task.import", &json!({"text": task.to_string()})).unwrap_err().contains("imported"));
+    let notebook = json!({"name": "Plugin notebook", "cells": [{"kind": "code", "source": format!("gp.run {gp}")}]});
+    s.run("notebook.open", &json!({"text": notebook.to_string()})).unwrap();
+    assert_eq!(s.run("notebook.run", &json!({"notebook": "Plugin notebook"})).unwrap()["error"], 0);
+    let graph = json!({"nodes": [{"id": "x", "kind": "tool", "tool": tool, "params": params}], "edges": []});
+    for (name, body) in [("Plugin steps", json!({"steps": [{"tool": tool, "params": params}]})), ("Plugin graph", json!({"graph": graph}))]
+    {
+        let mut model = body;
+        model["name"] = json!(name);
+        s.run("model.import", &json!({"text": model.to_string()})).unwrap();
+        let why = s.run("model.run", &json!({"name": name})).unwrap_err();
+        assert!(why.contains("from a file"), "{why}");
+    }
+    assert_eq!(s.map().layers.len(), before, "no untrusted tool ran");
+    // The same graph made here is authorized; no plugin interface or manifest policy changes.
+    s.run("model.new", &json!({"name": "Made here", "graph": graph})).unwrap();
+    s.run("model.run", &json!({"name": "Made here"})).unwrap();
+    assert_eq!(s.map().layers.len(), before + 1);
+    assert!(s.map().layer_by_name("Made").is_some());
+    rustgis_plugins::unload("eng-tool-containment");
+}
+
 #[test]
 fn imported_tasks_name_outputs_and_steps_are_edited() {
     let mut s = Session::new(sample::world_project());
@@ -2198,8 +2273,8 @@ fn imported_tasks_name_outputs_and_steps_are_edited() {
     assert!(s.map().layer_by_name("Near cities").is_some());
     let to_a_file = json!({"name": "To a file", "steps": [{"title": "Buffer", "command": "gp.run", "params": {"tool": "buffer", "params": {"input": "Cities", "distance": 100, "output": "C:/temp/x.shp"}}}]});
     assert!(s.run("task.import", &json!({"text": to_a_file.to_string()})).is_err());
-    assert!(crate::cmd::items::touches_files("gp.run", &json!({"tool": "buffer", "params": {"output": "../x.shp"}})));
-    assert!(!crate::cmd::items::touches_files("gp.run", &json!({"tool": "buffer", "params": {"output": "Near cities"}})));
+    assert!(crate::cmd::items::touches_files(&s, "gp.run", &json!({"tool": "buffer", "params": {"output": "../x.shp"}})));
+    assert!(!crate::cmd::items::touches_files(&s, "gp.run", &json!({"tool": "buffer", "params": {"output": "Near cities"}})));
     // Only a plain layer name, only gp.run's, only for RustGIS's own tools.
     for (command, params) in [
         ("gp.run", json!({"tool": "buffer", "params": {"output": "x.shp"}})),
@@ -2213,7 +2288,7 @@ fn imported_tasks_name_outputs_and_steps_are_edited() {
         ("gp.run", json!({"tool": "buffer", "params": {"input": "Cities", "nested": {"output": "x"}}})),
         ("layer.rename", json!({"layer": "Cities", "output": "x"})),
     ] {
-        assert!(crate::cmd::items::touches_files(command, &params), "{command} {params}");
+        assert!(crate::cmd::items::touches_files(&s, command, &params), "{command} {params}");
     }
 
     // `"step": null` runs the whole task, as before; a step that isn't an index is refused.
@@ -2258,7 +2333,7 @@ Line two."
     assert!(s.run("task.editStep", &json!({"task": "Lesson", "step": 1, "title": format!(" {same} ")})).is_err());
     assert_eq!(s.undo_depth(), depth);
     // Still a task from a file: a step that writes a file stays refused after editing.
-    assert!(!s.trusted_tasks.contains("lesson"));
+    assert!(!s.item_trusted("task", "lesson"));
 }
 
 #[test]
@@ -2931,7 +3006,7 @@ fn geolibre_runs_can_finish_asynchronously() {
         eprintln!("skipped: no GeoLibre runner (set RUSTGIS_GEOLIBRE)");
         return;
     }
-    assert!(external_start(&mut s, "geolibre:slope", &json!({})).unwrap_err().contains("required"));
+    assert!(external_start(&mut s, "geolibre:slope", &json!({})).err().unwrap().contains("required"));
     assert!(external_start(&mut s, "buffer", &json!({})).is_err(), "only GeoLibre tools");
     let run = external_start(&mut s, "geolibre:slope", &json!({"input": "scene"})).unwrap();
     assert_eq!((run.tool.as_str(), run.files.len()), ("slope", 1), "the embedded raster is staged");
@@ -6612,11 +6687,11 @@ fn project_items_files_styles_packages_tasks_and_3d() {
     s.run("task.run", &json!({"task": "Explore", "step": 2})).unwrap();
     assert_eq!(s.map().selection_count(), 0);
     s.run("task.new", &json!({"name": "Replay", "fromHistory": true})).unwrap();
-    assert!(s.trusted_tasks.contains("replay"), "history run in this session");
+    assert!(s.item_trusted("task", "replay"), "history run in this session");
     // History that came with an opened project is someone else's.
     s.history_from_file = 1;
     s.run("task.new", &json!({"name": "Replay file", "fromHistory": true})).unwrap();
-    assert!(!s.trusted_tasks.contains("replay file"));
+    assert!(!s.item_trusted("task", "replay file"));
     s.history_from_file = 0;
     assert_eq!(s.project.tasks.last().unwrap().steps.len(), 1);
     s.run("task.save", &json!({"task": "Explore", "path": path("explore.rgistask")})).unwrap();
@@ -8121,6 +8196,17 @@ fn plugin_tools_name_their_output_layer_with_edit_alone() {
     use crate::cmd::plugins::reaches;
     let mut s = world();
     plugin("eng-out", &["edit"]);
+    #[cfg(feature = "geolibre")]
+    crate::cmd::gp::external_load_manifests(
+        &json!([{
+            "id":"slope", "display_name":"Slope", "params":[
+                {"name":"input","data_kind":"raster","io_role":"input","required":true},
+                {"name":"output","data_kind":"raster","io_role":"output"}
+            ]
+        }])
+        .to_string(),
+    )
+    .unwrap();
     let clip = json!({"tool": "clip", "params": {"input": "Cities", "clip": "Countries", "output": "Cities in countries"}});
     let gp = s.registry.get("gp.run").copied().unwrap();
     assert!(reaches(&gp, &clip).is_none(), "the assistant doesn't ask either");
@@ -8130,13 +8216,68 @@ fn plugin_tools_name_their_output_layer_with_edit_alone() {
         json!({"tool": "clip", "params": {"input": "Cities", "clip": "Countries", "output": "out/cities"}}),
         json!({"tool": "clip", "params": {"input": "Cities", "clip": "Countries", "output": "cities.shp"}}),
         json!({"tool": "clip", "params": {"input": "Cities", "clip": "Countries", "output": "C:\\cities"}}),
+        #[cfg(feature = "geolibre")]
         json!({"tool": "geolibre:slope", "params": {"input": "Cities", "output": "slope"}}),
-        json!({"tool": "vectorToPmtiles", "params": {"input": "Cities", "output": "cities"}}),
+        json!({"tool": "vectorToPmtiles", "params": {"input": "Cities", "minZoom": 0, "maxZoom": 0, "output": "cities"}}),
     ] {
         let e = forward(&mut s, "eng-out", "gp.run", params.clone()).unwrap_err();
         assert!(e.contains("'files' permission"), "{params}: {e}");
     }
     rustgis_plugins::unload("eng-out");
+}
+
+/// The real Wasm forwarding command may run only its own tool, resolved by id or display
+/// name, with edit and file requirements preserved. Process tools share the same boundary.
+#[test]
+fn plugin_bridges_cannot_run_another_plugins_tools() {
+    let mut s = world();
+    for id in ["eng-bridge-owner", "eng-bridge-other"] {
+        let mut pkg = rustgis_plugins::Package::from_zip(&rustgis_plugins::testing::package(id, &["edit"])).unwrap();
+        pkg.manifest.tools[0].name = format!("Points for {id}");
+        rustgis_plugins::load(pkg, "test").unwrap();
+    }
+    let before = s.map().layers.len();
+    for tool in ["plugin:eng-bridge-other/m", "Points for eng-bridge-other"] {
+        let why = forward(&mut s, "eng-bridge-owner", "gp.run", json!({"tool": tool, "params": {"input": "Cities"}})).unwrap_err();
+        assert!(why.contains("another plugin") && why.contains("eng-bridge-other"), "{why}");
+        assert_eq!(s.map().layers.len(), before);
+    }
+    for tool in ["plugin:eng-bridge-owner/m", "Points for eng-bridge-owner"] {
+        forward(&mut s, "eng-bridge-owner", "gp.run", json!({"tool": tool, "params": {"input": "Cities"}})).unwrap();
+    }
+    assert_eq!(s.map().layers.len(), before + 2);
+    plugin("eng-bridge-readonly", &[]);
+    let why =
+        forward(&mut s, "eng-bridge-readonly", "gp.run", json!({"tool": "plugin:eng-bridge-readonly/m", "params": {"input": "Cities"}}))
+            .unwrap_err();
+    assert!(why.contains("'edit' permission"), "{why}");
+    // File-shaped parameters to an own tool still require files before the tool runs.
+    let why = forward(
+        &mut s,
+        "eng-bridge-owner",
+        "gp.run",
+        json!({"tool": "plugin:eng-bridge-owner/m", "params": {"input": "Cities", "path": "never-opened.nc"}}),
+    )
+    .unwrap_err();
+    assert!(why.contains("'files' permission"), "{why}");
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let run = rustgis_plugins::testing::child_run("tests::plugin_process_child");
+        let manifest =
+            rustgis_plugins::Manifest::parse(&rustgis_plugins::testing::process_manifest("eng-bridge-process", &[], &run)).unwrap();
+        let pkg =
+            rustgis_plugins::Package { manifest, wasm: vec![], sha256: "test".into(), dir: Some(std::env::temp_dir()), skills: vec![] };
+        rustgis_plugins::load(pkg, "test").unwrap();
+        let why =
+            forward(&mut s, "eng-bridge-owner", "gp.run", json!({"tool": "plugin:eng-bridge-process/m", "params": {"input": "Cities"}}))
+                .unwrap_err();
+        assert!(why.contains("another plugin"), "{why}");
+        assert_eq!(s.map().layers.len(), before + 2, "no process tool ran");
+        rustgis_plugins::unload("eng-bridge-process");
+    }
+    for id in ["eng-bridge-owner", "eng-bridge-other", "eng-bridge-readonly"] {
+        rustgis_plugins::unload(id);
+    }
 }
 
 /// A plugin's command the app runs leaves its downloads to the app, which fetches them off the
@@ -8155,7 +8296,10 @@ fn plugin_downloads_are_left_to_the_app() {
     assert_eq!((s.undo.len(), s.map().layers.len()), (undo, layers));
     let asked = s.take_url_requests();
     assert_eq!(asked.len(), 1);
-    assert_eq!((asked[0]["name"].as_str(), asked[0]["x"].as_str(), asked[0]["y"].as_str()), (Some("Places"), Some("lon"), Some("lat")));
+    assert_eq!(
+        (asked[0].params()["name"].as_str(), asked[0].params()["x"].as_str(), asked[0].params()["y"].as_str()),
+        (Some("Places"), Some("lon"), Some("lat"))
+    );
     assert!(s.run("plugin:eng-url/f", &p).is_err(), "run otherwise, it waits");
     assert!(s.take_url_requests().is_empty());
     // An edit run that way is an undo step still.
@@ -8461,6 +8605,7 @@ fn plugin_fetches_run_the_command_again_when_they_land() {
     let (base, _) = serve_documents();
     fetch_mode(true, false);
     let url = format!("{base}/json?web=1");
+    s.log.clear();
     let notices = s.notice_mark();
     let undo = s.undo.len();
     let r = forward(&mut s, "eng-fetch-web", "host.fetch", json!({"url": url})).unwrap();
@@ -8480,6 +8625,11 @@ fn plugin_fetches_run_the_command_again_when_they_land() {
     assert_eq!(ran[0].0, "plugin:eng-fetch-web/f");
     assert_eq!(ran[0].1.as_ref().unwrap()["json"]["valid"], true);
     assert!(s.poll_plugin_retries().is_empty(), "run once");
+    assert_eq!(
+        s.log.entries().filter(|e| e.command == "plugin:eng-fetch-web/f").count(),
+        1,
+        "one actual final log entry, no pending entry"
+    );
     // A failed fetch is given to the run again as its error.
     let r = forward(&mut s, "eng-fetch-web", "host.fetch", json!({"url": format!("{base}/missing")})).unwrap();
     assert_eq!(r["pending"], true);
@@ -8492,6 +8642,35 @@ fn plugin_fetches_run_the_command_again_when_they_land() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     assert!(ran[0].1.as_ref().unwrap_err().contains("404"), "{:?}", ran[0].1);
+    // A held pinned retry publishes revocation instead of disappearing from the UI.
+    struct Live(std::sync::atomic::AtomicBool);
+    impl crate::policy::Revocation for Live {
+        fn allows(&self, _: crate::policy::Effects) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    let live = std::sync::Arc::new(Live(true.into()));
+    let scope = crate::policy::Scope::assistant(901, live.clone());
+    let call = crate::policy::Call::command(
+        "plugin:eng-fetch-web/f",
+        json!({"op":"host.fetch","params":{"url":format!("{base}/json?revoked=1")}}),
+    );
+    let crate::policy::Outcome::NeedsApproval(p) = s.review(&scope, &call) else { panic!("plugin must ask") };
+    assert_eq!(s.run_permitted(scope, p.allow(), &call).unwrap()["pending"], true);
+    live.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mark = s.notice_mark();
+    let started = std::time::Instant::now();
+    let revoked = loop {
+        let r = s.poll_plugin_retries();
+        if !r.is_empty() || started.elapsed() > std::time::Duration::from_secs(10) {
+            break r;
+        }
+        std::thread::yield_now();
+    };
+    assert_eq!(revoked.len(), 1);
+    assert!(revoked[0].1.is_err());
+    assert!(s.notices_since(mark).iter().any(|n| n.error), "revoked retry is visible");
+    assert!(s.poll_plugin_retries().is_empty());
     // A command forever waiting gives up.
     s.retry_tries = crate::cmd::plugins::fetch::MAX_RETRIES;
     let e = forward(&mut s, "eng-fetch-web", "host.fetch", json!({"url": format!("{base}/json?web=2")})).unwrap_err();
@@ -8519,6 +8698,19 @@ fn plugin_tools_run_in_the_geoprocessing_pane() {
 
 #[test]
 fn plugin_tools_run_off_the_session() {
+    // This snapshot-fitting scenario needs stable accounts; connection tests rotate the
+    // process-wide store and correctly revoke unrelated held continuations.
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var_os("RUSTGIS_PLUGIN_BG_TEST_CHILD").is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::plugin_tools_run_off_the_session", "--nocapture"])
+            .env("RUSTGIS_PLUGIN_BG_TEST_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("test result: ok. 1 passed; 0 failed;"));
+        return;
+    }
     use crate::cmd::gp::{plugin_complete, plugin_start};
     use rustgis_plugins::tools::Control;
     let mut s = world();
@@ -8625,14 +8817,17 @@ fn plugin_file_parameters_reach_files_and_stay_out_of_the_history() {
     let mut s = world();
     plugin("eng-file", &["files"]);
     let run = json!({"tool": "plugin:eng-file/r", "params": {"model": "/data/pism.nc"}});
-    // Running a tool that reads a file reaches files (the assistant asks first)...
+    // Plugin identity asks each time, with or without a file parameter.
     let gp = s.registry.get("gp.run").copied().unwrap();
-    assert!(matches!(reaches(&gp, &run), Some(Reach::Files)));
-    assert!(reaches(&gp, &json!({"tool": "plugin:eng-file/m", "params": {"input": "Cities"}})).is_none());
-    // ...so a plugin without `files` can't run it.
+    assert_eq!(reaches(&gp, &run), Some(Reach::Plugin("plugin:eng-file/r")));
+    assert_eq!(
+        reaches(&gp, &json!({"tool": "plugin:eng-file/m", "params": {"input": "Cities"}})),
+        Some(Reach::Plugin("plugin:eng-file/m"))
+    );
+    // A different plugin cannot run it, regardless of its file parameters.
     plugin("eng-file-edit", &["edit"]);
     let e = forward(&mut s, "eng-file-edit", "gp.run", run).unwrap_err();
-    assert!(e.contains("'files' permission"), "{e}");
+    assert!(e.contains("another plugin"), "{e}");
     // A file picked in the browser travels with its contents, but the history keeps its name.
     let picked = json!({"tool": "plugin:eng-file/r", "params": {"model": {"name": "pism.nc", "data": "Q0RGAQ=="}}});
     s.run("gp.run", &picked).unwrap();
@@ -10809,10 +11004,11 @@ fn url_requests_wait_for_the_front_end() {
     assert!(s.request_url(&json!({"url": "https://x.org/a.geojson", "name": "A2"})).is_ok());
     let taken = s.take_url_requests();
     assert_eq!(taken.len(), 3, "the same request once");
-    assert_eq!((taken[0]["name"].as_str(), taken[0]["zoom"].as_bool()), (Some("A"), Some(true)));
-    assert_eq!(taken[1]["url"], "https://x.org/b.geojson");
-    assert_eq!((taken[2]["url"].as_str(), taken[2]["name"].as_str()), (Some("https://x.org/a.geojson"), Some("A2")));
+    assert_eq!((taken[0].params()["name"].as_str(), taken[0].params()["zoom"].as_bool()), (Some("A"), Some(true)));
+    assert_eq!(taken[1].params()["url"], "https://x.org/b.geojson");
+    assert_eq!((taken[2].params()["url"].as_str(), taken[2].params()["name"].as_str()), (Some("https://x.org/a.geojson"), Some("A2")));
     assert!(s.take_url_requests().is_empty());
+    drop(taken); // Abandoned opaque requests release their bounded unclaimed authority.
     for i in 0..16 {
         assert!(s.request_url(&json!({"url": format!("https://x.org/{i}")})).is_ok(), "{i}");
     }
@@ -10821,8 +11017,12 @@ fn url_requests_wait_for_the_front_end() {
     assert!(s.request_url(&json!({"url": "https://x.org/3"})).is_ok(), "one already waiting is fine");
     let taken = s.take_url_requests();
     assert_eq!(taken.len(), 16, "a few at a time");
-    assert_eq!((taken[0]["url"].as_str(), taken[15]["url"].as_str()), (Some("https://x.org/0"), Some("https://x.org/15")));
-    assert!(s.request_url(&json!({"url": "https://x.org/16"})).is_ok(), "room again once taken");
+    assert_eq!(
+        (taken[0].params()["url"].as_str(), taken[15].params()["url"].as_str()),
+        (Some("https://x.org/0"), Some("https://x.org/15"))
+    );
+    drop(taken);
+    assert!(s.request_url(&json!({"url": "https://x.org/16"})).is_ok(), "room again once abandoned");
 }
 
 /// A mutating command that only left a request for the front end (the browser's `layer.addUrl`)
@@ -10867,8 +11067,8 @@ fn a_failed_command_takes_its_request_back() {
     });
     assert!(r.is_err());
     let left = s.take_url_requests();
-    assert_eq!(left.len(), 1, "{left:?}");
-    assert_eq!(left[0]["url"], "https://x.org/kept.geojson");
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].params()["url"], "https://x.org/kept.geojson");
 }
 
 /// A service's features keep the address they came from, and Copy Path gives it without its key.
@@ -12574,7 +12774,8 @@ fn diagnostics_keep_failed_command_context_without_changing_notice_rollback() {
         id: "diagnostics.testSourceRestore",
         label: "Diagnostics source restore",
         mutates: false,
-        run: panic_run,
+        run: crate::policy::Handler::new(panic_run),
+        effects: crate::policy::Effects::NONE,
         ..*s.registry.get("map.zoomIn").unwrap()
     };
     s.registry.commands.push(command);
@@ -12633,7 +12834,8 @@ fn diagnostics_network_requests_belong_only_to_the_command_session() {
         id: "diagnostics.testRequest",
         label: "Diagnostics request",
         mutates: false,
-        run: request,
+        run: crate::policy::Handler::new(request),
+        effects: crate::policy::Effects::NONE,
         ..*a.registry.get("map.zoomIn").unwrap()
     };
     a.registry.commands.push(command);
@@ -18752,8 +18954,8 @@ fn a_failed_command_keeps_the_project_open_before_it() {
     let mut s = world();
     // Opened from a file, edited, unsaved, with a task made here.
     s.path = Some("atlas.rgis".into());
+    s.run("task.new", &json!({"name":"mine", "steps":[]})).unwrap();
     s.run("map.rename", &json!({"name": "Edited"})).unwrap();
-    s.trusted_tasks.insert("mine".into());
     let (name, opened, undo) = (s.project.name.clone(), s.opened, s.undo_label());
     assert!(undo.is_some() && s.dirty());
     let r = s.guarded("Task", true, |s| {
@@ -18765,7 +18967,7 @@ fn a_failed_command_keeps_the_project_open_before_it() {
     // It comes back with what it held: its undo history, its unsaved state, the trust it had, and
     // its file, so Save writes there.
     assert_eq!(s.undo_label(), undo);
-    assert!(s.dirty() && s.trusted_tasks.contains("mine"));
+    assert!(s.dirty() && s.item_trusted("task", "mine"));
     assert_eq!(s.path.as_deref(), Some(std::path::Path::new("atlas.rgis")));
     s.run("edit.undo", &Value::Null).unwrap();
     assert_ne!(s.map().name, "Edited", "the edit before still undoes");
@@ -18801,7 +19003,7 @@ fn a_failed_command_keeps_the_project_open_before_it() {
     // Opened for good, it counts, and the old project's history and file go with it.
     s.run("project.new", &json!({"name": "Other"})).unwrap();
     assert_eq!((s.opened, s.undo_label(), s.path.as_deref()), (opened + 1, None, None));
-    assert!(!s.trusted_tasks.contains("mine"));
+    assert!(!s.item_trusted("task", "mine"));
 }
 
 /// A run from the history as code (#539): a Python call, a Script pane line, a CLI command. A
@@ -18819,11 +19021,16 @@ fn a_run_is_copied_from_the_history_as_code() {
     let py = code(&mut s, 0, "python").unwrap();
     assert!(py.starts_with("s.run(\n    \"gp.run\",\n    tool=\"buffer\",\n    params={\n"), "{py}");
     assert!(py.contains("\"distance\": 100,") && py.contains("\"input\": \"Cities\",") && py.ends_with(")"), "{py}");
-    assert_eq!(code(&mut s, 0, "command").unwrap(), r#"gp.run {"params":{"distance":100,"input":"Cities"},"tool":"buffer"}"#);
+    assert_eq!(
+        code(&mut s, 0, "command").unwrap(),
+        r#"gp.run {"params":{"dissolve":"None","distance":100,"input":"Cities","units":"Kilometers"},"tool":"buffer"}"#
+    );
     let cli = code(&mut s, 0, "cli").unwrap();
     assert!(
         cli.starts_with("rustgis-cli run --project '")
-            && cli.ends_with(r#"--cmd 'gp.run={"params":{"distance":100,"input":"Cities"},"tool":"buffer"}'"#),
+            && cli.ends_with(
+                r#"--cmd 'gp.run={"params":{"dissolve":"None","distance":100,"input":"Cities","units":"Kilometers"},"tool":"buffer"}'"#
+            ),
         "{cli}"
     );
     // A point buffer: by its command, with the point.
@@ -20864,7 +21071,7 @@ fn dem_tiles_mosaic_clip_by_polygon_share_a_stretch_and_report_overviews() {
     assert!(s.notices_since(mark).iter().any(|n| n.text == said), "{:?}", s.notices_since(mark));
     std::fs::remove_dir_all(&dir).ok();
     // Bare file names read files too: tasks and notebooks from elsewhere may not run it.
-    assert!(crate::cmd::items::touches_files("raster.mosaic", &json!({"inputs": ["a.tif", "b.tif"]})));
+    assert!(crate::cmd::items::touches_files(&s, "raster.mosaic", &json!({"inputs": ["a.tif", "b.tif"]})));
     for (bad, why) in [
         (json!({"inputs": ["west"]}), "two or more"),
         (json!({"inputs": ["west", "coarse"]}), "cell size"),
@@ -21020,9 +21227,9 @@ fn model_graphs(s: &mut Session) {
     assert_eq!(r["outputs"][0], "Buffers");
     // Saving over a model from a file keeps it one.
     s.run("model.save", &json!({"name": "From disk", "graph": both, "imported": true})).unwrap();
-    assert!(!s.trusted_models.contains("from disk"));
+    assert!(!s.item_trusted("model", "from disk"));
     s.run("model.save", &json!({"name": "From disk", "graph": both, "rename": "Renamed"})).unwrap();
-    assert!(!s.trusted_models.contains("renamed") && !s.trusted_models.contains("from disk"));
+    assert!(!s.item_trusted("model", "renamed") && !s.item_trusted("model", "from disk"));
     s.run("model.remove", &json!({"name": "Renamed"})).unwrap();
 
     // Problems: a missing layer, an unconnected required input, a loop.
@@ -25817,6 +26024,16 @@ fn built_in_tools_run_off_the_session() {
     tool_complete(&mut s, id, done).unwrap();
     let e = s.run("gp.finish", &json!({"id": id})).unwrap_err();
     assert!(e.contains("no longer the active one"), "{e}");
+    assert_eq!(s.map().layers.len(), layers);
+    // A standalone table belongs to the project, so its owned result can land while another map is in view.
+    s.project.active_map = 0;
+    let run = tool_start(&mut s, "summaryStatistics", &json!({"input":"Cities","field":"pop_max"})).unwrap();
+    s.project.active_map = 1;
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    let made = s.run("gp.finish", &json!({"id":id})).unwrap();
+    assert_eq!(made["table"], "Cities_Statistics");
+    assert!(s.project.tables.iter().any(|t| t.dataset.name == "Cities_Statistics"));
     assert_eq!(s.map().layers.len(), layers);
     // A tool that rewrites its layer applies when the layer is as it read it, and is refused when
     // it was edited meanwhile, even only in its fields (the rows, however many, aren't compared).

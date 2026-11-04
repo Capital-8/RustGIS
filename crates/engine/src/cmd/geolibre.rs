@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 /// The importer reads files and URLs named inside the project, so callers require approval.
 pub fn commands() -> Vec<C> {
-    vec![C::new("project.importGeolibre", "Import GeoLibre Project", "Project › Import", import_project).params(
+    vec![C::new("project.importGeolibre", "Import GeoLibre Project", "Project › Import", import_project).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files)).params(
         r#"{"path"?: "*.geolibre|*.geolibre.json", "url"?: "https://…", "text"?: "project JSON", "data"?: "base64 JSON", "dir"?: "folder for local data"} → {map, layers, notes}"#,
     )]
 }
@@ -64,7 +64,7 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
             }
             q["url"] = json!(geolibre::download_url(url));
         }
-        return s.request_url(&q);
+        return s.request_import_url(&q);
     }
     let text = project_text(p)?;
     let mut report = Report::default();
@@ -291,7 +291,7 @@ fn add_layer(s: &mut Session, r: &Value, dir: Option<&str>, report: &mut Report,
                 let mut saved = r.clone();
                 saved["visible"] = json!(boolean(r, "visible", true) && folder.0);
                 saved["opacity"] = json!(number(r, "opacity", 1.0).clamp(0.0, 1.0) * folder.1);
-                s.request_url(&json!({"url":address,"whole":true,"name":name,"geolibreLayer":{"token":token,"record":saved}}))?;
+                s.request_import_url(&json!({"url":address,"whole":true,"name":name,"geolibreLayer":{"token":token,"record":saved}}))?;
                 report.approximated(name, "MBTiles archive is downloading; wait before saving");
             }
             report.approximated(name, "tile overlays draw above feature layers; tile vector styling uses RustGIS defaults");
@@ -339,8 +339,17 @@ fn add_layer(s: &mut Session, r: &Value, dir: Option<&str>, report: &mut Report,
         let remote = rustgis_map::tiles::is_web(&address);
         let mut q = json!({"name":name,"zoom":false});
         q[if remote { "url" } else { "path" }] = json!(address);
-        #[cfg(target_arch = "wasm32")]
-        if remote && kind != "cog" && !(kind == "raster" && super::layer::is_tiff_url(&address)) {
+        let defer = {
+            #[cfg(target_arch = "wasm32")]
+            {
+                true
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                s.leave_downloads
+            }
+        };
+        if defer && remote && kind != "cog" && !(kind == "raster" && super::layer::is_tiff_url(&address)) {
             // Reserve the final position and group membership before downloads can finish in
             // arbitrary order. The token follows the layer across map switches and reordering.
             let token = pending_token();
@@ -362,7 +371,7 @@ fn add_layer(s: &mut Session, r: &Value, dir: Option<&str>, report: &mut Report,
                 }
             }
             q["geolibreLayer"] = json!({"token":token,"record":r});
-            s.request_url(&q)?;
+            s.request_import_url(&q)?;
             report.approximated(name, "URL data is downloading; its saved style is applied when the download completes");
             return Ok(Added::Feature(id));
         }
@@ -627,7 +636,7 @@ mod admission_tests {
         let before = s.project.maps.len();
         let layers: Vec<_> = (0..10).map(|i| json!({"type":"zarr","source":{"url":format!("https://example.org/{i}.zarr")}})).collect();
         for i in 0..10 {
-            s.request_url(&json!({"url":format!("https://example.org/{i}.zarr"),"geolibreZarr":true})).unwrap();
+            s.request_import_url(&json!({"url":format!("https://example.org/{i}.zarr"),"geolibreZarr":true})).unwrap();
         }
         let requests = s.take_url_requests();
         let ids: Vec<_> = requests.iter().map(|_| s.download_started()).collect();

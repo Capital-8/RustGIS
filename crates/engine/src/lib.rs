@@ -11,11 +11,13 @@ pub mod durable;
 pub mod geometry_calc;
 pub mod model;
 pub mod peer;
+pub mod policy;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod prefs;
 pub mod project;
 mod roles;
 pub use peer::Peer;
+pub use roles::{Document, ParamRole, Role};
 mod parameters;
 pub mod project_log;
 pub use parameters::{params_envelope, script_line};
@@ -42,6 +44,18 @@ use std::path::PathBuf;
 use rustgis_map::{Camera, Map};
 use serde_json::Value;
 
+/// Opaque deferred request. Reading its parameters does not claim or widen its authority.
+pub struct UrlRequest {
+    key: u64,
+    params: Value,
+    authority: std::sync::Arc<policy::Continuation>,
+}
+impl UrlRequest {
+    pub fn params(&self) -> &Value {
+        &self.params
+    }
+}
+
 pub type CmdResult = Result<Value, String>;
 
 /// A command.
@@ -60,7 +74,14 @@ pub struct CommandSpec {
     pub mutates: bool,
     /// `None` = enabled; `Some(reason)` = disabled.
     pub enabled: fn(&Session) -> Option<&'static str>,
-    pub run: fn(&mut Session, &Value) -> CmdResult,
+    pub run: policy::Handler,
+    /// Reviewed reach, independently consumed by the engine policy.
+    pub effects: policy::Effects,
+    /// Durable-output parameter roles, separate from permission effects. None is unreviewed.
+    pub roles: Option<&'static [ParamRole]>,
+    /// Pure executor-owned resolution for commands whose inputs exceed the common layer selector.
+    pub(crate) transition: Option<fn(&cmd::InputContext<'_>, &Value) -> Result<Option<cmd::Selection>, String>>,
+    pub(crate) inputs: Option<fn(&cmd::InputContext<'_>, &Value) -> Result<cmd::Inputs, String>>,
 }
 
 fn always(_: &Session) -> Option<&'static str> {
@@ -80,7 +101,43 @@ impl CommandSpec {
     }
 
     pub const fn new(id: &'static str, label: &'static str, location: &'static str, run: fn(&mut Session, &Value) -> CmdResult) -> Self {
-        CommandSpec { id, label, location, shortcut: "", params: "{}", mutates: true, enabled: always, run }
+        CommandSpec {
+            id,
+            label,
+            location,
+            shortcut: "",
+            params: "{}",
+            mutates: true,
+            enabled: always,
+            run: policy::Handler::new(run),
+            effects: policy::Effects::UNREVIEWED,
+            roles: None,
+            inputs: None,
+            transition: None,
+        }
+    }
+    /// Declares the effects reviewed for this command; omitted declarations fail closed.
+    pub const fn effects(mut self, effects: policy::Effects) -> Self {
+        self.effects = effects;
+        self
+    }
+    /// Declares durable-output roles. An empty list adopts the reviewed common parameter rules.
+    pub const fn roles(mut self, roles: &'static [ParamRole]) -> Self {
+        self.roles = Some(roles);
+        self
+    }
+    /// Shares a command owner's actual selectors with exact approval; never performs I/O.
+    pub(crate) const fn inputs(mut self, inputs: fn(&cmd::InputContext<'_>, &Value) -> Result<cmd::Inputs, String>) -> Self {
+        self.inputs = Some(inputs);
+        self
+    }
+    /// Declares a pure scalar selector transition; exact Ask refuses an unmodelled transition.
+    pub(crate) const fn transition(
+        mut self,
+        transition: fn(&cmd::InputContext<'_>, &Value) -> Result<Option<cmd::Selection>, String>,
+    ) -> Self {
+        self.transition = Some(transition);
+        self
     }
     pub const fn key(mut self, s: &'static str) -> Self {
         self.shortcut = s;
@@ -462,7 +519,8 @@ struct ProjectFiles {
 /// An undo or redo step: the project before it, the layout open then, its label, who made it,
 /// and which state of the project it is ([`Session::dirty`]). File origins accompany changes
 /// made by the command only: undoing an ordinary edit must not undo a subsequent Save As.
-type Step = (Project, Option<usize>, &'static str, Option<String>, u64, Option<ProjectFiles>);
+type Step =
+    (Project, Option<usize>, &'static str, Option<String>, u64, Option<ProjectFiles>, (policy::Trust, policy::Trust, policy::Trust));
 
 /// What a project holds in the session beside itself: what [`Session::clear_history`] forgets
 /// when another project starts, and what opening one sets (its file, layer, tool…). When another
@@ -483,9 +541,9 @@ struct PutAside {
     history_projection: String,
     state: u64,
     saved: Option<u64>,
-    trusted_tasks: std::collections::HashSet<String>,
-    trusted_models: std::collections::HashSet<String>,
-    trusted_notebooks: std::collections::HashSet<String>,
+    trusted_tasks: policy::Trust,
+    trusted_models: policy::Trust,
+    trusted_notebooks: policy::Trust,
     project_starts: u64,
     history_from_file: usize,
     active_layer: Option<u32>,
@@ -507,11 +565,12 @@ struct PutAside {
     pending: Vec<PendingRun>,
     file_outputs: Vec<cmd::gp::PendingFile>,
     #[cfg(feature = "geolibre")]
-    started: Vec<(u64, rustgis_geolibre::Job, serde_json::Value, u64)>,
+    started: Vec<(u64, rustgis_geolibre::Job, serde_json::Value, u64, policy::Continuation)>,
     plugin_runs: Vec<cmd::gp::StartedRun>,
     downloading: Vec<u64>,
     downloaded: Vec<(u64, Vec<u8>)>,
-    url_requests: Vec<serde_json::Value>,
+    url_requests: Vec<UrlRequest>,
+    policy_work: policy::downloads::Work,
     plugin_retries: Vec<cmd::plugins::fetch::Retry>,
     /// A style of the project still loading, which mustn't move the next one's view.
     style_view: Option<(String, Camera)>,
@@ -519,11 +578,12 @@ struct PutAside {
     sql_results: Vec<(u64, String, Option<String>, rustgis_data::source::duckdb::Output)>,
     trend_results: Vec<(u64, Vec<rustgis_data::raster::Raster>, usize)>,
     raster_results: Vec<(u64, cmd::workflows::Made)>,
-    raster_runs: Vec<u64>,
+    raster_runs: Vec<(u64, policy::Continuation)>,
     edit_counts: std::collections::HashMap<u32, cmd::design::EditCounts>,
 }
 
 pub struct Session {
+    policy: policy::State,
     pub project: Project,
     pub path: Option<PathBuf>,
     /// What was run in this session (#797), whatever project was open: kept in memory only, so
@@ -622,12 +682,12 @@ pub struct Session {
     pub active_layout: Option<usize>,
     /// Tasks made in this session (lower-cased names). Others came from files, and their steps
     /// may not touch files when run.
-    pub trusted_tasks: std::collections::HashSet<String>,
+    trusted_tasks: policy::Trust,
     /// A task is executing: its steps may not start another task, even through scripts.
     /// Kept across project replacement until the active call returns; never part of undo.
     pub(crate) task_running: bool,
     /// Models made in this session (lower-cased names); the steps of others may not touch files.
-    pub trusted_models: std::collections::HashSet<String>,
+    trusted_models: policy::Trust,
     /// What the last model run did, node by node (`model::RunReport`), kept even when the run
     /// failed and the project was restored, so ModelBuilder can show which node stopped it.
     pub model_run: Option<model::RunReport>,
@@ -635,7 +695,7 @@ pub struct Session {
     /// the project (ModelBuilder's canvas) drop it when this changes.
     pub project_starts: u64,
     /// Notebooks made in this session (lower-cased names); the cells of others may not touch files.
-    pub trusted_notebooks: std::collections::HashSet<String>,
+    trusted_notebooks: policy::Trust,
     /// A notebook is running: it may not start another, even through a task or model (no
     /// unbounded recursion).
     pub(crate) notebook_running: bool,
@@ -688,7 +748,7 @@ pub struct Session {
     queue_gp_files: bool,
     /// Asynchronous runs started and not yet complete: (id, job, resolved params, start time).
     #[cfg(feature = "geolibre")]
-    pub(crate) started: Vec<(u64, rustgis_geolibre::Job, serde_json::Value, u64)>,
+    pub(crate) started: Vec<(u64, rustgis_geolibre::Job, serde_json::Value, u64, policy::Continuation)>,
     /// Plugin tool runs started and not yet complete (`gp::plugin_start`).
     pub(crate) plugin_runs: Vec<cmd::gp::StartedRun>,
     /// Plugins' panels, by plugin id: the widgets' values and what the plugin last said about
@@ -701,7 +761,7 @@ pub struct Session {
     pub(crate) downloaded: Vec<(u64, Vec<u8>)>,
     /// Downloads a command asked for where nothing may wait (the browser): the parameters of
     /// `layer.addUrl` calls, for the front end to fetch and add (see [`Session::take_url_requests`]).
-    pub(crate) url_requests: Vec<serde_json::Value>,
+    pub(crate) url_requests: Vec<UrlRequest>,
     /// Set by [`Session::request_url`] for [`Session::guarded`]: the command running changed
     /// nothing, it only left a request (a plugin's own answer can't claim that).
     request_only: bool,
@@ -727,7 +787,7 @@ pub struct Session {
     pub(crate) raster_results: Vec<(u64, cmd::workflows::Made)>,
     /// The ids of the Analysis workflows running on a thread (see
     /// [`cmd::workflows::raster_start`]), apart from the downloads'.
-    pub(crate) raster_runs: Vec<u64>,
+    pub(crate) raster_runs: Vec<(u64, policy::Continuation)>,
     /// Set where nothing waits on a command but a shell (`rustgis-cli run`): long runs a command
     /// works out where it's called (a trend over a state from a data cube) take the app's larger
     /// bounds, as its panes do on a thread, and tell their progress (a share, 0 to 1, and 1 when
@@ -741,6 +801,7 @@ const MAX_URL_REQUESTS: usize = 16;
 
 /// A finished tool run, held until `gp.finish` applies it.
 pub(crate) struct PendingRun {
+    pub(crate) continuation: policy::Continuation,
     pub id: u64,
     pub tool: String,
     /// The tool's id, for the history.
@@ -873,10 +934,11 @@ impl Session {
         // The engine's tests never add Shapefile indexes to the user's cache (#1230).
         #[cfg(all(test, not(target_arch = "wasm32")))]
         rustgis_data::source::shp::use_temporary_index_dir();
-        // Cheap: the suite's tools load the first time a tool list is needed.
+        // Trusted native startup publishes tool schemas before restricted metadata consumers run.
         #[cfg(feature = "geolibre")]
         rustgis_geolibre::register();
         rustgis_plugins::tools::register();
+        let _ = rustgis_analysis::external_tools();
         // FlatGeobuf and GeoParquet by their web address are read through the tile fetchers.
         render::rustgis_tiles::remote::install();
         rustgis_data::diagnostics::set_clock(|| {
@@ -919,6 +981,7 @@ impl Session {
             layer_clipboard: None,
             keep_tool: false,
             active_layout: None,
+            policy: Default::default(),
             trusted_tasks: Default::default(),
             task_running: false,
             trusted_models: Default::default(),
@@ -996,7 +1059,8 @@ impl Session {
         self.next_pending = self.next_pending.wrapping_add(1);
         // A few at a time: past that many, the oldest are forgotten.
         if self.downloading.len() >= 64 {
-            self.downloading.remove(0);
+            let retired = self.downloading.remove(0);
+            self.forget_download_claim(retired);
         }
         self.downloading.push(self.next_pending);
         self.next_pending
@@ -1005,6 +1069,10 @@ impl Session {
     /// Hands over a download's bytes, for `layer.addDownload {"id"}`; `false` when it was dropped
     /// (another project was opened meanwhile).
     pub fn download_landed(&mut self, id: u64, bytes: Vec<u8>) -> bool {
+        if let Err(e) = self.download_continues(id) {
+            self.notify(e, true);
+            return false;
+        }
         let Some(i) = self.downloading.iter().position(|d| *d == id) else { return false };
         self.downloading.remove(i);
         self.downloaded.push((id, bytes));
@@ -1013,6 +1081,7 @@ impl Session {
 
     /// Forgets a download that failed.
     pub fn download_failed(&mut self, id: u64) {
+        self.forget_download_claim(id);
         self.downloading.retain(|d| *d != id);
     }
 
@@ -1029,18 +1098,6 @@ impl Session {
     /// so. A request made again while it waits is made once (the same address read another way,
     /// as another layer or with other columns, is another request), and past a few waiting
     /// requests the next is refused rather than silently dropping one already promised.
-    pub fn request_url(&mut self, p: &serde_json::Value) -> Result<serde_json::Value, String> {
-        let url = p.get("url").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        if !self.url_requests.iter().any(|q| q == p) {
-            if self.url_requests.len() >= MAX_URL_REQUESTS {
-                return Err(format!("{url}: {MAX_URL_REQUESTS} downloads are already waiting; try again when they have landed"));
-            }
-            self.url_requests.push(p.clone());
-        }
-        self.request_only = true;
-        Ok(serde_json::json!({"pending": true, "url": url}))
-    }
-
     /// Runs a command as [`Session::run`] does, except that the downloads `layer.addUrl` would
     /// wait for (on the desktop) are left to the front end, as in the browser: the app runs the
     /// commands of plugins this way, so a plugin adding data by address doesn't freeze it. The
@@ -1052,15 +1109,21 @@ impl Session {
         r
     }
 
-    /// The `layer.addUrl` requests waiting for the front end ([`Session::request_url`]), taken.
-    pub fn take_url_requests(&mut self) -> Vec<serde_json::Value> {
-        std::mem::take(&mut self.url_requests)
-    }
-
     /// Takes tool files awaiting download. Metadata stays until `gp.fileDelivered` acknowledges
     /// delivery, so producing bytes alone never records a successful run.
     pub fn take_gp_files(&mut self) -> Vec<(u64, String, Vec<u8>)> {
-        self.file_outputs.iter_mut().filter_map(|f| f.bytes.take().map(|bytes| (f.id, f.file_name.clone(), bytes))).collect()
+        let mut live = Vec::new();
+        for mut file in std::mem::take(&mut self.file_outputs) {
+            if let Err(e) = self.check_continuation(&file.continuation) {
+                self.notify(e, true);
+                continue;
+            }
+            if let Some(bytes) = file.bytes.take() {
+                live.push((file.id, file.file_name.clone(), bytes));
+            }
+            self.file_outputs.push(file);
+        }
+        live
     }
 
     /// Whether background work still belongs to this project.
@@ -1098,6 +1161,11 @@ impl Session {
     /// panic restores it. A command run by itself (not as a part of another) that changes the
     /// project, or reaches a file or a service, goes into the session's log (#797).
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
+        self.command_epilogue(id, params, |s| s.run_command(id, params))
+    }
+
+    /// Shared command bookkeeping for ordinary dispatch and execution of an already pinned retry.
+    pub(crate) fn command_epilogue(&mut self, id: &str, params: &Value, run: impl FnOnce(&mut Self) -> CmdResult) -> CmdResult {
         let _diagnostic_scope = self.diagnostics.enter();
         let source = self.registry.get(id).map(|spec| spec.id).or_else(|| id.starts_with(rustgis_plugins::PREFIX).then_some("Plugin"));
         // Restored on every path, including panics outside `guarded`, so a later notice is not
@@ -1106,7 +1174,7 @@ impl Session {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let notice_mark = self.notice_mark();
             if self.depth > 0 {
-                return self.run_command(id, params);
+                return run(self);
             }
             // Undo and redo are logged with the step they take back or bring back.
             let step = match id {
@@ -1118,7 +1186,7 @@ impl Session {
             // one entry too, as it is one step to undo.
             let joins = self.merge.is_some() && self.merge == self.merged && !self.undo.is_empty();
             let (at, start) = (project_log::now_ms(), web_time::Instant::now());
-            let res = self.run_command(id, params);
+            let res = run(self);
             // A plugin's command waiting for its fetches answers `pending` and runs again when they
             // land: logged then, once. (Another command's `pending`, a download the web app makes, is
             // logged as it is asked for: nothing runs it again.)
@@ -1173,7 +1241,8 @@ impl Session {
         }
         if id.starts_with(rustgis_plugins::PREFIX) {
             self.merge = merge;
-            return self.run_plugin(id, params);
+            let op = self.authorize(id, params)?;
+            return self.invoke(op, policy::Txn::Own);
         }
         let Some(&spec) = self.registry.get(id) else { return Err(format!("unknown command '{id}'")) };
         // Keys the command does not read: said, so a script or an agent can correct itself.
@@ -1207,14 +1276,15 @@ impl Session {
         if let Some(why) = blocked {
             return Err(format!("{}: {why}", spec.label));
         }
-        let (run, mutates, label) = (spec.run, spec.mutates, spec.label);
+        let (mutates, label) = (spec.mutates, spec.label);
         if let Some(e) = self.streamed_edit(id, mutates, label, named.or(active)) {
             // Said, as a failure in `guarded` is: this returns before it (#468).
             self.notify(e.clone(), true);
             return Err(e);
         }
         self.merge = merge;
-        let res = self.guarded(label, mutates, |s| run(s, params));
+        let op = self.authorize(id, params)?;
+        let res = self.invoke(op, policy::Txn::Own);
         if id == "layer.addDownload"
             && res.is_ok()
             && let Some(token) = params.get("geolibreLayer").and_then(|v| v.get("token")).and_then(serde_json::Value::as_str)
@@ -1254,6 +1324,7 @@ impl Session {
     /// and restored if `f` fails or panics.
     pub(crate) fn guarded(&mut self, label: &'static str, mutates: bool, f: impl FnOnce(&mut Session) -> CmdResult) -> CmdResult {
         let snapshot = mutates.then(|| self.project.clone());
+        let trust = (self.trusted_tasks.clone(), self.trusted_models.clone(), self.trusted_notebooks.clone());
         let state = self.state;
         // The merge key asked for applies to this command only, whatever it does; and to a
         // command run by itself, not to those it runs.
@@ -1275,6 +1346,7 @@ impl Session {
         self.quiet_failure = false;
         // Requests a failed command left for the front end go with its other changes.
         let requests = self.url_requests.len();
+        let queued_authority = self.queued_authority();
         let file_outputs = self.file_outputs.len();
         let said = self.notices_given;
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)))
@@ -1326,7 +1398,7 @@ impl Session {
                     files.identity != self.file_identity || files.path != self.path || files.opened_package != self.opened_package
                 });
                 if key.is_none() || key != self.merged || self.undo.is_empty() {
-                    self.undo.push((snap, open_layout, label, self.actor.clone(), state, files));
+                    self.undo.push((snap, open_layout, label, self.actor.clone(), state, files, trust.clone()));
                     if self.undo.len() > UNDO_LIMIT {
                         self.undo.remove(0);
                     }
@@ -1350,6 +1422,7 @@ impl Session {
                 // The project as it was before the command, so the layout open then, whatever
                 // the command opened on the way (a task's steps).
                 self.project = snap;
+                (self.trusted_tasks, self.trusted_models, self.trusted_notebooks) = trust;
                 self.active_layout = open_layout;
                 // Replaced during the command: what it held beside itself (its undo history, its
                 // trust, its unsaved state) comes back with it.
@@ -1362,6 +1435,7 @@ impl Session {
                     self.opened_package = files.opened_package;
                 }
                 self.opened = opened;
+                self.sync_policy_generation();
                 self.state = state;
                 if let Some(c) = counts {
                     self.edit_counts = c;
@@ -1374,11 +1448,9 @@ impl Session {
                 self.notices_given -= (new - errors.len()) as u64;
                 self.notices.extend(errors);
                 let mut recorded_failure = false;
-                for record in failed_history
-                    .into_iter()
-                    .skip(history_from)
-                    .filter(|record| !record.ok && rustgis_analysis::tool(&record.id).is_some_and(cmd::gp::writes_files))
-                {
+                for record in failed_history.into_iter().skip(history_from).filter(|record| {
+                    !record.ok && rustgis_analysis::resolve_published(&record.id).is_some_and(|r| cmd::gp::writes_files(r.spec()))
+                }) {
                     self.push_gp_record(record);
                     recorded_failure = true;
                 }
@@ -1394,6 +1466,7 @@ impl Session {
         }
         if res.is_err() {
             self.url_requests.truncate(requests);
+            self.rollback_queued_authority(&queued_authority);
             self.file_outputs.truncate(file_outputs);
         }
         let quiet = std::mem::take(&mut self.quiet_failure);
@@ -1469,6 +1542,7 @@ impl Session {
             downloading: take(&mut self.downloading),
             downloaded: take(&mut self.downloaded),
             url_requests: take(&mut self.url_requests),
+            policy_work: self.take_policy_work(),
             plugin_retries: take(&mut self.plugin_retries),
             style_view: self.style_view.take(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1519,6 +1593,7 @@ impl Session {
             downloading,
             downloaded,
             url_requests,
+            policy_work,
             plugin_retries,
             style_view,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1542,6 +1617,7 @@ impl Session {
         (self.pending, self.plugin_runs, self.plugin_retries) = (pending, plugin_runs, plugin_retries);
         self.file_outputs = file_outputs;
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
+        self.restore_policy_work(policy_work);
         (self.trend_results, self.raster_results, self.raster_runs) = (trend_results, raster_results, raster_runs);
         #[cfg(feature = "geolibre")]
         {
@@ -1724,9 +1800,14 @@ impl Session {
 
     pub(crate) fn undo(&mut self) -> bool {
         self.merged = None;
-        let Some((p, saved, label, actor, state, mut files)) = self.undo.pop() else { return false };
+        let Some((p, saved, label, actor, state, mut files, trust)) = self.undo.pop() else { return false };
         let (open, was) = (self.open_layout_name(), self.active_layout);
         let cur = std::mem::replace(&mut self.project, p);
+        let old_trust = (
+            std::mem::replace(&mut self.trusted_tasks, trust.0),
+            std::mem::replace(&mut self.trusted_models, trust.1),
+            std::mem::replace(&mut self.trusted_notebooks, trust.2),
+        );
         if let Some(files) = &mut files {
             std::mem::swap(&mut self.file_identity, &mut files.identity);
             std::mem::swap(&mut self.path, &mut files.path);
@@ -1736,16 +1817,21 @@ impl Session {
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
-        self.redo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files));
+        self.redo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust));
         self.touch_all_geometry();
         true
     }
 
     pub(crate) fn redo(&mut self) -> bool {
         self.merged = None;
-        let Some((p, saved, label, actor, state, mut files)) = self.redo.pop() else { return false };
+        let Some((p, saved, label, actor, state, mut files, trust)) = self.redo.pop() else { return false };
         let (open, was) = (self.open_layout_name(), self.active_layout);
         let cur = std::mem::replace(&mut self.project, p);
+        let old_trust = (
+            std::mem::replace(&mut self.trusted_tasks, trust.0),
+            std::mem::replace(&mut self.trusted_models, trust.1),
+            std::mem::replace(&mut self.trusted_notebooks, trust.2),
+        );
         if let Some(files) = &mut files {
             std::mem::swap(&mut self.file_identity, &mut files.identity);
             std::mem::swap(&mut self.path, &mut files.path);
@@ -1755,7 +1841,7 @@ impl Session {
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
-        self.undo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files));
+        self.undo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust));
         self.touch_all_geometry();
         true
     }
@@ -1907,9 +1993,7 @@ impl Session {
     /// selection if it was made around the current active layer, else that layer alone (none
     /// when there is no active layer). Layers the map no longer has are left out.
     pub fn selected_layers(&self) -> Vec<u32> {
-        let map = self.map();
-        let picked: &[u32] = if self.layer_selection_of == self.active_layer { &self.layer_selection } else { &[] };
-        map.layers.iter().map(|l| l.id).filter(|id| picked.contains(id) || self.active_layer == Some(*id)).collect()
+        cmd::InputSource::input_context(self).selected_layers()
     }
 
     /// The tile layer picked in the Layers pane (`map.selectTiles`): the topmost one marked, while
@@ -1989,22 +2073,7 @@ impl Session {
 
     /// Resolves a `layer` parameter (name or id), defaulting to the active layer.
     pub fn layer_id(&self, p: &Value) -> Result<u32, String> {
-        let map = self.map();
-        match p.get("layer") {
-            Some(Value::Number(n)) => n
-                .as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .filter(|id| map.layer(*id).is_some())
-                .ok_or_else(|| format!("no layer with id {n}")),
-            Some(Value::String(s)) => map
-                .layer_by_name(s)
-                .map(|l| l.id)
-                .or_else(|| s.parse::<u32>().ok().filter(|id| map.layer(*id).is_some()))
-                .ok_or_else(|| format!("no layer named '{s}'")),
-            _ => {
-                self.active_layer.filter(|id| map.layer(*id).is_some()).ok_or_else(|| "select a layer in the Layers pane first".to_string())
-            }
-        }
+        cmd::InputSource::input_context(self).layer_id(p)
     }
 
     /// Resolves a `table` parameter to a standalone table's position in the project: by its id,

@@ -383,6 +383,11 @@ other clients' reads can still run while it waits. Explicit automatic approval b
 extra queue for that run, but not the reserved-command refusals. Ordinary MCP clients retain
 the access policy described above.
 
+The displayed batch is frozen with its effective parameters, targets and runtime loads. If
+those change while it waits, RustGIS refuses it and the agent must request it again. Delayed
+downloads, tool results and screenshots retain the original grant, check it before starting
+another stage and before landing, and can be completed only once by their owner.
+
 Stopping the relay through its command or status-bar control also turns off its remembered
 agent-control choice. Copyable setup commands are labelled for POSIX shells or PowerShell and
 quote the executable path literally; use the matching shell.

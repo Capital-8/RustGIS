@@ -1034,7 +1034,7 @@ their name.
   of the flow, stay on the map. A run that fails is undone as a whole.
 - **Save** keeps the model in the project; **Export** writes it as a `*.model.json` file, which
   **Import** (or dropping the file on the window) opens again. A model from a file may not read
-  or write files. **Copy Command** copies a `model.run` command that runs the model from the
+  or write files, use the network or run other software, including plugin and GeoLibre tools. **Copy Command** copies a `model.run` command that runs the model from the
   Script pane, the command line or Python.
 
 The Workflows pane's Models section lists the project's models, and New Model From History turns

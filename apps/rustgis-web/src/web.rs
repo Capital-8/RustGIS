@@ -579,65 +579,83 @@ async fn unless_stalled(
 /// `rustgis_tiles::cache::split_range`).
 /// A status in `omit` is an expected answer (a tile past a map's edge): its failure isn't
 /// recorded, only noted once per server, as on the desktop.
-async fn fetch_bytes(url: &str, capture: Capture, omit: &'static [u16]) -> Result<Vec<u8>, String> {
+async fn fetch_bytes(
+    url: &str,
+    capture: Capture,
+    still: Option<rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::Still>,
+    omit: &'static [u16],
+) -> Result<Vec<u8>, String> {
     use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache::RequestDiagnostics, failure::Failure};
     let mut diagnostics = RequestDiagnostics::with_capture(url, "GET", capture);
     diagnostics.omit_statuses(omit);
     let answer = async {
-        let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
-        let window = web_sys::window().ok_or("no window")?;
         use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache;
-        // A data download carries its caller's budget (at most MAX_DOWNLOAD); other fetches use 64 MB.
-        let (url, limit) = cache::split_download_limit(url);
-        let max = limit.map(|n| n as u64).unwrap_or(64 << 20);
-        let (url, tail) = cache::split_tail(url);
-        let (url, range) = cache::split_range(url);
-        // An `s3://` address becomes its web address, and a request to an S3 connection's endpoint
-        // is signed (the bucket's CORS rules must allow the Authorization and x-amz-* headers).
-        let prepared = rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::s3::prepare(url)?;
-        let url = prepared.url.as_str();
-        // An ArcGIS sign-in's token, for the portal and the servers it covers, renewed first when it
-        // is about to expire. It goes as the request's `token` parameter, not a header: ArcGIS's
-        // query endpoints answer the header's CORS preflight with an error.
-        if !prepared.signed {
-            crate::arcgis::renew_if_due(url).await;
-        }
-        let arcgis =
-            if prepared.signed { None } else { rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::arcgis_auth::with_token(url) };
-        // Only the request carries it: messages name the address without it.
-        let request = arcgis.as_deref().unwrap_or(url);
-        let asked = match (range, tail) {
-            (Some((a, b)), _) => Some(format!("bytes={a}-{b}")),
-            (None, Some(n)) => Some(format!("bytes=-{n}")),
-            (None, None) => None,
-        };
-        let init = web_sys::RequestInit::new();
-        // A tile or document that stalls is given up (see `STALL_MS`).
-        let abort = if limit.is_none() { web_sys::AbortController::new().ok() } else { None };
-        if let Some(a) = &abort {
-            init.set_signal(Some(&a.signal()));
-        }
+        let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
+        let (promise, abort, range, tail, max, url) = crate::request::prepare_and_send(
+            &still,
+            || async {
+                let window = web_sys::window().ok_or("no window")?;
+                use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache;
+                // A data download carries its caller's budget (at most MAX_DOWNLOAD); other fetches use 64 MB.
+                let (url, limit) = cache::split_download_limit(url);
+                let max = limit.map(|n| n as u64).unwrap_or(64 << 20);
+                let (url, tail) = cache::split_tail(url);
+                let (url, range) = cache::split_range(url);
+                // An `s3://` address becomes its web address, and a request to an S3 connection's endpoint
+                // is signed (the bucket's CORS rules must allow the Authorization and x-amz-* headers).
+                let prepared = rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::s3::prepare(url)?;
+                let url = prepared.url.as_str();
+                // An ArcGIS sign-in's token, for the portal and the servers it covers, renewed first when it
+                // is about to expire. It goes as the request's `token` parameter, not a header: ArcGIS's
+                // query endpoints answer the header's CORS preflight with an error.
+                if !prepared.signed {
+                    crate::arcgis::renew_if_due(url, still.clone()).await;
+                }
+                let arcgis = if prepared.signed {
+                    None
+                } else {
+                    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::arcgis_auth::with_token(url)
+                };
+                // Only the request carries it: messages name the address without it.
+                let request = arcgis.as_deref().unwrap_or(url);
+                let asked = match (range, tail) {
+                    (Some((a, b)), _) => Some(format!("bytes={a}-{b}")),
+                    (None, Some(n)) => Some(format!("bytes=-{n}")),
+                    (None, None) => None,
+                };
+                let init = web_sys::RequestInit::new();
+                // A tile or document that stalls is given up (see `STALL_MS`).
+                let abort = if limit.is_none() { web_sys::AbortController::new().ok() } else { None };
+                if let Some(a) = &abort {
+                    init.set_signal(Some(&a.signal()));
+                }
+                if asked.is_some() || !prepared.headers.is_empty() {
+                    let headers = web_sys::Headers::new().map_err(err)?;
+                    if let Some(r) = &asked {
+                        headers.set("Range", r).map_err(err)?;
+                    }
+                    for (k, v) in &prepared.headers {
+                        headers.set(k, v).map_err(err)?;
+                    }
+                    init.set_headers(&headers);
+                }
+                // A signed or authorized request goes only where its credentials are for.
+                if prepared.signed || arcgis.is_some() {
+                    init.set_redirect(web_sys::RequestRedirect::Error);
+                }
+                // The token's address goes nowhere else: no referrer from it, no cookies with it.
+                if arcgis.is_some() {
+                    init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
+                    init.set_credentials(web_sys::RequestCredentials::Omit);
+                }
+                Ok((window, request.to_string(), init, abort, range, tail, max, prepared.url))
+            },
+            |(window, request, init, abort, range, tail, max, url)| {
+                (window.fetch_with_str_and_init(&request, &init), abort, range, tail, max, url)
+            },
+        )
+        .await?;
         let stalled = || format!("nothing came in {} seconds", STALL_MS / 1000);
-        if asked.is_some() || !prepared.headers.is_empty() {
-            let headers = web_sys::Headers::new().map_err(err)?;
-            if let Some(r) = &asked {
-                headers.set("Range", r).map_err(err)?;
-            }
-            for (k, v) in &prepared.headers {
-                headers.set(k, v).map_err(err)?;
-            }
-            init.set_headers(&headers);
-        }
-        // A signed or authorized request goes only where its credentials are for.
-        if prepared.signed || arcgis.is_some() {
-            init.set_redirect(web_sys::RequestRedirect::Error);
-        }
-        // The token's address goes nowhere else: no referrer from it, no cookies with it.
-        if arcgis.is_some() {
-            init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
-            init.set_credentials(web_sys::RequestCredentials::Omit);
-        }
-        let promise = window.fetch_with_str_and_init(request, &init);
         // A refused fetch is an opaque TypeError ("Failed to fetch") by design: the browser doesn't
         // say why, so the likely reasons are named, with the browser's own message but not its stack.
         let resp: web_sys::Response = unless_stalled(promise, abort.as_ref())
@@ -731,22 +749,35 @@ async fn fetch_bytes(url: &str, capture: Capture, omit: &'static [u16]) -> Resul
 
 /// POSTs a JSON document and reads the answer (at most the tile cache's `MAX_BYTES`), without
 /// following redirects; an error status is `HTTP <status>`.
-async fn post_json(url: &str, body: &str, capture: Capture) -> Result<Vec<u8>, String> {
+async fn post_json(
+    url: &str,
+    body: &str,
+    capture: Capture,
+    still: Option<rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::Still>,
+) -> Result<Vec<u8>, String> {
     use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache::RequestDiagnostics, failure::Failure};
     let mut diagnostics = RequestDiagnostics::with_capture(url, "POST", capture);
     let answer = async {
         use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache;
         let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
-        let window = web_sys::window().ok_or("no window")?;
-        let init = web_sys::RequestInit::new();
-        init.set_method("POST");
-        init.set_redirect(web_sys::RequestRedirect::Error);
-        let headers = web_sys::Headers::new().map_err(err)?;
-        headers.set("Content-Type", "application/json").map_err(err)?;
-        headers.set("Accept", "application/json").map_err(err)?;
-        init.set_headers(&headers);
-        init.set_body(&wasm_bindgen::JsValue::from_str(body));
-        let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str_and_init(url, &init))
+        let promise = crate::request::prepare_and_send(
+            &still,
+            || async {
+                let window = web_sys::window().ok_or("no window")?;
+                let init = web_sys::RequestInit::new();
+                init.set_method("POST");
+                init.set_redirect(web_sys::RequestRedirect::Error);
+                let headers = web_sys::Headers::new().map_err(err)?;
+                headers.set("Content-Type", "application/json").map_err(err)?;
+                headers.set("Accept", "application/json").map_err(err)?;
+                init.set_headers(&headers);
+                init.set_body(&wasm_bindgen::JsValue::from_str(body));
+                Ok((window, init))
+            },
+            |(window, init)| window.fetch_with_str_and_init(url, &init),
+        )
+        .await?;
+        let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(|_| "the browser couldn't reach it (offline, or the server doesn't accept requests from web pages)".to_string())?
             .dyn_into()
@@ -769,28 +800,42 @@ async fn post_json(url: &str, body: &str, capture: Capture) -> Result<Vec<u8>, S
 /// Asks for an address's headers (`HEAD`): a TIFF header's announced length and the type. The
 /// browser shows a page `X-TIFF-Header-Length` only when the server exposes it
 /// (`Access-Control-Expose-Headers`); without it, the header is read as any other file's.
-async fn head(url: &str, capture: Capture) -> Result<rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::Head, String> {
+async fn head(
+    url: &str,
+    capture: Capture,
+    still: Option<rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::Still>,
+) -> Result<rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::Head, String> {
     use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache::RequestDiagnostics, failure::Failure};
     let mut diagnostics = RequestDiagnostics::with_capture(url, "HEAD", capture);
     let answer = async {
-        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache, s3};
+        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache;
         let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
-        let window = web_sys::window().ok_or("no window")?;
-        let prepared = s3::prepare(url)?;
-        // A request signed for S3 is signed for a GET.
-        if prepared.signed {
-            return Ok(cache::Head::default());
-        }
-        let init = web_sys::RequestInit::new();
-        init.set_method("HEAD");
-        if !prepared.headers.is_empty() {
-            let headers = web_sys::Headers::new().map_err(err)?;
-            for (k, v) in &prepared.headers {
-                headers.set(k, v).map_err(err)?;
-            }
-            init.set_headers(&headers);
-        }
-        let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str_and_init(&prepared.url, &init))
+        let promise = crate::request::prepare_and_send(
+            &still,
+            || async {
+                use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::s3;
+                let window = web_sys::window().ok_or("no window")?;
+                let prepared = s3::prepare(url)?;
+                // A request signed for S3 is signed for a GET.
+                if prepared.signed {
+                    return Ok(None);
+                }
+                let init = web_sys::RequestInit::new();
+                init.set_method("HEAD");
+                if !prepared.headers.is_empty() {
+                    let headers = web_sys::Headers::new().map_err(err)?;
+                    for (k, v) in &prepared.headers {
+                        headers.set(k, v).map_err(err)?;
+                    }
+                    init.set_headers(&headers);
+                }
+                Ok(Some((window, prepared.url, init)))
+            },
+            |request| request.map(|(window, url, init)| window.fetch_with_str_and_init(&url, &init)),
+        )
+        .await?;
+        let Some(promise) = promise else { return Ok(cache::Head::default()) };
+        let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(|_| "the browser couldn't reach it (offline, or the server doesn't accept requests from web pages)".to_string())?
             .dyn_into()
@@ -882,12 +927,10 @@ fn clipboard() -> Option<web_sys::Clipboard> {
 fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, embedded: bool) -> Services {
     // Map tiles come through the browser's fetch (the app repaints when they arrive).
     rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::set_fetcher_omitting(|url, done, omit| {
-        let capture = Capture::current();
-        wasm_bindgen_futures::spawn_local(async move {
-            let result = fetch_bytes(&url, capture.clone(), omit).await;
-            let _scope = capture.enter();
-            done(result);
-        });
+        wasm_bindgen_futures::spawn_local(crate::request::handoff(
+            move |capture, still| async move { fetch_bytes(&url, capture, still, omit).await },
+            done,
+        ));
     });
     // Their pictures are decoded by the browser, off the page's thread.
     rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::set_image_decoder(|bytes, done| {
@@ -904,21 +947,17 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
     });
     // So are HEAD requests (a GeoTIFF made on request saying how long its header is).
     rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::set_header(|url, done| {
-        let capture = Capture::current();
-        wasm_bindgen_futures::spawn_local(async move {
-            let result = head(&url, capture.clone()).await;
-            let _scope = capture.enter();
-            done(result);
-        });
+        wasm_bindgen_futures::spawn_local(crate::request::handoff(
+            move |capture, still| async move { head(&url, capture, still).await },
+            done,
+        ));
     });
     // So are JSON documents POSTed (the NLDI's flowtrace).
     rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::set_poster(|url, body, done| {
-        let capture = Capture::current();
-        wasm_bindgen_futures::spawn_local(async move {
-            let result = post_json(&url, &body, capture.clone()).await;
-            let _scope = capture.enter();
-            done(result);
-        });
+        wasm_bindgen_futures::spawn_local(crate::request::handoff(
+            move |capture, still| async move { post_json(&url, &body, capture, still).await },
+            done,
+        ));
     });
     let open_inbox = inbox.clone();
     let font_ctx = ctx.clone();
@@ -975,7 +1014,7 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             let (url, inbox, ctx) = (url.to_string(), font_sink.clone(), font_ctx.clone());
             let capture = Capture::current();
             wasm_bindgen_futures::spawn_local(async move {
-                match fetch_bytes(&url, capture, &[]).await {
+                match fetch_bytes(&url, capture, None, &[]).await {
                     Ok(bytes) => {
                         inbox.lock().unwrap_or_else(|e| e.into_inner()).push((url, bytes));
                         ctx.request_repaint();
@@ -1073,8 +1112,9 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
         fetch: Some(Box::new(move |url: &str, slot| {
             let (url, ctx) = (url.to_string(), fetch_ctx.clone());
             let capture = Capture::current();
+            let still = rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::current_still();
             wasm_bindgen_futures::spawn_local(async move {
-                let r = fetch_bytes(&url, capture, &[]).await.map_err(|e| format!("{url}: {e}"));
+                let r = fetch_bytes(&url, capture, still, &[]).await.map_err(|e| format!("{url}: {e}"));
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
                 ctx.request_repaint();
             });

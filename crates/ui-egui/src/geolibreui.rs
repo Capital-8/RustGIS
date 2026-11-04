@@ -29,12 +29,12 @@ pub struct Read {
 }
 
 /// Starts an import read; the engine has already reserved its layer and drawing position.
-pub fn start(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
+pub fn start(app: &mut RustGisApp, p: &Value, claim: Option<u64>) -> Result<(), String> {
     if app.ui.geolibre_zarr.len() >= 16 {
         return Err(tl!("16 imported Zarr stores are already queued").into());
     }
     let root = p.get("url").and_then(Value::as_str).ok_or(tl!("Zarr URL is required"))?.trim_end_matches('/').to_string();
-    let id = app.session.download_started();
+    let id = claim.unwrap_or_else(|| app.session.download_started());
     app.ui.geolibre_zarr.push(Read {
         id,
         params: p.clone(),
@@ -143,11 +143,20 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     let mut done = Vec::new();
     // Serial reads bound aggregate buffers and assembly to one store. Queued jobs hold
     // parameters only; they cannot start downloads until earlier stores complete.
-    if let Some(job) = app.ui.geolibre_zarr.first_mut()
-        && let Some(result) = job.poll()
-    {
-        done.push((job.id, job.root.clone(), job.params.clone(), result));
-        app.ui.geolibre_zarr.remove(0);
+    if let Some(id) = app.ui.geolibre_zarr.first().map(|job| job.id) {
+        let allowed = app.session.download_continues(id);
+        let still = app.session.download_still(id);
+        let result = match allowed {
+            Err(e) => Some(Err(e)),
+            Ok(()) => cache::with_optional_still(still, || app.ui.geolibre_zarr.first_mut().and_then(Read::poll)),
+        };
+        if let Some(result) = result {
+            let Some(job) = app.ui.geolibre_zarr.first() else {
+                return;
+            };
+            done.push((job.id, job.root.clone(), job.params.clone(), result));
+            app.ui.geolibre_zarr.remove(0);
+        }
     }
     for (id, url, mut params, result) in done {
         match result {
@@ -308,52 +317,67 @@ mod tests {
 
     #[test]
     fn geolibre_zarr_start_failure_removes_reservation_through_app_frame() {
-        let mut app = RustGisApp::with_sample();
-        // Keep sixteen reads pending without issuing network requests.
-        for i in 0..16 {
-            app.ui.geolibre_zarr.push(Read {
-                id: i,
-                params: json!({}),
-                root: "https://example.org/grid.zarr".into(),
-                queue: Vec::new(),
-                waiting: vec![(".zmetadata".into(), Slot::default())],
-                got: HashMap::new(),
-                phase: None,
-                bytes: 0,
-                forbidden: 0,
-                error: None,
-            });
+        for late_failure in [false, true] {
+            let mut app = RustGisApp::with_sample();
+            // Existing native reader tickets keep sixteen held slots valid without any sends.
+            if !late_failure {
+                for _ in 0..16 {
+                    let id = app.session.download_started();
+                    app.ui.geolibre_zarr.push(Read {
+                        id,
+                        params: json!({}),
+                        root: "https://example.org/grid.zarr".into(),
+                        queue: Vec::new(),
+                        waiting: vec![(".zmetadata".into(), Slot::default())],
+                        got: HashMap::new(),
+                        phase: None,
+                        bytes: 0,
+                        forbidden: 0,
+                        error: None,
+                    });
+                }
+            }
+            app.session
+                .run_leaving_downloads(
+                    "project.importGeolibre",
+                    &json!({"text":json!({
+                "name":"Deferred Zarr", "version":"0.2.0", "mapView":{},
+                "layers":[{"id":"overflow","name":"Overflow","type":"zarr","groupId":"folder",
+                    "source":{"url":"https://example.org/overflow.zarr"}}], "layerGroups":[{"id":"folder","name":"Folder"}]
+            }).to_string()}),
+                )
+                .unwrap();
+            let target = app.session.project.active_map;
+            let id = app.session.map().layer_by_name("Overflow").unwrap().id;
+            assert!(app.session.map().groups.iter().any(|g| g.children.contains(&id)));
+            if late_failure {
+                // Claim/start in the origin map, then let the actual admitted reader fail on a
+                // later frame after a map switch. Its cleanup owns the original reservation.
+                let request = app.session.take_url_requests().pop().unwrap();
+                app.add_url(request.params(), Some(&request), None).unwrap();
+                app.ui.geolibre_zarr[0].queue.clear();
+                app.ui.geolibre_zarr[0].error = Some("synthetic imported read failure".into());
+                app.run("map.new", json!({"name":"Other"})).unwrap();
+            }
+            let active = app.session.project.active_map;
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.logic(ui.ctx()));
+            output.textures_delta.clear();
+            assert_eq!(app.session.project.active_map, active);
+            assert!(app.session.project.maps[target].layer(id).is_none());
+            assert!(app.session.project.maps[target].groups.iter().all(|g| !g.children.contains(&id)));
+            assert_eq!(app.ui.geolibre_zarr.len(), if late_failure { 0 } else { 16 });
+            assert!(app.session.take_url_requests().is_empty());
         }
-        let target = app.session.project.active_map;
-        let token = "geolibre-pending:overflow-test";
-        let mut ds = rustgis_engine::data::Dataset::new("Overflow", rustgis_engine::data::GeometryType::Point, Vec::new());
-        ds.source = Some(token.into());
-        let id = app.session.map_mut().add_dataset(ds);
-        let mut group = rustgis_engine::map::LayerGroup::new("Folder");
-        group.children.push(id);
-        app.session.map_mut().add_group(group);
-        app.session
-            .request_url(&json!({"url":"https://example.org/overflow.zarr","geolibreZarr":true,"geolibreLayer":{"token":token}}))
-            .unwrap();
-        app.run("map.new", json!({"name":"Other"})).unwrap();
-        let active = app.session.project.active_map;
-        let ctx = egui::Context::default();
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.logic(ui.ctx()));
-        // Logic-only frames do not paint; explicitly discard their font texture updates.
-        output.textures_delta.clear();
-        assert_eq!(app.session.project.active_map, active);
-        assert!(app.session.project.maps[target].layer(id).is_none());
-        assert!(app.session.project.maps[target].groups.iter().all(|g| !g.children.contains(&id)));
-        assert_eq!(app.ui.geolibre_zarr.len(), 16);
-        assert!(app.session.take_url_requests().is_empty());
     }
 
     /// A full active reader must not let queued stores issue downloads or retain chunk buffers.
     #[test]
     fn geolibre_zarr_waiting_store_does_not_multiply_the_active_byte_budget() {
         let mut app = RustGisApp::with_sample();
+        let id = app.session.download_started();
         app.ui.geolibre_zarr.push(Read {
-            id: 0,
+            id,
             params: json!({}),
             root: "https://example.org/active.zarr".into(),
             queue: vec!["next".into()],
@@ -364,7 +388,7 @@ mod tests {
             forbidden: 0,
             error: None,
         });
-        start(&mut app, &json!({"url":"https://example.org/queued.zarr"})).unwrap();
+        start(&mut app, &json!({"url":"https://example.org/queued.zarr"}), None).unwrap();
         let ctx = egui::Context::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.logic(ui.ctx()));
         output.textures_delta.clear();

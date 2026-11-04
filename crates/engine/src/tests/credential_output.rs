@@ -227,7 +227,7 @@ fn generated_notebook_errors_are_cleaned_before_the_output_is_retained() {
     let mut s = marked();
     let source = format!("layer.addUrl {{\"url\":\"https://h.invalid/?token={SECRET}\",\"cellSize\":1}}");
     s.project.notebooks[0].cells[0].source = source.clone();
-    s.trusted_notebooks.insert("credentials".into());
+    s.trusted_notebooks.insert("credentials".into(), std::sync::Arc::new(s.item_content("notebook", "credentials").unwrap()));
     let _ = s.run("notebook.run", &json!({"notebook":0}));
     assert_eq!(s.project.notebooks[0].cells[0].source, source);
     assert!(!s.project.notebooks[0].cells[0].output.as_ref().unwrap().contains(SECRET));
@@ -254,7 +254,7 @@ fn generated_notebook_errors_are_cleaned_before_the_output_is_retained() {
 fn peers_bypass_saved_restore_and_retention_requires_the_current_exact_slot() {
     let mut s = marked();
     let saved = s.project.saved_text(None).unwrap().0;
-    s.trusted_tasks.insert("credentials".into());
+    s.trusted_tasks.insert("credentials".into(), std::sync::Arc::new(s.item_content("task", "credentials").unwrap()));
     let generation = s.opened;
     s.open_peer_text(Peer::Embedder, &saved).unwrap();
     assert!(s.opened != generation && s.trusted_tasks.is_empty());
