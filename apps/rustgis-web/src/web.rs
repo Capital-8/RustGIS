@@ -395,7 +395,7 @@ impl Embed {
         let queued = std::mem::take(&mut *self.queue.borrow_mut());
         for value in queued {
             match parse(&value) {
-                Some(Msg::Project(text)) => match app.run("project.openText", serde_json::json!({"text": text})) {
+                Some(Msg::Project(text)) => match app.open_peer_text(&text) {
                     Ok(_) => self.changes.seen(key(&app.session)),
                     Err(e) => app.session.notify(e, true),
                 },
@@ -411,8 +411,13 @@ impl Embed {
             }
         }
         match self.changes.due(key(&app.session), web_time::Instant::now()) {
-            (true, _) => match serde_json::to_string(&app.session.project) {
-                Ok(text) => self.answer(&crate::embed::project(&text)),
+            (true, _) => match app.session.peer_text(rustgis_engine::Peer::Embedder) {
+                Ok((text, report)) => {
+                    self.answer(&crate::embed::project(&text));
+                    for notice in report.notices() {
+                        app.session.notify(notice, false);
+                    }
+                }
                 Err(e) => log::error!("couldn't send the project: {e}"),
             },
             (false, Some(wait)) => ctx.request_repaint_after(wait),

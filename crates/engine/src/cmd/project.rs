@@ -148,7 +148,9 @@ pub(crate) fn reset_to(s: &mut Session, p: Project) {
     reset(s, p);
 }
 
+/// Replaces project authority, clearing the exchange record, item trust and active connections.
 fn reset(s: &mut Session, p: Project) {
+    s.exchange = None;
     super::connections::clear_active();
     s.database_logins.clear_activations();
     s.database_logins.clear_requests();
@@ -302,13 +304,12 @@ fn open_text(s: &mut Session, p: &Value) -> CmdResult {
 fn write(s: &mut Session, path: PathBuf) -> CmdResult {
     let path = if path.extension().is_none() { path.with_extension(crate::project::EXTENSION) } else { path };
     let destination = std::path::absolute(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let stripped = s.project.save(&destination)?;
+    let report = s.project.save(&destination)?;
+    let stripped = report.layer_addresses();
     s.mark_saved();
     s.edit_counts.clear();
     s.notify(format!("Saved {}", path.display()), false);
-    if stripped > 0 {
-        s.notify(format!("{stripped} layer address(es) were saved without their keys, tokens or passwords: after RustGIS closes, add those layers again to give them"), false);
-    }
+    crate::durable::notify(s, &report);
     s.path = Some(destination);
     Ok(json!({"path": path.display().to_string(), "stripped": stripped}))
 }

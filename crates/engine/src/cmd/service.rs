@@ -55,9 +55,9 @@ fn url_of(p: &Value) -> Result<&str, String> {
 pub(crate) fn without_token(p: &Value) -> Result<Option<Value>, String> {
     use crate::render::rustgis_tiles::arcgis_auth;
     let Some(url) = ps(p, "url").map(str::trim) else { return Ok(None) };
-    let has_token = url
-        .split_once('?')
-        .is_some_and(|(_, q)| q.split('&').any(|kv| kv.split('=').next().is_some_and(|k| k.eq_ignore_ascii_case("token"))));
+    let has_token = url.split_once('?').is_some_and(|(_, q)| {
+        q.split('&').any(|kv| kv.split('=').next().is_some_and(|k| rustgis_data::address::normalized_name(k).as_deref() == Some("token")))
+    });
     // ArcGIS REST addresses only: another kind of service's `token` stays in its address.
     let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
     let arcgis = match ps(p, "type") {
@@ -169,6 +169,7 @@ fn capabilities(p: &Value) -> Result<Discovery, String> {
             result.service.layers.push(layer);
             result.sources.push(address.clone());
         }
+        result.service.withheld_addresses = result.service.withheld_addresses.saturating_add(service.withheld_addresses);
         result.service.notes.extend(service.notes);
         let features = result.service.layers.iter().any(|l| matches!(l.offer, Offer::Features { .. }));
         let tiles = result.service.layers.iter().any(|l| matches!(l.offer, Offer::Tiles { .. } | Offer::VectorTiles { .. }));
@@ -330,13 +331,15 @@ fn checked_template(service: &str, t: &str) -> Result<String, String> {
 /// The tile template an OGC API tileset list advertises (its WebMercatorQuad tileset's), read now
 /// (the list, then the tileset when the list doesn't carry it). `None` when it can't be read.
 #[cfg(not(target_arch = "wasm32"))]
-fn advertised_template(list: &str, vector: bool) -> Option<String> {
+fn advertised_template(list: &str, vector: bool, withheld: &mut u32) -> Option<String> {
     use rustgis_data::ogc::{TilesStep, resolve_tiles};
     let mut doc = list.to_string();
     for _ in 0..2 {
         crate::render::rustgis_tiles::address::check(&doc, Some(list)).ok()?;
         let body = crate::render::rustgis_tiles::cache::download_blocking(&doc).ok()?;
-        match resolve_tiles(list, &doc, &body, vector)? {
+        let resolved = resolve_tiles(list, &doc, &body, vector)?;
+        *withheld = withheld.saturating_add(resolved.withheld_addresses);
+        match resolved.step {
             TilesStep::Template(t) => return checked_template(list, &t).ok(),
             TilesStep::Next(next) => doc = next,
         }
@@ -346,7 +349,7 @@ fn advertised_template(list: &str, vector: bool) -> Option<String> {
 
 /// In the browser nothing waits: the app reads the template itself and passes it as `"tiles"`.
 #[cfg(target_arch = "wasm32")]
-fn advertised_template(_: &str, _: bool) -> Option<String> {
+fn advertised_template(_: &str, _: bool, _: &mut u32) -> Option<String> {
     None
 }
 
@@ -384,13 +387,18 @@ pub fn service_json(svc: &Service) -> Value {
             layer
         })
         .collect();
-    json!({"kind": svc.kind, "title": svc.title, "count": layers.len(), "layers": layers, "notes": svc.notes})
+    let mut notes = svc.notes.clone();
+    if svc.withheld_addresses > 0 {
+        notes.push(rustgis_data::ogc::QUERY_WITHHELD_NOTICE.replace("{n}", &svc.withheld_addresses.to_string()));
+    }
+    json!({"kind": svc.kind, "title": svc.title, "count": layers.len(), "layers": layers, "notes": notes})
 }
 
-pub(crate) fn layers(_s: &mut Session, p: &Value) -> CmdResult {
+pub(crate) fn layers(s: &mut Session, p: &Value) -> CmdResult {
     let owned = without_token(p)?;
     let p = owned.as_ref().unwrap_or(p);
     let found = capabilities(p)?;
+    notify_withheld(s, found.service.withheld_addresses);
     let mut out = service_json(&found.service);
     if let Some(layers) = out.get_mut("layers").and_then(Value::as_array_mut) {
         for (layer, source) in layers.iter_mut().zip(found.sources) {
@@ -403,6 +411,11 @@ pub(crate) fn layers(_s: &mut Session, p: &Value) -> CmdResult {
     Ok(out)
 }
 
+/// Counts destinations, not pairs; clean discovery emits no credential-forwarding notice.
+fn notify_withheld(s: &mut Session, count: u32) {
+    s.notify_loss(rustgis_data::ogc::QUERY_WITHHELD_NOTICE, count);
+}
+
 /// Adds one of a service's layers: map layers as tiles (an overlay), a style as a style, features
 /// downloaded.
 pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
@@ -411,6 +424,15 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     let url = url_of(p)?.to_string();
     let want = ps(p, "layer").map(str::trim).filter(|l| !l.is_empty()).ok_or("layer is required")?;
     let found = capabilities(p)?;
+    let mut withheld = found.service.withheld_addresses;
+    let result = add_discovered(s, p, &url, want, &found, &mut withheld);
+    notify_withheld(s, withheld);
+    result
+}
+
+/// Adds from an already-read listing, accumulating resolver losses for `add`'s single notice
+/// epilogue. Validation and execution errors return unchanged through that epilogue too.
+fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Discovery, withheld: &mut u32) -> CmdResult {
     let candidates =
         || found.service.layers.iter().zip(&found.sources).filter(|(_, source)| ps(p, "source_url").is_none_or(|s| s == source.as_str()));
     let (layer, source) = candidates()
@@ -480,7 +502,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     // the usual path.
     let advertised = match (&layer.tilesets, ps(p, "tiles")) {
         (Some(_), Some(t)) => Some(checked_template(source, t)?),
-        (Some(list), None) => advertised_template(list, matches!(layer.offer, Offer::VectorTiles { .. })),
+        (Some(list), None) => advertised_template(list, matches!(layer.offer, Offer::VectorTiles { .. }), withheld),
         _ => None,
     };
     match &layer.offer {

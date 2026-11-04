@@ -22,6 +22,7 @@ fn need_presentation(s: &Session) -> Option<&'static str> {
     if s.project.presentations.is_empty() { Some("add a presentation first (Publish › New Presentation)") } else { None }
 }
 
+/// Registers presentation actions, with public generated video labels and guarded outputs.
 pub fn commands() -> Vec<C> {
     vec![
         C::new("presentation.new", "New Presentation", "Publish › Presentation", |s, p| {
@@ -116,7 +117,7 @@ pub fn commands() -> Vec<C> {
                 (None, None) => None,
             };
             let caption: String = ps(p, "caption").unwrap_or("").chars().take(MAX_CAPTION).collect();
-            let title = ps(p, "title").map(str::to_string).unwrap_or_else(|| file_name(&source));
+            let title = ps(p, "title").map(str::to_string).unwrap_or_else(|| video_label(&source));
             add_page(s, p, title, PageKind::Video { source, poster, caption })
         })
         .when(need_presentation)
@@ -166,8 +167,26 @@ pub fn commands() -> Vec<C> {
     ]
 }
 
-fn file_name(source: &str) -> String {
-    source.rsplit(['/', '\\']).next().filter(|n| !n.is_empty()).unwrap_or(source).chars().take(200).collect()
+/// Derives generated labels from the public address before extracting a path or host. User
+/// titles/captions and local filenames (including '?' and '#') are data and retain their bytes.
+pub(crate) fn video_label(source: &str) -> String {
+    use crate::durable::{Kept, public_address};
+    let clean = match public_address(source) {
+        Kept::Unchanged => source.to_string(),
+        Kept::Changed(s) => s,
+        Kept::Withheld(_) => return "Video".into(),
+    };
+    let inner = crate::sources::template_archive(&clean).map_or(clean.as_str(), |(_, a)| a);
+    let inner = rustgis_data::s3_address::parse(inner).ok().flatten().map_or(inner, |b| b.url);
+    let inner = inner.strip_prefix(crate::render::rustgis_tiles::s3::ANONYMOUS).unwrap_or(inner);
+    let remote = inner.split_once("://").filter(|(s, _)| ["http", "https", "s3"].iter().any(|p| p.eq_ignore_ascii_case(s)));
+    let name = if let Some((_, rest)) = remote {
+        let rest = rest.split(['?', '#']).next().unwrap_or("");
+        rest.rsplit('/').find(|s| !s.is_empty()).unwrap_or("Video")
+    } else {
+        inner.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or(inner)
+    };
+    name.chars().take(200).collect()
 }
 
 /// The presentation named or numbered by `presentation`, else the active one, else the last.
@@ -268,9 +287,11 @@ fn update_page(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// A presentation file.
-pub fn presentation_file(s: &Session, i: usize) -> Result<Vec<u8>, String> {
-    let pres = s.project.presentations.get(i).ok_or("no presentation")?;
-    serde_json::to_vec_pretty(pres).map_err(|e| e.to_string())
+pub fn presentation_file(s: &mut Session, i: usize) -> Result<Vec<u8>, String> {
+    let pres = s.project.presentations.get_mut(i).ok_or("no presentation")?;
+    let (bytes, report) = crate::durable::output(pres, None, |p| serde_json::to_vec_pretty(p).map_err(|e| e.to_string()))?;
+    crate::durable::notify(s, &report);
+    Ok(bytes)
 }
 
 /// A page drawn as a page layout: its title across the top and its content below.
@@ -342,7 +363,7 @@ pub fn page_layout(s: &Session, pres: &Presentation, page: &Page) -> Layout {
                 l.add(
                     "Play",
                     (m + bw * 0.3, top + bh / 2.0 - 6.0, bw * 0.4, 12.0),
-                    text(&format!("Video: {}", file_name(source)), 18.0, dark, true),
+                    text(&format!("Video: {}", video_label(source)), 18.0, dark, true),
                 );
             }
             if cap_h > 0.0 {
@@ -359,7 +380,7 @@ pub fn page_layout(s: &Session, pres: &Presentation, page: &Page) -> Layout {
             l.add(
                 "Play",
                 (m + bw * 0.3, top + bh / 2.0 - 6.0, bw * 0.4, 12.0),
-                text(&format!("Video: {}", file_name(source)), 20.0, Rgba::rgb(0xFF, 0xFF, 0xFF), true),
+                text(&format!("Video: {}", video_label(source)), 20.0, Rgba::rgb(0xFF, 0xFF, 0xFF), true),
             );
             if !caption.trim().is_empty() {
                 l.add("Caption", (m, h - m - h * 0.07, w - 2.0 * m, h * 0.07), text(caption, 15.0, Rgba::rgb(0x55, 0x5B, 0x66), false));
@@ -430,6 +451,7 @@ pub fn export_bytes(s: &mut Session, i: usize, format: &str, dpi: f64) -> Result
     }
     let mut pdf_pages = Vec::new();
     let mut slides = String::new();
+    let mut output_report = crate::durable::Report::default();
     let mut held = 0usize;
     let (mut frames_pictured, mut pages_pictured) = (Vec::new(), Vec::new());
     for k in 0..n {
@@ -452,11 +474,25 @@ pub fn export_bytes(s: &mut Session, i: usize, format: &str, dpi: f64) -> Result
             let body = match &page.kind {
                 // The poster is the drawn page, which already shows the title and caption. The
                 // source is played as given (a file next to the slideshow or a web address).
-                PageKind::Video { source, .. } => format!(
-                    "<video controls preload=\"metadata\" title=\"{}\" poster=\"data:image/png;base64,{png}\" src=\"{}\"></video>",
-                    html_escape(&page.title),
-                    html_escape(playable(source))
-                ),
+                PageKind::Video { source, .. } => {
+                    let source = match crate::durable::public_address(source) {
+                        crate::durable::Kept::Unchanged => source.clone(),
+                        crate::durable::Kept::Changed(s) => {
+                            output_report.videos = output_report.videos.saturating_add(1);
+                            s
+                        }
+                        crate::durable::Kept::Withheld(prefix) => {
+                            output_report.videos = output_report.videos.saturating_add(1);
+                            output_report.withheld = output_report.withheld.saturating_add(1);
+                            prefix.into()
+                        }
+                    };
+                    format!(
+                        "<video controls preload=\"metadata\" title=\"{}\" poster=\"data:image/png;base64,{png}\" src=\"{}\"></video>",
+                        html_escape(&page.title),
+                        html_escape(playable(&source))
+                    )
+                }
                 _ => format!("<img alt=\"{}\" src=\"data:image/png;base64,{png}\">", html_escape(&page.title)),
             };
             let notes = if page.notes.is_empty() { String::new() } else { format!("<aside>{}</aside>", html_escape(&page.notes)) };
@@ -466,6 +502,7 @@ pub fn export_bytes(s: &mut Session, i: usize, format: &str, dpi: f64) -> Result
             return Err(format!("the export passed {} MB at page {}; export at a lower dpi", BUDGET >> 20, k + 1));
         }
     }
+    crate::durable::notify(s, &output_report);
     if format == "pdf" {
         super::layout::pictured_notices(s, &frames_pictured, &pages_pictured);
         return Ok((rustgis_render::pdf::write(&pdf_pages, &name), n));

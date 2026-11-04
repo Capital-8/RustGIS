@@ -387,20 +387,10 @@ fn str_arg(a: &Value, k: &str) -> Option<String> {
 /// The `params` a command or tool runs with: an object, or JSON text of one (some models send
 /// that). Anything else is an error: running with defaults instead could act on the wrong layer.
 fn params_arg(a: &Value) -> Result<Value, String> {
-    match a.get("params") {
-        None | Some(Value::Null) => Ok(json!({})),
-        Some(v @ Value::Object(_)) => Ok(v.clone()),
-        Some(Value::String(t)) if t.trim().is_empty() => Ok(json!({})),
-        Some(Value::String(t)) => match serde_json::from_str::<Value>(t) {
-            Ok(v @ Value::Object(_)) => Ok(v),
-            Ok(_) => Err("params must be a JSON object".into()),
-            Err(e) => Err(format!("params is not valid JSON: {e}")),
-        },
-        Some(_) => Err("params must be a JSON object".into()),
-    }
+    rustgis_engine::params_envelope(a.get("params"))
 }
 
-/// An object parameter, which some models send as JSON text (leniently, for display and approval).
+/// An object parameter, which some models send as JSON text (leniently, for display only).
 fn obj_arg(a: &Value, k: &str) -> Value {
     match a.get(k) {
         Some(Value::String(t)) if !t.trim().is_empty() => serde_json::from_str(t).unwrap_or(Value::Null),

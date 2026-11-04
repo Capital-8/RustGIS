@@ -787,8 +787,16 @@ mod tests {
             let slot = Slot::default();
             *slot.lock().unwrap() = Some(Err("unreachable".to_string()));
             let params = json!({"url": api, "layer": "relief (map tiles)", "text": tiled, "name": "Relief"});
-            let resolve =
-                crate::TilesResolve { params, list: "l".into(), doc: "l".into(), read: 0, vector: false, fallback: fallback.into(), slot };
+            let resolve = crate::TilesResolve {
+                params,
+                list: "l".into(),
+                doc: "l".into(),
+                read: 0,
+                withheld_addresses: 0,
+                vector: false,
+                fallback: fallback.into(),
+                slot,
+            };
             crate::ServiceStep::Tiles { resolve, dialog: false, origin: origin.map(str::to_string) }
         };
         let before = h.state().session.sources.recent.clone();

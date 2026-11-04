@@ -522,7 +522,9 @@ fn save_model(s: &mut Session, p: &Value) -> CmdResult {
 /// A model as a `*.model.json` file: written to `path`, or its text returned.
 fn export_model(s: &mut Session, p: &Value) -> CmdResult {
     let (name, g, _) = model_graph(s, p)?;
-    let text = serde_json::to_string_pretty(&crate::model::to_file(&name, &g)).map_err(|e| e.to_string())?;
+    let (text, report) =
+        crate::durable::output_owned(g, |g| serde_json::to_string_pretty(&crate::model::to_file(&name, g)).map_err(|e| e.to_string()))?;
+    crate::durable::notify(s, &report);
     let file: String = name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     match ps(p, "path") {
         Some(path) => {
@@ -630,21 +632,10 @@ pub fn refused_in_script(id: &str) -> bool {
 pub fn script_commands(script: &str) -> Result<Vec<(usize, String, Value)>, String> {
     let mut out = Vec::new();
     for (n, line) in script.lines().enumerate().take(MAX_SCRIPT_LINES) {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+        if let Some(parsed) = crate::script_line(line) {
+            let (id, params) = parsed.map_err(|e| format!("line {}: {e}", n + 1))?;
+            out.push((n + 1, id, params));
         }
-        let (id, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        let id = id.trim_end_matches('=');
-        let params: Value = if rest.trim().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(rest.trim()).map_err(|e| format!("line {}: {e}", n + 1))?
-        };
-        if refused_in_script(id) {
-            return Err(format!("line {}: '{id}' can't run in a script", n + 1));
-        }
-        out.push((n + 1, id.to_string(), params));
     }
     Ok(out)
 }

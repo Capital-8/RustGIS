@@ -411,11 +411,13 @@ pub struct ServiceBrowse {
 pub struct TilesResolve {
     /// `service.add`'s parameters, given the template as `"tiles"` once read.
     pub params: Value,
-    /// The tileset list, whose query the template keeps; the document being read; how many have
+    /// The tileset list, whose safe query options the template may inherit; the document being read; how many have
     /// been.
     pub list: String,
     pub doc: String,
     pub read: u8,
+    /// Destinations that lost inherited query settings across both document reads.
+    pub withheld_addresses: u32,
     pub vector: bool,
     /// The usual-path template, when the advertised one can't be read.
     pub fallback: String,
@@ -1556,7 +1558,7 @@ impl RustGisApp {
         // Not an undoable edit: saving names the project, as `project.saveAs` does, once the
         // file is written.
         let old = std::mem::replace(&mut self.session.project.name, stem.clone());
-        let (text, stripped) = match self.session.project.saved_text(None) {
+        let (text, report) = match self.session.project.saved_text(None) {
             Ok(saved) => saved,
             Err(e) => {
                 self.session.project.name = old;
@@ -1569,14 +1571,8 @@ impl RustGisApp {
             return Err(e);
         }
         self.session.notify(crate::i18n::fmt("Downloaded {name}", &[("name", &file)]), false);
-        if stripped > 0 {
-            self.session.notify(
-                crate::i18n::fmt(
-                    "{n} layer address(es) were saved without their keys, tokens or passwords: after RustGIS closes, add those layers again to give them",
-                    &[("n", &stripped.to_string())],
-                ),
-                false,
-            );
+        for notice in report.notices() {
+            self.session.notify(notice, false);
         }
         self.session.mark_saved();
         self.ui.web_file = Some(file);
@@ -1795,6 +1791,29 @@ impl RustGisApp {
             return Ok(Value::Null);
         }
         self.run(id, params)
+    }
+
+    /// Imports a peer's project without going through User command dispatch or restore memory.
+    pub fn open_peer_text(&mut self, text: &str) -> Result<(), String> {
+        let report = self.session.open_peer_text(rustgis_engine::Peer::Embedder, text)?;
+        assistantpane::peer_replaced(self);
+        self.ui.web_file = None;
+        self.map.deleting = None;
+        self.ui.cog_probes.clear();
+        if let Some(steps) = self.ws.recording.take() {
+            self.session.notify(
+                crate::i18n::fmt(
+                    "Recording stopped: another project opened, and its {n} steps were for the previous one.",
+                    &[("n", &steps.len().to_string())],
+                ),
+                true,
+            );
+        }
+        layoutview::follow_project(self);
+        for notice in report.notices() {
+            self.session.notify(notice, false);
+        }
+        Ok(())
     }
 
     /// Runs a command by id: `ui.*` here, everything else in the engine.
@@ -3773,6 +3792,10 @@ impl RustGisApp {
                         continue;
                     };
                     let next = r.ok().and_then(|body| resolve_tiles(&resolve.list, &resolve.doc, &body, resolve.vector));
+                    let next = next.map(|resolved| {
+                        resolve.withheld_addresses = resolve.withheld_addresses.saturating_add(resolved.withheld_addresses);
+                        resolved.step
+                    });
                     let template = match next {
                         Some(TilesStep::Next(next)) if resolve.read < 2 => {
                             resolve.read += 1;
@@ -3784,6 +3807,12 @@ impl RustGisApp {
                         Some(TilesStep::Template(t)) => t,
                         _ => resolve.fallback.clone(),
                     };
+                    if resolve.withheld_addresses > 0 {
+                        self.session.notify(
+                            i18n::fmt(rustgis_engine::data::ogc::QUERY_WITHHELD_NOTICE, &[("n", &resolve.withheld_addresses.to_string())]),
+                            false,
+                        );
+                    }
                     let mut p = resolve.params;
                     p["tiles"] = json!(template);
                     let title = p["name"].as_str().unwrap_or("").to_string();
@@ -4537,6 +4566,37 @@ mod download_service_tests {
     use super::{RustGisApp, Services, complete_gp_file};
     use serde_json::json;
 
+    /// The real asynchronous completion receiver owns the forwarding notice, even when the
+    /// layer is added successfully. Input is already downloaded into the usual completion slot.
+    #[test]
+    fn tile_resolver_completion_reports_query_settings_it_withheld() {
+        for (query, count) in [("collections=roads", 0), ("token=RGSYNTH_ui_20261103&collections=roads", 1)] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let list = format!("https://h.invalid/svc/tiles?{query}");
+            let capabilities = json!({"title":"roads", "links":[{"rel":"tilesets-map", "href":list}]}).to_string();
+            let body =
+                br#"{"links":[{"rel":"item", "type":"image/png", "href":"https://elsewhere.invalid/{tileMatrix}/{tileRow}/{tileCol}"}]}"#
+                    .to_vec();
+            let resolve = super::TilesResolve {
+                params: json!({"url":"https://h.invalid/svc", "type":"ogcapi", "layer":"map", "text":capabilities}),
+                list: list.clone(),
+                doc: list,
+                read: 0,
+                withheld_addresses: 0,
+                vector: false,
+                fallback: "https://h.invalid/svc/tiles/{z}/{y}/{x}".into(),
+                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(body)))),
+            };
+            app.ui.service_steps.push(super::ServiceStep::Tiles { resolve, dialog: true, origin: None });
+            app.poll_service_steps();
+            assert!(app.ui.service_steps.is_empty());
+            let notices = app.session.notices.iter().filter(|n| n.text.contains("address(es) the service listed")).count();
+            assert_eq!(notices, count);
+            assert!(app.session.map().tiles.iter().all(|t| !t.url.contains("RGSYNTH_")));
+            assert!(app.dialogs.error.is_none(), "{:?}", app.dialogs.error);
+        }
+    }
+
     #[test]
     fn rejected_download_does_not_announce_success_or_rename_project() {
         let mut app = RustGisApp::with_sample()
@@ -4667,5 +4727,27 @@ mod download_service_tests {
         let mut app = RustGisApp::with_sample();
         assert_eq!(app.run("gp.fileDelivered", json!({"id": u64::MAX})), Err("no pending file with that id".into()));
         assert_eq!(app.session.notices.iter().filter(|n| n.error && n.text == "no pending file with that id").count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod peer_output_tests {
+    use super::*;
+
+    /// Drives the actual receiving wrapper, including the UI state a direct Session call misses.
+    #[test]
+    fn peer_project_uses_import_authority_and_resets_old_ui_work() {
+        let mut app = RustGisApp::with_sample();
+        app.session.project.maps[0].layers[0].dataset.source = Some("https://h.invalid/?token=RGSYNTH_4".into());
+        let (text, _) = app.session.project.saved_text(None).unwrap();
+        app.session.trusted_tasks.insert("prior".into());
+        app.assistant.queued = Some("old project action".into());
+        app.ui.web_file = Some("prior.rgis".into());
+        let generation = app.session.opened;
+        app.open_peer_text(&text).unwrap();
+        assert_ne!(app.session.opened, generation);
+        assert!(app.session.trusted_tasks.is_empty());
+        assert!(app.ui.web_file.is_none() && app.assistant.queued.is_none());
+        assert!(!serde_json::to_string(&app.session.project).unwrap().contains("RGSYNTH_4"));
     }
 }

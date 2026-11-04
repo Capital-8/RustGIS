@@ -119,7 +119,16 @@ pub(crate) fn add_layer_from(
             let fallback = offer.get("url").and_then(Value::as_str).unwrap_or("").to_string();
             let vector = offer.get("type").and_then(Value::as_str) == Some("vectorTiles");
             let slot = crate::fetch_into(list);
-            let resolve = crate::TilesResolve { params: p, list: list.to_string(), doc: list.to_string(), read: 0, vector, fallback, slot };
+            let resolve = crate::TilesResolve {
+                params: p,
+                list: list.to_string(),
+                doc: list.to_string(),
+                read: 0,
+                withheld_addresses: 0,
+                vector,
+                fallback,
+                slot,
+            };
             app.ui.service_steps.push(crate::ServiceStep::Tiles { resolve, dialog, origin });
             Ok(tl!("Reading the tileset of"))
         }

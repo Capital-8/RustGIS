@@ -517,15 +517,20 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"imported": n}))
 }
 
-/// The project without its features (layer schemas, symbology, layouts and styles stay).
+/// The project without features or sources that would reload them; schemas and styles stay.
 fn template(p: &Project) -> Project {
     let mut t = p.clone();
     t.gp_history.clear();
+    t.offline_areas.clear();
     for m in &mut t.maps {
         for l in &mut m.layers {
             l.dataset.features.clear();
             l.selection.clear();
             l.dataset.source = None;
+            l.source = None;
+            if let Some(archive) = &mut l.design.archive {
+                archive.clear();
+            }
             // A feature-less template has no loaded rows to save back to a source.
             l.postgis = None;
             l.gpkg = None;
@@ -540,29 +545,30 @@ fn template(p: &Project) -> Project {
     }
     for t in &mut t.tables {
         t.features.clear();
+        t.source = None;
     }
     t
 }
 
 /// Packages only completed imports; runtime download reservations cannot be reopened.
 /// Refuses JSON beyond the project or ZIP inflation limit before creating the archive.
-fn package_project(s: &Session) -> Result<Vec<u8>, String> {
+fn package_project(s: &mut Session) -> Result<Vec<u8>, String> {
     s.project.ensure_imports_complete()?;
     let mut p = s.project.clone();
     let mut budget = MAX_EMBED;
     for m in &mut p.maps {
         *m = embedded_map(m, &mut budget);
     }
-    crate::project::strip_addresses(p.addresses_mut());
-    let text = serde_json::to_string(&p).map_err(|e| e.to_string())?;
+    let name = p.name.clone();
+    let (text, report) = crate::durable::output_owned(p, |p| serde_json::to_string(p).map_err(|e| e.to_string()))?;
+    crate::durable::notify(s, &report);
     let limit = crate::project::MAX_BYTES.min(rustgis_data::zip::MAX_TOTAL as u64);
     if text.len() as u64 > limit {
         return Err(format!("the project is too large to package (maximum {} MiB)", limit >> 20));
     }
-    let readme =
-        format!("{} — a RustGIS project package.\nOpen it with RustGIS (Project › Open), or unzip it for {}.rgis.\n", p.name, p.name);
+    let readme = format!("{} — a RustGIS project package.\nOpen it with RustGIS (Project › Open), or unzip it for {}.rgis.\n", name, name);
     rustgis_data::zip::write(&[
-        (format!("{}.{}", safe(&p.name), crate::project::EXTENSION), text.into_bytes()),
+        (format!("{}.{}", safe(&name), crate::project::EXTENSION), text.into_bytes()),
         ("README.txt".into(), readme.into_bytes()),
     ])
 }
@@ -573,7 +579,7 @@ fn safe(name: &str) -> String {
 }
 
 /// A package of the active map; `mobile` drops hidden layers and simplifies geometry.
-fn package_map(s: &Session, mobile: bool, tol: f64) -> Result<Vec<u8>, String> {
+fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, String> {
     let mut m = embedded_map(s.map(), &mut MAX_EMBED.clone());
     if mobile {
         // Groups folded into their layers: a hidden group's layers are dropped with the others.
@@ -600,19 +606,23 @@ fn package_map(s: &Session, mobile: bool, tol: f64) -> Result<Vec<u8>, String> {
         }
     }
     crate::project::ensure_map_imports_complete(&m)?;
-    crate::project::strip_addresses(m.addresses_mut());
-    let text = serde_json::to_string(&m).map_err(|e| e.to_string())?;
+    let name = m.name.clone();
+    let (text, report) = crate::durable::output_owned(m, |m| serde_json::to_string(m).map_err(|e| e.to_string()))?;
+    crate::durable::notify(s, &report);
     let kind = if mobile { "mobile map package" } else { "map package" };
-    let readme = format!("{} — a RustGIS {kind}.\nAdd it to a project with Data › Import.\n", m.name);
-    rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&m.name)), text.into_bytes()), ("README.txt".into(), readme.into_bytes())])
+    let readme = format!("{} — a RustGIS {kind}.\nAdd it to a project with Data › Import.\n", name);
+    rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&name)), text.into_bytes()), ("README.txt".into(), readme.into_bytes())])
 }
 
 /// The geoprocessing history with the layers its runs made, as GeoJSON.
-fn package_gp(s: &Session) -> Result<Vec<u8>, String> {
+fn package_gp(s: &mut Session) -> Result<Vec<u8>, String> {
     if s.project.gp_history.is_empty() {
         return Err("no geoprocessing has been run yet".into());
     }
-    let mut entries = vec![("history.json".to_string(), serde_json::to_vec_pretty(&s.project.gp_history).map_err(|e| e.to_string())?)];
+    let (history, report) =
+        crate::durable::output(&mut s.project.gp_history, None, |h| serde_json::to_vec_pretty(h).map_err(|e| e.to_string()))?;
+    crate::durable::notify(s, &report);
+    let mut entries = vec![("history.json".to_string(), history)];
     let mut layers = std::collections::HashSet::new();
     let mut files = std::collections::HashSet::new();
     for rec in s.project.gp_history.iter().filter(|r| r.ok) {
@@ -1019,9 +1029,9 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
                 None => s.map(),
             };
             crate::project::ensure_map_imports_complete(map)?;
-            let mut map = embedded_map(map, &mut MAX_EMBED.clone());
-            crate::project::strip_addresses(map.addresses_mut());
-            (map.name.clone(), to_json(&map)?)
+            let map = embedded_map(map, &mut MAX_EMBED.clone());
+            let name = map.name.clone();
+            (name, durable_bytes(s, map)?)
         }
         "layer" => {
             let id = s.layer_id(p)?;
@@ -1029,9 +1039,9 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
             if l.dataset.source.as_deref().is_some_and(|source| source.starts_with("geolibre-pending:")) {
                 return Err("this layer is still downloading; wait for it to finish before saving".into());
             }
-            let mut layer = embed_layer(l, &mut MAX_EMBED.clone());
-            crate::project::strip_addresses(layer.addresses_mut().collect());
-            (layer.name.clone(), to_json(&layer)?)
+            let layer = embed_layer(l, &mut MAX_EMBED.clone());
+            let name = layer.name.clone();
+            (name, durable_bytes(s, layer)?)
         }
         "styles" => {
             if s.project.styles.is_empty() {
@@ -1051,7 +1061,7 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
             if let Some(n) = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
                 t.name = n.chars().take(200).collect();
             }
-            (t.name.clone(), to_json(&t)?)
+            (t.name.clone(), durable_bytes(s, t)?)
         }
         "projectPackage" => (s.project.name.clone(), package_project(s)?),
         "mapPackage" | "mobilePackage" => {
@@ -1061,8 +1071,11 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
         "gpPackage" => ("results".to_string(), package_gp(s)?),
         "bookmarks" => (format!("{} bookmarks", s.map().name), super::navigate::bookmarks_file(s.map())?),
         "task" => {
-            let t = task_ref(s, p)?;
-            (t.name.clone(), to_json(t)?)
+            let t = task_mut(s, p)?;
+            let name = t.name.clone();
+            let (bytes, report) = crate::durable::output(t, None, to_json)?;
+            crate::durable::notify(s, &report);
+            (name, bytes)
         }
         "obj" => {
             let id = s.layer_id(p)?;
@@ -1113,4 +1126,11 @@ pub(crate) fn save_item(s: &mut Session, kind: &str, p: &Value) -> CmdResult {
     let (_, bytes) = item_bytes(s, kind, p)?;
     rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
     Ok(json!({"path": path, "bytes": bytes.len()}))
+}
+
+/// Consumes the existing item draft, emitting losses after serialization has completed.
+fn durable_bytes<T: crate::durable::Durable + serde::Serialize>(s: &mut Session, value: T) -> Result<Vec<u8>, String> {
+    let (bytes, report) = crate::durable::output_owned(value, to_json)?;
+    crate::durable::notify(s, &report);
+    Ok(bytes)
 }

@@ -204,25 +204,30 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             Ok((m.name.clone(), ogc_zip(&m.name, &layers, &[])?, m.name.clone()))
         }
         "webTool" => {
-            let ms = &s.project.models;
+            let ms = &mut s.project.models;
             let m = match ps(p, "model") {
-                Some(n) => ms.iter().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no model '{n}'"))?,
-                None => ms.last().ok_or("make a model first (ModelBuilder)")?,
+                Some(n) => ms.iter_mut().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no model '{n}'"))?,
+                None => ms.last_mut().ok_or("make a model first (ModelBuilder)")?,
             };
-            let params: Vec<Value> = m
-                .steps
-                .iter()
-                .enumerate()
-                .flat_map(|(i, st)| {
-                    st.params
-                        .as_object()
-                        .into_iter()
-                        .flatten()
-                        .map(move |(k, v)| json!({"step": i + 1, "tool": st.tool, "name": k, "default": v}))
-                })
-                .collect();
-            let tool = json!({"format": "RustGIS web tool", "version": 1, "name": m.name, "steps": m.steps, "parameters": params});
-            Ok((m.name.clone(), serde_json::to_vec_pretty(&tool).map_err(|e| e.to_string())?, m.name.clone()))
+            let name = m.name.clone();
+            let (bytes, report) = crate::durable::output(m, None, |m| {
+                let params: Vec<Value> = m
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, st)| {
+                        st.params
+                            .as_object()
+                            .into_iter()
+                            .flatten()
+                            .map(move |(k, v)| json!({"step": i + 1, "tool": st.tool, "name": k, "default": v}))
+                    })
+                    .collect();
+                let tool = json!({"format": "RustGIS web tool", "version": 1, "name": m.name, "steps": m.steps, "parameters": params});
+                serde_json::to_vec_pretty(&tool).map_err(|e| e.to_string())
+            })?;
+            crate::durable::notify(s, &report);
+            Ok((name.clone(), bytes, name))
         }
         "webScene" => {
             let mut m = map_of(s, p)?;

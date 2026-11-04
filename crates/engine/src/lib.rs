@@ -7,12 +7,19 @@
 
 pub mod cmd;
 pub mod connections;
+pub mod durable;
 pub mod geometry_calc;
 pub mod model;
+pub mod peer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod prefs;
 pub mod project;
+mod roles;
+pub use peer::Peer;
+mod parameters;
 pub mod project_log;
+pub use parameters::{params_envelope, script_line};
+pub use project_log::{LogCopy, log_params};
 pub mod s3_connections;
 pub mod s3_keys;
 #[cfg(test)]
@@ -432,6 +439,18 @@ pub struct Notice {
     pub error: bool,
 }
 
+/// One counted, already-redacted loss, independent of the changes a command can roll back.
+struct LossNotice {
+    template: &'static str,
+    count: u32,
+    text: rustgis_data::diagnostics::Redacted,
+    source: Option<&'static str>,
+}
+
+/// At most 256 KiB of redacted text per outer command (32 kinds, redaction's 8 KiB bound).
+/// Further losses are counted in one overflow notice rather than silently discarded.
+const MAX_LOSS_NOTICE_KINDS: usize = 32;
+
 const UNDO_LIMIT: usize = 40;
 
 struct ProjectFiles {
@@ -551,6 +570,8 @@ pub struct Session {
     /// the command came (the app, an agent, a script): the interface drops what it kept for the
     /// old one.
     pub opened: u64,
+    /// Session-local last bridge exchange; absent from project files and undo snapshots.
+    pub(crate) exchange: Option<peer::Exchange>,
     pub tool: Tool,
     /// The layer selected in the Layers pane (the one the Style and Data tabs act on).
     pub active_layer: Option<u32>,
@@ -567,6 +588,10 @@ pub struct Session {
     /// camera then: moved since, the map stays.
     pub style_view: Option<(String, Camera)>,
     pub notices: Vec<Notice>,
+    /// Counted losses await the outermost guard's cleanup, including failed nested commands.
+    /// Runtime-only: never in Project, undo or PutAside, so replacement cannot erase them.
+    loss_notices: Vec<LossNotice>,
+    loss_notice_overflow: u32,
     /// Troubleshooting history, independent of the active pane, project files and undo.
     pub diagnostics: rustgis_data::diagnostics::History,
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]),
@@ -876,6 +901,7 @@ impl Session {
             registry: Registry { commands: cmd::all() },
             revision: 1,
             opened: 0,
+            exchange: None,
             tool: Tool::Explore,
             active_layer: None,
             layer_selection: Vec::new(),
@@ -883,6 +909,8 @@ impl Session {
             view_size: (1200.0, 720.0),
             style_view: None,
             notices: Vec::new(),
+            loss_notices: Vec::new(),
+            loss_notice_overflow: 0,
             diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
             table_layer: None,
@@ -1351,7 +1379,7 @@ impl Session {
                     .skip(history_from)
                     .filter(|record| !record.ok && rustgis_analysis::tool(&record.id).is_some_and(cmd::gp::writes_files))
                 {
-                    self.project.gp_history.push(record);
+                    self.push_gp_record(record);
                     recorded_failure = true;
                 }
                 if recorded_failure {
@@ -1380,6 +1408,11 @@ impl Session {
         }
         self.fix_active_layer();
         self.revision = self.revision.wrapping_add(1);
+        // Nested guards leave their losses pending: only after the outermost rollback has
+        // withdrawn completion notices may these go to ordinary notice consumers.
+        if self.depth == 0 {
+            self.flush_loss_notices();
+        }
         res
     }
 
@@ -1545,8 +1578,61 @@ impl Session {
         self.notice_redacted(text, if error { Severity::Error } else { Severity::Info });
     }
 
+    /// A counted loss that remains true after rollback, unlike a completion such as "Deleted
+    /// 3 features". Only static engine templates with `{n}` and a count enter this channel.
+    /// Counts saturate and repeated templates aggregate once per outer command. Text is redacted
+    /// before retention; at most 32 kinds are held, with excess counts reported as one overflow.
+    /// Outside a guard it is published immediately. A native panic caught by `guarded` follows
+    /// the same outermost drain as an error; nothing is saved in project or undo state.
+    pub(crate) fn notify_loss(&mut self, template: &'static str, count: u32) {
+        use rustgis_data::diagnostics::{Redacted, Severity};
+        if count == 0 {
+            return;
+        }
+        if self.depth == 0 {
+            self.notice_redacted(Redacted::new(&template.replace("{n}", &count.to_string())), Severity::Info);
+        } else if let Some(loss) = self.loss_notices.iter_mut().find(|loss| loss.template == template) {
+            loss.count = loss.count.saturating_add(count);
+            loss.text = Redacted::new(&template.replace("{n}", &loss.count.to_string()));
+        } else if self.loss_notices.len() < MAX_LOSS_NOTICE_KINDS {
+            self.loss_notices.push(LossNotice {
+                template,
+                count,
+                text: Redacted::new(&template.replace("{n}", &count.to_string())),
+                source: self.diagnostic_source,
+            });
+        } else {
+            self.loss_notice_overflow = self.loss_notice_overflow.saturating_add(count);
+        }
+    }
+
+    /// Publishes and empties runtime losses only after outermost success/error/panic cleanup.
+    /// Stored attribution keeps nested command losses assigned to their original command.
+    fn flush_loss_notices(&mut self) {
+        use rustgis_data::diagnostics::Severity;
+        for loss in std::mem::take(&mut self.loss_notices) {
+            self.notice_redacted_from(loss.text, Severity::Info, loss.source);
+        }
+        let overflow = std::mem::take(&mut self.loss_notice_overflow);
+        if overflow > 0 {
+            self.notice(format!("{overflow} further loss(es) could not be described"), Severity::Info);
+        }
+    }
+
+    /// Uses current attribution for ordinary notices; delayed losses retain their own source.
     fn notice_redacted(&mut self, text: rustgis_data::diagnostics::Redacted, severity: rustgis_data::diagnostics::Severity) {
-        self.diagnostics.push_redacted(severity, self.diagnostic_source.unwrap_or("Application"), &text);
+        self.notice_redacted_from(text, severity, self.diagnostic_source);
+    }
+
+    /// The one publication path for the ordinary notice queue and diagnostics; called once per
+    /// loss at drain, so neither sink sees a duplicate from queuing and publication.
+    fn notice_redacted_from(
+        &mut self,
+        text: rustgis_data::diagnostics::Redacted,
+        severity: rustgis_data::diagnostics::Severity,
+        source: Option<&'static str>,
+    ) {
+        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text);
         self.notices.push(Notice { text: text.into_string(), error: severity == rustgis_data::diagnostics::Severity::Error });
         self.notices_given += 1;
         if self.notices.len() > 200 {
@@ -1960,5 +2046,42 @@ impl Session {
 
     pub fn title(&self) -> String {
         self.project.name.clone()
+    }
+}
+
+impl durable::Durable for GpRecord {
+    fn prepare(&self, p: &mut durable::Prepare<'_>) {
+        use durable::Leaf;
+        let Self { tool, id, params, command, at: _, ok: _, messages, millis: _, outputs: _ } = self;
+        let tool = if id.is_empty() { cmd::gp::tool_id(tool).unwrap_or("") } else { id };
+        p.tool(Leaf::HistoryParams, tool, params);
+        if let Some((id, params)) = command {
+            p.command(Leaf::HistoryCommand, id, params);
+        }
+        for (i, message) in messages.iter().enumerate() {
+            p.generated(Leaf::Message(i), message);
+        }
+    }
+    fn field_mut(&mut self, owners: &[durable::Owner], leaf: &durable::Leaf) -> Option<durable::FieldMut<'_>> {
+        use durable::{FieldMut, Leaf};
+        if !owners.is_empty() {
+            return None;
+        }
+        match leaf {
+            Leaf::HistoryParams => Some(FieldMut::Json(&mut self.params)),
+            Leaf::HistoryCommand => Some(FieldMut::Json(&mut self.command.as_mut()?.1)),
+            Leaf::Message(i) => self.messages.get_mut(*i).map(FieldMut::Text),
+            _ => None,
+        }
+    }
+}
+
+impl Session {
+    /// The single history production seam: retained generated messages never keep address keys.
+    pub(crate) fn push_gp_record(&mut self, mut record: GpRecord) {
+        for message in &mut record.messages {
+            *message = rustgis_data::address::scrub_addresses(message).0.into_owned();
+        }
+        self.project.gp_history.push(record);
     }
 }
