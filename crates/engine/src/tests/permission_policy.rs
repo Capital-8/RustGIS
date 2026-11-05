@@ -333,6 +333,25 @@ fn permission_policy_native_classification_keeps_scope_through_completion() {
     assert!(s.run_scoped(scope, &finish).is_err());
 }
 
+/// Background preparers reject non-object params before they can create a raster completion.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn permission_policy_native_raster_rejects_non_object_params_before_queuing() {
+    use crate::cmd::workflows::{raster_start, runs_in_background};
+    let mut s = world();
+    s.run("layer.addDataBytes", &json!({"fileName":"scene.tif", "data":two_class_b64()})).unwrap();
+    let source = s.map().layer_by_name("scene").unwrap().id;
+    let commands = s.registry.commands.iter().filter(|c| runs_in_background(c.id).is_some()).map(|c| c.id).collect::<Vec<_>>();
+    assert!(!commands.is_empty());
+    for command in commands {
+        s.run("layer.select", &json!({"layer":source})).unwrap();
+        for params in [json!(7), json!([]), json!("defaults"), json!(false), Value::Null] {
+            assert!(raster_start(&mut s, command, &params).is_err(), "{command}: {params}");
+            assert!(s.raster_runs.is_empty(), "{command}: a rejected request queued no worker");
+        }
+    }
+}
+
 /// The new export worker cannot start after revocation or land in a replacement project;
 /// native snapshots still report after the person switches maps.
 #[cfg(not(target_arch = "wasm32"))]
@@ -991,7 +1010,7 @@ fn permission_policy_stored_cross_map_clipboard_and_managed_share_targets() {
 fn permission_policy_plugin_preparation_keeps_owner_before_remote_send() {
     use rustgis_data::source::{Batch, FeatureSource, Request, SourceInfo};
     use std::{
-        io::Write,
+        io::{Read, Write},
         sync::{Mutex, mpsc},
         time::Duration,
     };
@@ -1047,8 +1066,9 @@ fn permission_policy_plugin_preparation_keeps_owner_before_remote_send() {
         });
         waiting.recv_timeout(Duration::from_secs(3)).unwrap();
         live.0.store(!revoke, Ordering::SeqCst);
+        let released_at = std::time::Instant::now();
         release.send(()).unwrap();
-        if !revoke {
+        let peer = if !revoke {
             let start = std::time::Instant::now();
             let mut peer = loop {
                 match listener.accept() {
@@ -1059,10 +1079,24 @@ fn permission_policy_plugin_preparation_keeps_owner_before_remote_send() {
                     other => panic!("live preparation must actually send: {other:?}"),
                 }
             };
+            peer.set_nonblocking(false).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let n = peer.read(&mut chunk).unwrap();
+                assert!(n > 0 && request.len() + n <= 32_768, "a bounded complete HTTP request");
+                request.extend_from_slice(&chunk[..n]);
+            }
+            assert!(request.starts_with(b"GET /input-prepare HTTP/"));
             peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
-        }
+            Some(peer)
+        } else {
+            None
+        };
         let result = worker.join().unwrap();
-        assert_eq!(result.is_err(), revoke);
+        drop(peer);
+        assert_eq!(result.is_err(), revoke, "revoke={revoke}, elapsed={:?}, error={:?}", released_at.elapsed(), result.as_ref().err());
         assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     }
     rustgis_plugins::unload(plugin);

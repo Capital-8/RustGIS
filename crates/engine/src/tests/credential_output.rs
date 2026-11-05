@@ -113,6 +113,30 @@ fn durable_writers_clean_all_owned_roles_and_preserve_the_live_project() {
     assert!(code.to_string().contains(DATA), "replayable data properties must remain");
 }
 
+/// Empty query pairs survive clean saves; an actual token still gives one counted loss.
+#[test]
+fn durable_empty_query_pairs_preserve_clean_urls_and_report_real_loss() {
+    for (query, kept, losses) in [
+        ("", "", 0),
+        ("&", "&", 0),
+        ("layer=1&&f=json", "layer=1&&f=json", 0),
+        ("layer=1&", "layer=1&", 0),
+        ("layer=1&&token=RGSYNTH_empty_query&", "layer=1", 1),
+    ] {
+        let url = format!("https://h.invalid/tiles/{{z}}/{{x}}/{{y}}.png?{query}");
+        let mut project = Project::default();
+        project.map_mut().tiles.push(rustgis_map::TileLayer::new("Clean", rustgis_map::TileKind::Raster, &url));
+        let before = serde_json::to_value(&project).unwrap();
+        let (saved, report) = project.saved_text(None).unwrap();
+        assert_eq!(report.layer_addresses(), losses, "{url}");
+        assert_eq!(report.notices().len(), usize::from(losses > 0), "{url}: {:?}", report.notices());
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        let expected = format!("https://h.invalid/tiles/{{z}}/{{x}}/{{y}}.png?{kept}");
+        assert_eq!(saved["maps"][0]["tiles"][0]["url"], expected);
+        assert_eq!(serde_json::to_value(&project).unwrap(), before);
+    }
+}
+
 #[test]
 fn durable_clean_and_opaque_content_keep_their_meaning() {
     let mut s = marked();

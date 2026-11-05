@@ -235,7 +235,7 @@ pub fn redact_query(address: &mut String) {
     let Some(at) = address.find('?').filter(|at| address.find('#').is_none_or(|end| *at < end)) else { return };
     let q = query(address);
     let names = QueryNames::of(q);
-    if q.split('&').all(|p| !p.is_empty() && pair_class(p, &names) == NameClass::Plain) {
+    if q.split('&').all(|p| pair_class(p, &names) == NameClass::Plain) {
         return;
     }
     let kept = q.split('&').filter(|p| !p.is_empty() && pair_class(p, &names) == NameClass::Plain).collect::<Vec<_>>().join("&");
@@ -552,7 +552,17 @@ mod tests {
             assert!(public.ends_with("layer=a%20b&f=json&%zz=1"), "{public}");
             assert!(removed > 0);
         }
-        for query in ["layer=a%20b&f=json&%zz=1", "layer=token%3DM", "code=EPSG:4326", "sv=2026&layer=1", r"layer=a\b&f=json"] {
+        for query in [
+            "layer=a%20b&f=json&%zz=1",
+            "layer=token%3DM",
+            "code=EPSG:4326",
+            "sv=2026&layer=1",
+            r"layer=a\b&f=json",
+            "",
+            "&",
+            "layer=1&&f=json",
+            "layer=1&",
+        ] {
             let address = format!("https://h.invalid/a?{query}");
             assert_eq!(public_web_address(&address), Public::Unchanged);
         }
