@@ -126,7 +126,10 @@ impl Session {
     }
     /// Rechecks every new stage, including a probe's fallback and later pages or keys.
     pub fn download_continues(&mut self, id: u64) -> Result<(), String> {
-        if !self.download_is_pending(id) && !self.downloaded.iter().any(|(n, _)| *n == id) {
+        if !self.download_is_pending(id)
+            && !self.downloaded.iter().any(|(n, _)| *n == id)
+            && !self.landed_reads.iter().any(|(n, _)| *n == id)
+        {
             return Err("this download belongs to a replaced project or was dropped".into());
         }
         if let Some(claim) = self.policy.work.claims.get(&id)
@@ -135,6 +138,7 @@ impl Session {
             self.policy.work.claims.remove(&id);
             self.downloading.retain(|n| *n != id);
             self.downloaded.retain(|(n, _)| *n != id);
+            self.landed_reads.retain(|(n, _)| *n != id);
             return Err(e);
         }
         Ok(())

@@ -4,6 +4,10 @@
 //! the tool has come. The run's control is the current one of the thread the tool runs on, so a
 //! tool asks [`check`] in its long loops without passing it along; the threads of
 //! [`crate::parallel`] take it over from the thread that starts them.
+//!
+//! A run someone can stop while it goes ([`Control::stoppable`]: the app's panes, `rustgis-cli
+//! run`) takes no work cap ([`uncapped`]): the caps, a second or two of work, are for the calls
+//! that wait on a tool with no way to stop it (a script, the assistant, the web app).
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -15,11 +19,19 @@ pub struct Control {
     cancel: AtomicBool,
     done: AtomicU64,
     total: AtomicU64,
+    /// Someone can stop the run while it goes ([`Control::stoppable`]).
+    stoppable: bool,
 }
 
 impl Control {
     pub fn new() -> Arc<Control> {
         Arc::new(Control::default())
+    }
+
+    /// A control for a run someone can stop while it goes, with a Cancel button or Ctrl-C: its
+    /// tools take no work cap ([`uncapped`]). Not in the browser, whose one thread a run holds.
+    pub fn stoppable() -> Arc<Control> {
+        Arc::new(Control { stoppable: !cfg!(target_arch = "wasm32"), ..Control::default() })
     }
 
     /// Asks the tool to stop at its next check.
@@ -37,6 +49,53 @@ impl Control {
         let total = self.total.load(Ordering::Relaxed);
         (total > 0).then(|| (self.done.load(Ordering::Relaxed).min(total), total))
     }
+}
+
+/// The same flag and count reach the data crate's writers (an export run under the control):
+/// their steps count here, and they stop when the run is cancelled.
+impl rustgis_data::progress::Probe for Control {
+    fn cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+    fn begin(&self, total: u64) {
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+    fn advance(&self, n: u64) {
+        self.done.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Carries the initiating request predicate to the data writer's last commit check as well as
+/// its loops. Progress still belongs to the original control; revocation never changes its flag.
+struct Progress {
+    control: Option<Arc<Control>>,
+    still: Option<rustgis_data::source::remote::Still>,
+}
+
+impl rustgis_data::progress::Probe for Progress {
+    fn cancelled(&self) -> bool {
+        self.control.as_ref().is_some_and(|c| c.is_cancelled()) || rustgis_data::source::remote::check_still(&self.still).is_err()
+    }
+    fn begin(&self, total: u64) {
+        if let Some(control) = &self.control {
+            rustgis_data::progress::Probe::begin(control.as_ref(), total);
+        }
+    }
+    fn advance(&self, n: u64) {
+        if let Some(control) = &self.control {
+            rustgis_data::progress::Probe::advance(control.as_ref(), n);
+        }
+    }
+}
+
+/// Installs the existing progress carrier with the current owned request predicate. With no
+/// explicit control, forwards the enclosing analysis run's, if any; authority is captured even
+/// when no run control exists, for a synchronous command's file commit checks.
+pub fn install_progress(control: Option<Arc<Control>>) -> rustgis_data::progress::Installed {
+    let control = control.or_else(current);
+    let still = rustgis_data::source::remote::current_still();
+    rustgis_data::progress::install(Some(Arc::new(Progress { control, still })))
 }
 
 /// A tool stopped because it was asked to.
@@ -87,6 +146,34 @@ impl Drop for Installed {
 /// Whether the run on this thread was asked to stop.
 pub(crate) fn cancelled() -> bool {
     CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.is_cancelled()))
+        || rustgis_data::source::remote::check_still(&rustgis_data::source::remote::current_still()).is_err()
+}
+
+/// Whether the run on this thread can be stopped while it goes ([`Control::stoppable`]), and so
+/// takes no work cap.
+pub(crate) fn uncapped() -> bool {
+    CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.stoppable))
+}
+
+/// The work units (a distance, a ray step, a multiply-add) between two looks at the cancel flag
+/// inside an item of a loop ([`Pace`]): a few milliseconds.
+const PACE_WORK: usize = 1 << 22;
+
+/// Looks at the cancel flag about every [`PACE_WORK`] units of work, within an item that may
+/// take long on its own (a row of a wide grid without a work cap), so Cancel stops the run soon.
+#[derive(Default)]
+pub(crate) struct Pace(usize);
+
+impl Pace {
+    /// Whether to stop after `work` more units: once the run was asked to.
+    pub(crate) fn stop(&mut self, work: usize) -> bool {
+        self.0 = self.0.saturating_add(work);
+        if self.0 < PACE_WORK {
+            return false;
+        }
+        self.0 = 0;
+        cancelled()
+    }
 }
 
 /// Stops the tool when its run was asked to: call it between rows or features of a long loop.
@@ -137,6 +224,50 @@ pub(crate) fn advance(n: usize) {
 mod tests {
     use super::*;
 
+    /// Revocation during real file construction must reach the data writer's final rename,
+    /// even though the person did not press Cancel. Its prior file and the next run survive.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_owned_write_rechecks_authority_before_installing_its_file() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("rustgis-owned-progress-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("output");
+        std::fs::write(&path, b"before")?;
+        let live = Arc::new(AtomicBool::new(true));
+        let current = live.clone();
+        let control = Control::new();
+        for controlled in [true, false] {
+            live.store(true, Ordering::SeqCst);
+            std::fs::write(&path, b"before")?;
+            let current = current.clone();
+            let result = rustgis_data::source::remote::with_still(Arc::new(move || current.load(Ordering::SeqCst)), || {
+                let write = || {
+                    let written: std::io::Result<()> = rustgis_data::io::write_atomic_with(&path, |out| {
+                        out.write_all(b"replacement")?;
+                        live.store(false, Ordering::SeqCst);
+                        Ok(())
+                    });
+                    assert!(written.is_err(), "revocation must stop the actual file commit");
+                    written.map_err(|e| e.to_string())
+                };
+                if controlled {
+                    crate::run_under("Export", &control, write)
+                } else {
+                    let _progress = install_progress(None);
+                    write()
+                }
+            });
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&path)?, b"before");
+            assert!(!control.is_cancelled(), "revocation did not change the user's cancel flag");
+            rustgis_data::io::write_atomic(&path, b"next run")?;
+            assert_eq!(std::fs::read(&path)?, b"next run");
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[test]
     fn a_run_sees_its_own_control_and_the_one_before_comes_back() {
         assert!(current().is_none() && check().is_ok());
@@ -157,6 +288,23 @@ mod tests {
             assert!(cancelled());
         }
         assert!(current().is_none() && check().is_ok());
+    }
+
+    #[test]
+    fn only_a_stoppable_run_is_uncapped_and_pace_sees_its_cancel() {
+        assert!(!uncapped(), "no run");
+        {
+            let _g = install(Some(Control::new()));
+            assert!(!uncapped(), "a run nobody can stop keeps its caps");
+        }
+        let c = Control::stoppable();
+        let _g = install(Some(c.clone()));
+        assert!(uncapped());
+        let mut pace = Pace::default();
+        assert!(!pace.stop(PACE_WORK), "not cancelled");
+        c.cancel();
+        assert!(!pace.stop(1), "not looked at again before PACE_WORK more");
+        assert!(pace.stop(PACE_WORK));
     }
 
     #[test]

@@ -242,6 +242,70 @@ fn permission_policy_native_classification_keeps_scope_through_completion() {
     assert!(s.run_scoped(scope, &finish).is_err());
 }
 
+/// The new export worker cannot start after revocation or land in a replacement project;
+/// native snapshots still report after the person switches maps.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn permission_policy_export_worker_keeps_its_initiating_owner() {
+    use crate::cmd::exports::{export_land, export_start};
+    use crate::policy::AgentAccess;
+    use rustgis_analysis::control::Control;
+    let mut s = world();
+    let dir = std::env::temp_dir().join(format!("rustgis-export-owner-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = |name: &str| dir.join(name);
+    let params = |name: &str| json!({"layer":"Cities", "path":path(name)});
+    let (assistant, _) = assistant(129);
+    assert!(s.with_scope(assistant, |s| export_start(s, "share.exportLayer", &params("unapproved.geojson"))).unwrap().is_err());
+    let live = Arc::new(Live(AtomicBool::new(true)));
+    let scope = Scope::agent(AgentAccess::Allow, false, "export-owner", None, live.clone());
+    let run = s.with_scope(scope.clone(), |s| export_start(s, "share.exportLayer", &params("revoked.geojson"))).unwrap().unwrap();
+    live.0.store(false, Ordering::SeqCst);
+    assert!(std::thread::spawn(move || run.run(&Control::new())).join().unwrap().is_err());
+    assert!(!path("revoked.geojson").exists());
+    live.0.store(true, Ordering::SeqCst);
+    let run = s.with_scope(scope, |s| export_start(s, "share.exportLayer", &params("completed.geojson"))).unwrap().unwrap();
+    let wrote = run.run(&Control::new()).unwrap();
+    s.run("project.new", &Value::Null).unwrap();
+    assert!(export_land(&mut s, wrote).unwrap_err().contains("replaced project"));
+    assert!(path("completed.geojson").exists(), "a completed write is not undone");
+    s.run("project.sample", &Value::Null).unwrap();
+    let run = export_start(&mut s, "share.exportLayer", &params("native.geojson")).unwrap();
+    s.run("map.new", &json!({"name":"Other"})).unwrap();
+    let wrote = run.run(&Control::new()).unwrap();
+    let count = s.map().layers.len();
+    assert_eq!(export_land(&mut s, wrote).unwrap()["path"], json!(path("native.geojson")));
+    assert_eq!(s.map().layers.len(), count);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The delayed UI token inherits a scoped caller and cannot escape a handler's transaction.
+#[test]
+fn permission_policy_prepared_plugin_keeps_scope_and_pre_handler_boundary() {
+    use crate::policy::AgentAccess;
+    let mut s = world();
+    plugin("eng-prepared-owner", &["edit"]);
+    let id = "plugin:eng-prepared-owner/f";
+    let params = json!({"op":"map.rename", "params":{"name":"Queued"}});
+    let before = s.map().name.clone();
+    let live = Arc::new(Live(AtomicBool::new(true)));
+    let scope = Scope::agent(AgentAccess::Allow, false, "prepared-owner", None, live.clone());
+    let prepared = s.with_scope(scope, |s| s.prepare_command(id, &params)).unwrap().unwrap();
+    live.0.store(false, Ordering::SeqCst);
+    assert!(s.run_prepared(prepared).unwrap_err().contains("revoked"));
+    assert!(!s.leave_downloads, "a refused prepared command restores the caller's download mode");
+    assert_eq!(s.map().name, before);
+    assert!(
+        s.guarded("Transaction", true, |s| {
+            assert!(s.prepare_command(id, &params).err().unwrap().contains("before handler"));
+            Err("a later transaction failure".into())
+        })
+        .is_err()
+    );
+    assert_eq!(s.map().name, before);
+    rustgis_plugins::unload("eng-prepared-owner");
+}
+
 /// Public creation returns a numeric notebook handle; trust follows its exact content and undo.
 #[test]
 fn permission_policy_notebook_creator_edit_and_import_provenance() {

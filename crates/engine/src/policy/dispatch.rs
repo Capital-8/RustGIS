@@ -28,6 +28,12 @@ pub(crate) enum CommandOp {
     Registered { spec: CommandSpec, params: Value },
     Plugin { cmd: rustgis_plugins::PluginCommand, pin: PluginPin, params: Value },
 }
+/// A single plugin invocation held before handler dispatch. Its operation and authority are
+/// engine-owned; it cannot be cloned, serialized or captured from a handler that may roll back.
+pub struct PreparedCommand {
+    op: Authorized<CommandOp>,
+    completion: super::Deferred,
+}
 pub(crate) struct ToolOp {
     pub(crate) pin: ToolPin,
     pub(crate) params: Value,
@@ -58,6 +64,67 @@ struct Cursor {
     made_tables: Vec<u32>,
 }
 impl Session {
+    /// Holds a plugin command at the pre-handler UI queue boundary, inheriting the current scope.
+    /// A handler or approved composite must run its children synchronously through normal dispatch.
+    pub fn prepare_command(&mut self, id: &str, params: &Value) -> Result<PreparedCommand, String> {
+        if self.depth > 0 || !self.policy.nodes.is_empty() || self.policy.cursor.is_some() {
+            return Err("plugin commands can only be queued before handler dispatch".into());
+        }
+        if !id.starts_with(rustgis_plugins::PREFIX) {
+            return Err("only plugin commands can wait in the UI command queue".into());
+        }
+        let op = self.authorize(id, params)?;
+        let completion = super::Deferred(self.continuation_for(op.node.clone()));
+        Ok(PreparedCommand { op, completion })
+    }
+    /// Consumes the held invocation under its initiating owner, with ordinary command bookkeeping.
+    pub fn run_prepared(&mut self, prepared: PreparedCommand) -> CmdResult {
+        let PreparedCommand { op, completion } = prepared;
+        let (id, params) = match op.op() {
+            CommandOp::Plugin { cmd, params, .. } => (cmd.id.clone(), params.clone()),
+            _ => return Err("not a prepared plugin command".into()),
+        };
+        self.with_deferred_downloads(|s| {
+            s.command_epilogue(&id, &params, |s| {
+                s.check_delivery(&completion.0)?;
+                // Native clicks retain dynamic plugin host calls, including a second queued click
+                // that names the first one's output. Restricted callers keep their exact targets.
+                if !completion.0.native_tool_owner() && *op.node != s.command_node(&id, &params)? {
+                    return Err("the queued command changed since it was authorized".into());
+                }
+                s.resume(&completion.0, |s| s.invoke(op, Txn::Own))?
+            })
+        })
+    }
+    /// Admits an export before its preparation reads any input or creates off-thread work.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn start_export(&mut self, command: &str, params: &Value) -> Result<crate::cmd::exports::ExportRun, String> {
+        if self.depth > 0 || !self.policy.nodes.is_empty() || self.policy.cursor.is_some() {
+            return Err("background exports can only start before handler dispatch".into());
+        }
+        let op = self.authorize(command, params)?;
+        let node = op.node.clone();
+        self.with_node(node, |s| crate::cmd::exports::export_start_raw(s, op))
+    }
+    /// Exports own their input snapshot. Native delivery may report it after a layer/map switch;
+    /// restricted delivery still binds the original live map and source identities.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn finish_export<T>(&mut self, c: &Continuation, f: impl FnOnce(&mut Session) -> T) -> Result<T, String> {
+        if !self.policy.scopes.is_empty() && !self.scope().same_caller(&c.scope) {
+            return Err("this run belongs to another caller".into());
+        }
+        if c.native_tool_owner() {
+            self.check_continuation_accounts(c)?;
+            for (key, source) in &c.sources {
+                if key.get(self).is_some_and(|l| super::plan::private_source(l) != *source) {
+                    return Err("the live source or account changed since this request started".into());
+                }
+            }
+        } else {
+            self.check_continuation(c)?;
+        }
+        self.resume_checked(c, f)
+    }
     /// Distinguishes a direct native URL ingress from a handler already holding admission.
     pub(super) fn policy_has_no_operation(&self) -> bool {
         self.policy.nodes.is_empty()

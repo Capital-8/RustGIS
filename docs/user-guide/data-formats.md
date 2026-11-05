@@ -76,6 +76,15 @@ GDAL](data.md#formats-through-gdal).
 (or `http://` or `s3://`, see [S3 buckets](data.md#s3-buckets)) address and adds it like an
 uploaded file. Native formats include GeoJSON, delimited text, GeoParquet, FlatGeobuf, GeoPackage,
 zipped Shapefiles, KML/KMZ, GPX, spreadsheets, GeoRSS, GML, DXF, TopoJSON, CityJSON, LiDAR and rasters.
+A Shapefile published as loose files, one address per part, is added by its `.shp` address: the
+`.dbf` beside it (same name and folder) is fetched too, and the `.shx`, `.prj` and `.cpg` when they
+are there, within the same download limit together. Their extensions follow the `.shp`'s case: a
+`.SHP` asks for `.DBF`, `.SHX`, and so on. An optional part that answers 404 or 410, or 403 to an
+address without keys or a user and password (S3's answer for a missing file), or a web page in its
+place, is left out, and a notice names it. The parts are looked up beside the address as given
+(each follows its own redirects), not beside where a redirect took the `.shp`. A presigned address
+(S3's `X-Amz-*`) signs one file, so its Shapefile's parts can't be fetched with it: add that
+Shapefile zipped.
 Downloads are limited to 512 MiB on desktop and 256 MiB on the web; individual readers may have
 lower limits (the whole-file vector readers use 256 MiB). In the web app the server must allow
 requests from web pages (CORS). On the desktop, with
@@ -191,6 +200,23 @@ A layer saved by an older version, which kept the file name it was downloaded un
 the service's address, shows **Add**; RustGIS won't guess by name. A service's downloaded layers
 are grouped under the service's host in the Layers pane's **Data Source** view, and **Copy Path**
 gives that address without its keys or tokens.
+
+Adding a layer or importing a group leaves the view where it is: only the first content added to an
+empty map (beyond its basemap) is framed. A map holds content once it has a layer (hidden or not), a
+tile overlay, or a cloud-optimised GeoTIFF, PMTiles or MBTiles tile layer (hidden, or drawn as a
+basemap, included). A plain basemap does not count, and neither does a map style a service offers:
+it draws as a basemap, under the layers.
+
+A PMTiles or MBTiles archive added as a file is the exception: it is framed on its bounds whatever
+the map holds, unless it covers the whole world. Features asked for over an area keep the view, or
+go to the box given. Layer files (`.rgislyr`) retain the current view even on an empty map.
+STAC searches frame their result footprints, in the browser and the commands, so the searched
+area is visible. Adding administrative boundaries follows the ordinary first-content rule.
+If several archives or styles request a view while their metadata loads, the latest request
+supersedes earlier pending requests. Panning or navigating elsewhere cancels pending framing.
+MBTiles metadata normally loads in the background. A read still pending after 30 seconds, or
+a worker pool saturated by stalled storage, reports an error; retry once the storage responds.
+
 An OGC API landing page works directly: RustGIS follows its advertised
 JSON collections link, so you don't need to append `/collections`. If the landing page also
 offers map tiles, they remain listed alongside the collections. A failed collections request
@@ -231,7 +257,7 @@ Scripts use `service.import {"url":"…","name":"My OGC Layer"}` and
 | OGC API Features | Collections | Their items downloaded as GeoJSON, following the service's `next` pages up to 100,000 features, or more on a computer with more memory (see Environments in the analysis guide; a command such as `service.add` waits a minute at most) |
 | OGC API Tiles | Collections' map and vector tiles; a landing page's dataset map tiles | A tile layer in WebMercatorQuad, from the tile template the tileset advertises (its `item` link; `…/tiles/WebMercatorQuad/{z}/{y}/{x}`, the usual path, when that can't be read), keeping the tiles link's query (a token), map tiles in the server's image format, vector tiles drawn layer by layer in colours of their own |
 | WCS 1.0 / 2.0 (a 1.1 service is asked in 1.0) | Coverages, with their bounds | A raster: GetCoverage of the map's view within the coverage's bounds (or its whole extent: `"bbox": "full"`), as a GeoTIFF in EPSG:4326, at most 2048 pixels on a side |
-| ArcGIS REST | FeatureServer and MapServer layers; a MapServer's map; an ImageServer; a VectorTileServer | Layers queried as GeoJSON (the layer's description read first, or given up on after 15 seconds), page by page past the server's record limit (`resultOffset`) up to 100,000 features or more on a computer with more memory (a command such as `service.add` waits a minute at most for the features), where the layer supports paging (ArcGIS Server 10.3 and later; otherwise up to the record limit); a map as its tile cache when it is Web Mercator's pyramid, else exported images; an ImageServer as exported images; a VectorTileServer as its MapLibre style |
+| ArcGIS REST | FeatureServer and MapServer layers; a MapServer's map; an ImageServer; a VectorTileServer | Layers queried as GeoJSON, or in protocol buffers (`f=pbf`, smaller and quicker to read) when the layer's description lists them and names its record limit (the description read first, or given up on after 15 seconds; a first protocol buffer page that can't be fetched or read has the layer read in GeoJSON), page by page past the server's record limit (`resultOffset`) up to 100,000 features or more on a computer with more memory (a command such as `service.add` waits a minute at most for the features), where the layer supports paging (ArcGIS Server 10.3 and later; otherwise up to the record limit); a map as its tile cache when it is Web Mercator's pyramid, else exported images; an ImageServer as exported images; a VectorTileServer as its MapLibre style |
 
 A WMS or WMTS layer's tiles are asked for down to the detail its service gives, and stretched
 only past it: a WMTS layer's over the zooms of its tile matrix set (or those its
@@ -486,8 +512,8 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 
 | Format | How to write it | Notes |
 | --- | --- | --- |
-| GeoJSON (`.geojson`, `.json`), CSV | Data › Export (`share.exportLayer`) | The Export Features dialog picks the format; the chosen extension is appended when needed. In the web app it downloads any vector format below except GeoPackage and FlatGeobuf (a Shapefile as one zip). A streamed layer exports its whole source: on the desktop, to GeoJSON, CSV, FlatGeobuf, GeoPackage or GeoParquet a chunk at a time with no limit on its size (a GeoParquet source's row groups are read whole, so on the desktop each holds at most 16,777,216 rows), otherwise loaded whole (see [Streamed layers](data.md)); remote sources on the web must be downloaded first. |
-| GeoPackage | Data › Export to `.gpkg` (desktop) | A new file with one feature table (an attributes table for a layer without geometry) in the layer's coordinate system (see below), with an R-tree and GeoPackage 1.4 triggers to maintain it. An existing destination is refused; adding or replacing tables in an existing GeoPackage is not supported. Unique feature ids that fit signed 64-bit integers are kept; otherwise SQLite assigns new ids. |
+| GeoJSON (`.geojson`, `.json`), CSV | Data › Export (`share.exportLayer`) | The Export Features dialog picks the format; the chosen extension is appended when needed. In the web app it downloads any vector format below except GeoPackage and FlatGeobuf (a Shapefile as one zip). A streamed layer exports its whole source: on the desktop, to GeoJSON, CSV, FlatGeobuf, GeoPackage or GeoParquet a chunk at a time with no limit on its size (a GeoParquet source's row groups are read whole, so on the desktop each holds at most 16,777,216 rows; a layer read in place from the GeoPackage it goes into is read whole first), otherwise loaded whole (see [Streamed layers](data.md)); remote sources on the web must be downloaded first. |
+| GeoPackage | Data › Export to `.gpkg` (desktop) | A new file with one feature table (an attributes table for a layer without geometry) in the layer's coordinate system (see below), with an R-tree and GeoPackage 1.4 triggers to maintain it. An existing destination is refused unless the export adds a table to it or replaces one of its feature or attribute tables (`mode`, see [Exporting](sharing.md)), leaving its other tables as they were. Unique feature ids that fit signed 64-bit integers are kept; otherwise SQLite assigns new ids. |
 | GeoParquet (`.parquet`, `.geoparquet`) | Data › Export | GeoParquet 1.1: WKB geometry in WGS 84, Zstd level 9 compression, row groups of up to 65,536 features and a `bbox` covering column with byte-stream-split encoding. The covering keeps spatial range reads available; compression favours smaller files over export speed. A standalone table without geometry writes plain Parquet. |
 | Shapefile | Data › Export to `.shp` (or `.zip` for the files zipped) | Writes `.shp`, `.shx`, `.dbf`, `.prj` (the coordinate system, see below) and `.cpg` (UTF-8). Field names are cut to 10 bytes (made unique ignoring case, and reported), text to at most 254 bytes, and numbers that do not fit their dBase field are left empty. Export notices count shortened text, non-null values left empty (including incompatible types), and numbers rounded to the field's precision, and name the affected source fields; features without geometry, and lines of a single point, are left out (and reported). |
 | FlatGeobuf | Data › Export to `.fgb` | In the layer's coordinate system (see below), with a spatial index; features without geometry are left out (and reported). Desktop only: the writer needs a temporary file, which the browser doesn't have. |

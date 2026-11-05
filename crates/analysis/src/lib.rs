@@ -32,6 +32,7 @@ pub mod tissot;
 mod tools;
 pub mod topology;
 pub mod trend;
+mod validity;
 pub mod warp;
 
 pub use attribute_join::{DuplicateStrategy, JoinFieldOptions, JoinFieldReport, join_field};
@@ -586,13 +587,18 @@ pub fn run_resolved(
 /// check, its count follows the work's progress, and a cancelled run's error says how far `name`
 /// came.
 pub fn run_under<T>(name: &str, control: &std::sync::Arc<control::Control>, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let still = rustgis_data::source::remote::current_still();
+    rustgis_data::source::remote::check_still(&still)?;
     if control.is_cancelled() {
         return Err(format!("{name} was cancelled before it started"));
     }
     let _current = control::install(Some(control.clone()));
+    // A file the work writes or reads counts and stops with it too.
+    let _data = control::install_progress(Some(control.clone()));
     // No count until the work starts one: a control used before doesn't show that run's.
     control::begin(0);
     let res = work();
+    rustgis_data::source::remote::check_still(&still)?;
     if !control.is_cancelled() {
         // Finished: its last step is all done, however it counted. A failed one stays where it
         // stopped.

@@ -11,6 +11,7 @@ mod plan;
 mod provenance;
 mod scope;
 
+pub use dispatch::PreparedCommand;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use dispatch::RasterOp;
 pub(crate) use dispatch::{Authorized, CommandOp, ModelOp, State, ToolOp, Txn};

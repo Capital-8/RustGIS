@@ -144,9 +144,16 @@ fn model_index(input: &impl super::InputSource, p: &Value) -> Result<usize, Stri
     }
 }
 
-/// Trains a model from the pixels under training polygons.
+/// Trains a model from the pixels under training polygons. Where a person at a terminal can stop
+/// it with Ctrl-C ([`Session::stoppable`](crate::Session::stoppable)), it takes no work cap, as
+/// from the pane.
 fn train(s: &Session, p: &Value) -> Result<DlModel, String> {
-    training(s, p)?.fit()
+    let t = training(s, p)?;
+    if s.stoppable {
+        rustgis_analysis::run_under("Train Deep Learning Model", &rustgis_analysis::control::Control::stoppable(), || t.fit())
+    } else {
+        t.fit()
+    }
 }
 
 /// A model to train: the raster, the training polygons and their classes, read of the session, and
@@ -249,7 +256,7 @@ fn free_name(s: &Session, base: &str) -> String {
 }
 
 fn classify(s: &mut Session, p: &Value) -> CmdResult {
-    super::workflows::made_or_ran(s, p, super::workflows::DEEP_LEARNING, classify_work)
+    super::workflows::made_or_ran(s, p, "dl.classify")
 }
 
 /// The model a classification uses: one of the project's, or one it trains first.

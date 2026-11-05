@@ -58,11 +58,19 @@ pub(super) fn declared(spec: &CommandSpec, params: &Value) -> Effects {
         effects = effects.with(Effect::Files).with(Effect::Network);
     }
     let params = crate::cmd::items::layer_name_left_out(spec.id, params);
+    // These owners read an explicit null path as no output file. Keep the existing narrow
+    // in-memory raster contract, including rasterization, without ignoring any other place.
+    let params =
+        if matches!(spec.id, "raster.georeference" | "raster.project" | "raster.rasterize") && params.get("path") == Some(&Value::Null) {
+            let mut given = params.into_owned();
+            if let Some(o) = given.as_object_mut() {
+                o.remove("path");
+            }
+            std::borrow::Cow::Owned(given)
+        } else {
+            params
+        };
     if !effects.contains(Effect::Network) && crate::cmd::items::names_place(&params, PLACE_KEYS, 0) {
-        effects = effects.with(Effect::Files);
-    }
-    // In-memory georeferencing/projecting is an edit; a named output reaches the file system.
-    if matches!(spec.id, "raster.georeference" | "raster.project") && crate::cmd::items::names_place(&params, PLACE_KEYS, 0) {
         effects = effects.with(Effect::Files);
     }
     effects

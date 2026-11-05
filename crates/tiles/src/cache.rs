@@ -750,13 +750,19 @@ pub fn download(url: &str, done: Done) {
 
 /// Like [`download`], with a smaller budget enforced by the native and browser fetchers.
 pub fn download_limited(url: &str, max: usize, done: Done) {
-    download_detailed(url, max, Box::new(move |r| done(r.map_err(|f| f.message))));
+    download_limited_omitting(url, max, &[], done);
+}
+
+/// Like [`download_limited`], but a status in `omit` is an expected answer: its failure isn't
+/// recorded, only noted once per server (a file that may not be there, which the caller handles).
+pub fn download_limited_omitting(url: &str, max: usize, omit: &'static [u16], done: Done) {
+    download_detailed_within(url, max, DOWNLOAD_TIMEOUT, omit, Box::new(move |r| done(r.map_err(|f| f.message))));
 }
 
 /// Like [`download_limited`], giving up after `timeout` natively (the browser's fetch keeps its
 /// own): a small answer that mustn't hold a thread for long (an ArcGIS layer's description).
 pub fn download_within(url: &str, max: usize, timeout: std::time::Duration, done: Done) {
-    download_detailed_within(url, max, timeout, Box::new(move |r| done(r.map_err(|f| f.message))));
+    download_detailed_within(url, max, timeout, &[], Box::new(move |r| done(r.map_err(|f| f.message))));
 }
 
 /// How long a download off the frame may take natively.
@@ -766,11 +772,12 @@ const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900
 /// that say who answered and an excerpt of the answer. The browser's fetch tells only the
 /// status, read back from its error.
 pub fn download_detailed(url: &str, max: usize, done: DoneDetailed) {
-    download_detailed_within(url, max, DOWNLOAD_TIMEOUT, done);
+    download_detailed_within(url, max, DOWNLOAD_TIMEOUT, &[], done);
 }
 
-/// Like [`download_detailed`], giving up after `timeout` natively.
-fn download_detailed_within(url: &str, max: usize, timeout: std::time::Duration, done: DoneDetailed) {
+/// Like [`download_detailed`], giving up after `timeout` natively; a status in `omit` isn't
+/// recorded as a failure.
+fn download_detailed_within(url: &str, max: usize, timeout: std::time::Duration, omit: &'static [u16], done: DoneDetailed) {
     if let Err(e) = check_current() {
         done(Err(Failure::new(url, e)));
         return;
@@ -791,8 +798,8 @@ fn download_detailed_within(url: &str, max: usize, timeout: std::time::Duration,
     });
     let f = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone();
     match f {
-        Some(f) => f(marked.clone(), Box::new(move |r| done(r.map_err(|e| Failure::new(&marked, e)))), &[]),
-        None => native::download_within(marked, timeout, done),
+        Some(f) => f(marked.clone(), Box::new(move |r| done(r.map_err(|e| Failure::new(&marked, e)))), omit),
+        None => native::download_within(marked, timeout, omit, done),
     }
 }
 
@@ -821,7 +828,7 @@ pub fn download_blocking_omitting(url: &str, omit: &'static [u16]) -> Result<Vec
     download_blocking_omitting_within(url, MAX_DOWNLOAD, BLOCKING_TIMEOUT, omit).map_err(large_file_hint)
 }
 
-/// A blocking download that ran out of time says how to add a large file instead.
+/// A waited-for download's error, with where a large file goes instead when it timed out.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn large_file_hint(e: String) -> String {
     if e.contains("timeout") || e.contains("timed out") {
@@ -841,7 +848,12 @@ pub fn download_blocking_within(url: &str, max: usize, timeout: std::time::Durat
 /// isn't recorded, only noted once per server (a store's absent chunk, which the caller counts
 /// itself).
 #[cfg(not(target_arch = "wasm32"))]
-fn download_blocking_omitting_within(url: &str, max: usize, timeout: std::time::Duration, omit: &'static [u16]) -> Result<Vec<u8>, String> {
+pub fn download_blocking_omitting_within(
+    url: &str,
+    max: usize,
+    timeout: std::time::Duration,
+    omit: &'static [u16],
+) -> Result<Vec<u8>, String> {
     crate::address::check(url, None)?;
     native::get(&native::download_agent(timeout), &download_address(url, max), omit)
 }
@@ -1453,16 +1465,17 @@ mod native {
     /// Downloads on a thread of its own, so a large file doesn't hold up the tiles.
     #[cfg(test)]
     pub(super) fn download(url: String, done: DoneDetailed) {
-        download_within(url, super::DOWNLOAD_TIMEOUT, done);
+        download_within(url, super::DOWNLOAD_TIMEOUT, &[], done);
     }
 
-    pub(super) fn download_within(url: String, timeout: std::time::Duration, done: DoneDetailed) {
+    pub(super) fn download_within(url: String, timeout: std::time::Duration, omit: &'static [u16], done: DoneDetailed) {
         let capture = Capture::current();
         let still = super::current_still();
         std::thread::spawn(move || {
             super::with_optional_still(still, || {
                 let _scope = capture.enter();
-                let r = super::check_current().map_err(Failure::from).and_then(|_| get_detailed(&download_agent(timeout), &url));
+                let r =
+                    super::check_current().map_err(Failure::from).and_then(|_| get_detailed_omitting(&download_agent(timeout), &url, omit));
                 done(r);
             })
         });
@@ -1546,7 +1559,12 @@ mod native {
 
     /// [`get`], telling what is known of a failure.
     pub(super) fn get_detailed(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, Failure> {
-        fetch_answer(agent, url, true, &[]).map_err(|f| Failure { url: url.to_string(), ..f })
+        get_detailed_omitting(agent, url, &[])
+    }
+
+    /// [`get_detailed`], a status in `omit` not recorded as a failure.
+    pub(super) fn get_detailed_omitting(agent: &ureq::Agent, url: &str, omit: &'static [u16]) -> Result<Vec<u8>, Failure> {
+        fetch_answer(agent, url, true, omit).map_err(|f| Failure { url: url.to_string(), ..f })
     }
 
     /// A file's length from a `Content-Range` header (`bytes 0-0/1234`); none when the server
@@ -1756,7 +1774,7 @@ mod native {
         done(Err(format!("{url}: this build has no way to fetch tiles")));
     }
 
-    pub(super) fn download_within(url: String, _timeout: std::time::Duration, done: DoneDetailed) {
+    pub(super) fn download_within(url: String, _timeout: std::time::Duration, _omit: &'static [u16], done: DoneDetailed) {
         let message = format!("{url}: this build has no way to fetch tiles");
         done(Err(crate::failure::Failure::new(&url, message)));
     }

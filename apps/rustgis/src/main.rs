@@ -276,11 +276,16 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.0.ui(ui);
     }
+    #[cfg(not(target_os = "macos"))]
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.0.drop_stale_clicks(raw_input);
+    }
     /// macOS: the Edit items arrive as clipboard events and keys (Undo and Redo in a focused text
     /// field), so the app reads them as it reads typed ones; the others wait for `logic`. While
     /// the shortcut editor is recording, the menu takes the keys it shows first: they go to it.
     #[cfg(target_os = "macos")]
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.0.drop_stale_clicks(raw_input);
         let Some(bar) = &self.2.bar else { return };
         let capturing = self.0.capturing_shortcut();
         let press = |events: &mut Vec<egui::Event>, k: egui::KeyboardShortcut| {
@@ -325,6 +330,7 @@ impl eframe::App for App {
     /// Every way eframe closes the app comes here, Cmd+Q on macOS included, which may not
     /// return from `run_native`: the run ended cleanly.
     fn on_exit(&mut self) {
+        self.0.end_exports();
         self.0.end_autosave();
         running::close(&self.1);
     }

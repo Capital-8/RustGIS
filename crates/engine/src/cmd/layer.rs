@@ -38,12 +38,12 @@ pub fn commands() -> Vec<C> {
         C::new("layer.defineProjection", "Define Projection", "Layers", define_projection).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
             .params(r#"{"layer"?: name|id, "crs": "EPSG:… or WKT; reinterpret native coordinates, without rewriting the source file"}"#),
-        C::new("layer.loadAll", "Load All Features", "Layers", load_all).roles(&[]).effects(crate::policy::Effects::NONE).when(need_streamed).params(r#"{"layer"?: name|id}"#),
+        C::new("layer.loadAll", "Load All Features", "Layers", load_all).when(need_streamed).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?: name|id}"#),
         C::new("layer.addUrl", "Add Data From URL", "Home › Add › Add Data", add_url).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
-            r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true zooms to what was added; false keeps the view of a GeoParquet or FlatGeobuf read in place (zoomed to only when the map was empty)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place (an address without a file name is read in place when its first bytes are a cloud-optimised GeoTIFF)", "cog"?: "bool: the address is a cloud-optimised GeoTIFF whatever its name says (the app's probe found it so)", "bbox"?: "[west, south, east, north] in degrees | "view": a cloud-optimised GeoTIFF's window as a raster layer (desktop and command line), read by range at full resolution, in the file's coordinate system, with its colour table and class names; at most 64 million values (all bands)", "cellSize"?: "with bbox: the coarsest overview whose cells are at most this size is read (the file's units; metres for longitude/latitude, a degree taken as 111.32 km)", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on"}"#,
+            r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.shp (its .dbf fetched beside it, and its .shx, .prj and .cpg when there)|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true frames everything added; false keeps the view, even on an empty map; omitted, the first content on an empty map is framed (a GeoParquet, FlatGeobuf or cloud-optimised GeoTIFF read in place likewise; a PMTiles or MBTiles archive ignores zoom and is framed on its bounds unless it covers the whole world)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place (an address without a file name is read in place when its first bytes are a cloud-optimised GeoTIFF)", "cog"?: "bool: the address is a cloud-optimised GeoTIFF whatever its name says (the app's probe found it so)", "bbox"?: "[west, south, east, north] in degrees | "view": a cloud-optimised GeoTIFF's window as a raster layer (desktop and command line), read by range at full resolution, in the file's coordinate system, with its colour table and class names; at most 64 million values (all bands)", "cellSize"?: "with bbox: the coarsest overview whose cells are at most this size is read (the file's units; metres for longitude/latitude, a degree taken as 111.32 km)", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on"}"#,
         ),
         C::new("layer.addDownload", "Add Downloaded Data", "Home › Add", add_download).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files))
-            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes and paging are checked, and the address is kept as the layer's source), "bounds"?: [west, south, east, north] (with service: the layer's longitude/latitude bounds from its capabilities, which its axes are checked against; without bounds they are left as they come; ignored without service), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error, and its request kept as the layer's source), "geolibreProject"?: bool (internal: downloaded project JSON), "geolibreLayer"?: {"token", "record"} (internal: reserved imported layer and its saved style), "geolibreZarr"?: bool (internal: an imported Zarr slice as GeoTIFF)}"#),
+            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes (when they came as GeoJSON) and paging are checked, and the address is kept as the layer's source), "bounds"?: [west, south, east, north] (with service: the layer's longitude/latitude bounds from its capabilities, which its axes are checked against; without bounds they are left as they come; ignored without service), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error, and its request kept as the layer's source), "geolibreProject"?: bool (internal: downloaded project JSON), "geolibreLayer"?: {"token", "record"} (internal: reserved imported layer and its saved style), "geolibreZarr"?: bool (internal: an imported Zarr slice as GeoTIFF)}"#),
         C::new("layer.addEncodedPolyline", "Add Encoded Polyline", "Home › Add", add_encoded_polyline).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"polyline": "encoded polyline text" | [texts] (one line each), "precision"?: 5 (Google) | 6 (OSRM, Valhalla), "name"?: text}"#,
         ),
@@ -1071,8 +1071,10 @@ pub(crate) const PHOTOS: &str = "Photos";
 /// Adds photos as points: to the photo layer named `name` when there is one, else to a new one.
 /// `feed` hands the reader one photo at a time, so only one file's bytes are held at once; the
 /// reader stops taking photos when the layer is full. Photos without a GPS position are left out
-/// and named in a notice.
-pub(crate) fn add_photos_to(s: &mut Session, name: &str, feed: impl FnOnce(&mut photo::Reader)) -> CmdResult {
+/// and named in a notice. The map zooms to the photos added when it was empty, or when `zoom` is
+/// `Some(true)`; `Some(false)` keeps the view.
+pub(crate) fn add_photos_to(s: &mut Session, name: &str, zoom: Option<bool>, feed: impl FnOnce(&mut photo::Reader)) -> CmdResult {
+    let empty_before = super::map_is_empty(s);
     let existing = s.map().layers.iter().find(|l| l.name == name && photo::is_photo_layer(&l.dataset)).map(|l| l.id);
     let held = existing.and_then(|id| s.map().layer(id)).map_or(0, |l| l.dataset.features.len());
     let room = photo::MAX_PHOTOS.saturating_sub(held);
@@ -1101,7 +1103,9 @@ pub(crate) fn add_photos_to(s: &mut Session, name: &str, feed: impl FnOnce(&mut 
         }
         None => add_dataset(s, ds),
     };
-    s.zoom_to(&extent);
+    if zoom.unwrap_or(empty_before) {
+        s.zoom_to(&extent);
+    }
     Ok(json!({"layer": id, "photos": added, "skipped": report.skipped}))
 }
 
@@ -1142,7 +1146,7 @@ fn add_photos(s: &mut Session, p: &Value) -> CmdResult {
         if paths.is_empty() {
             return Err("give \"paths\" (photo files) or a \"folder\" of photos".into());
         }
-        add_photos_to(s, &name, |reader| {
+        add_photos_to(s, &name, None, |reader| {
             for (i, path) in paths.iter().enumerate() {
                 if reader.is_full() {
                     reader.left_over(paths.len() - i);
@@ -1192,7 +1196,7 @@ fn add_geodatabase(s: &mut Session, p: &Value, path: &str) -> CmdResult {
     // is installed; else, or if GDAL can't either, said. The second go on whether the first added.
     let mut results: Vec<Value> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
-    match add_reads(s, p, path, reads, Vec::new()) {
+    match add_reads(s, p, path, reads, Vec::new(), None) {
         Ok(r) => results.push(r),
         Err(e) => failed.push(e),
     }
@@ -1262,7 +1266,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         return add_layer_file(s, path);
     }
     if rustgis_data::source::is_source_name(path) {
-        return add_source(s, p, Origin::Path(path));
+        return add_source(s, p, Origin::Path(path), None);
     }
     // A CityJSON model named .json, in the coordinate system given or with a layer picked: as a
     // .city.json, all its layers.
@@ -1273,7 +1277,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         if rustgis_data::io::is_cityjson(path, &bytes) {
             let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
-            return add_layers(s, p, &full, &bytes);
+            return add_layers(s, p, &full, &bytes, None);
         }
     }
     // A large GeoJSON FeatureCollection (any, with `"stream": true`) is read in place, streamed
@@ -1288,7 +1292,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
     {
         let name = Path::new(path).file_stem().and_then(|n| n.to_str()).unwrap_or("layer");
         match rustgis_data::source::geojson::GeoJsonSource::open_path(Path::new(path), name) {
-            Ok(src) => return add_source_with(s, p, Origin::Path(path), Some(Box::new(src))),
+            Ok(src) => return add_source_with(s, p, Origin::Path(path), Some(Box::new(src)), None),
             // Not a FeatureCollection: read whole below.
             Err(rustgis_data::DataError::Unsupported(_)) => {}
             Err(e) => return Err(format!("{path}: {e}")),
@@ -1311,11 +1315,11 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         });
         if stream {
             let src = rustgis_data::source::shp::ShpSource::open_path_in(Path::new(path), name, Some(crs)).map_err(|e| e.to_string())?;
-            return add_source_with(s, p, Origin::Path(path), Some(Box::new(src)));
+            return add_source_with(s, p, Origin::Path(path), Some(Box::new(src)), None);
         }
         let mut read = rustgis_data::io::read_shapefile_in(Path::new(path), name, Some(crs)).map_err(|e| e.to_string())?;
         read.0.source = Some(path.to_string());
-        return add_read(s, p, read);
+        return add_read(s, p, read, None);
     }
     // A large Shapefile is read in place, as a GeoPackage is; smaller ones are loaded whole.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1324,7 +1328,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
             rustgis_data::source::shp::record_count(Path::new(path)).is_some_and(|n| n > rustgis_map::source::STREAM_ABOVE)
         })
     {
-        return add_source(s, p, Origin::Path(path));
+        return add_source(s, p, Origin::Path(path), None);
     }
     // A PMTiles archive is a tile layer (raster or vector, as its header says).
     if path.to_ascii_lowercase().ends_with(".pmtiles") {
@@ -1344,13 +1348,14 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
             return Err(format!("{path}: in the web app, add the MBTiles file from this computer (Home › Add › Add Data)"));
         }
         let full = std::path::absolute(path).map(|p| p.display().to_string()).map_err(|e| format!("{path}: {e}"))?;
-        // Read now, so a file that isn't an archive is said at once rather than when it draws.
-        crate::render::rustgis_tiles::mbtiles::info(&full)?;
+        // Refuse a promptly unreadable file now; a slow header is deferred without holding
+        // the command thread past the same one-second budget used by map.addTiles.
+        crate::render::rustgis_tiles::mbtiles::info_ready(&full, web_time::Duration::from_secs(1))?;
         let mut q = json!({"url": full, "kind": "mbtiles", "top": true});
         if let Some(n) = ps(p, "name") {
             q["name"] = json!(n);
         }
-        return super::tiles::add(s, &q);
+        return super::tiles::add_with_metadata_wait(s, &q, web_time::Duration::ZERO);
     }
     #[cfg(not(target_arch = "wasm32"))]
     if rustgis_data::filegdb::is_geodatabase(Path::new(path)) {
@@ -1374,7 +1379,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         // Read from disk: the table keeps the workbook's path, so an export can't replace it.
         let mut read = read_sheet(p, path, &bytes)?;
         read.0.source = Some(std::path::absolute(path).map_or_else(|_| path.to_string(), |a| a.display().to_string()));
-        return add_read(s, p, read);
+        return add_read(s, p, read, None);
     }
     #[cfg(not(target_arch = "wasm32"))]
     if large_osm(path) {
@@ -1387,7 +1392,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         }
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
-        return add_layers(s, p, &full, &bytes);
+        return add_layers(s, p, &full, &bytes, None);
     }
     let delimited = read_delimited(p, path, || {
         let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
@@ -1401,13 +1406,13 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         Some(read) => read,
         None => rustgis_data::io::read_path(Path::new(path)).map_err(|e| format!("{path}: {e}"))?,
     };
-    add_read(s, p, read)
+    add_read(s, p, read, None)
 }
 
 /// Adds every layer of a file that holds several: the Shapefiles (and other files) of a zip, a KML
 /// or KMZ's points, lines and polygons drawn in its styles, a GPX's waypoints, routes, tracks and
 /// track points. `"layer"` picks one by name; a name given applies to the first.
-pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u8]) -> CmdResult {
+pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u8], zoom: Option<bool>) -> CmdResult {
     // A LandXML file in a coordinate system it doesn't say.
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty());
     let landxml = rustgis_data::landxml::is_landxml_name(file_name)
@@ -1503,7 +1508,7 @@ pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u
             }
         }
     }
-    add_reads(s, p, file_name, reads, overlays)
+    add_reads(s, p, file_name, reads, overlays, zoom)
 }
 
 /// Adds the layers a file gave and its ground overlays: a layer that can't be added is skipped
@@ -1514,6 +1519,7 @@ fn add_reads(
     file_name: &str,
     reads: Vec<rustgis_data::io::LayerRead>,
     overlays: Vec<(String, rustgis_data::raster::Raster)>,
+    zoom: Option<bool>,
 ) -> CmdResult {
     let mut added = Vec::new();
     let mut failed = Vec::new();
@@ -1523,7 +1529,7 @@ fn add_reads(
         let styles = read.styles;
         // A layer that can't be added is skipped and said; the others are still added. A name
         // given goes to the first layer actually added.
-        match add_read(s, &q, (read.dataset, read.report)) {
+        match add_read(s, &q, (read.dataset, read.report), zoom) {
             Ok(r) => {
                 if let Some(id) = r.get("layer").and_then(Value::as_u64).and_then(|i| u32::try_from(i).ok()) {
                     apply_styles(s, id, &styles);
@@ -1537,7 +1543,7 @@ fn add_reads(
         }
     }
     for (name, raster) in overlays {
-        match super::raster::add_overlay(s, &name, raster) {
+        match super::raster::add_overlay(s, &name, raster, zoom) {
             Ok(r) => added.push(r),
             Err(e) => failed.push(format!("{name}: {e}")),
         }
@@ -1555,6 +1561,11 @@ fn add_reads(
     // The first layer, as the result of adding a single file says it.
     if let Some(first) = layers.first() {
         out["layer"] = first.clone();
+    }
+    // `"zoom": true` frames everything added, not only the file's last layer (each `add_read`
+    // above framed its own).
+    if zoom == Some(true) {
+        zoom_to_added(s, &out);
     }
     Ok(out)
 }
@@ -1801,8 +1812,8 @@ const MAX_SKIPPED_NAMED: usize = 100;
 /// Adds a GeoPackage, GeoParquet or FlatGeobuf file: each feature table becomes a layer. Large
 /// sources (or any, with `"stream": true`) are streamed, read in place a view at a time; smaller
 /// ones are loaded whole, so they can be edited.
-pub(crate) fn add_source(s: &mut Session, p: &Value, origin: Origin<'_>) -> CmdResult {
-    add_source_with(s, p, origin, None)
+pub(crate) fn add_source(s: &mut Session, p: &Value, origin: Origin<'_>, zoom: Option<bool>) -> CmdResult {
+    add_source_with(s, p, origin, None, zoom)
 }
 
 /// [`add_source`], with the source already open (its one table).
@@ -1811,6 +1822,7 @@ fn add_source_with(
     p: &Value,
     origin: Origin<'_>,
     mut opened: Option<Box<dyn rustgis_data::source::FeatureSource>>,
+    zoom: Option<bool>,
 ) -> CmdResult {
     use rustgis_data::source;
     let label = match &origin {
@@ -1851,7 +1863,7 @@ fn add_source_with(
     if tables.is_empty() {
         return Err(format!("{label}: no feature tables"));
     }
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let mut ids = Vec::new();
     let mut streamed = false;
     let mut features = 0u64;
@@ -1931,7 +1943,7 @@ fn add_source_with(
             }
         }
     }
-    if empty_before {
+    if zoom.unwrap_or(empty_before) {
         let e = ids.iter().filter_map(|id| s.map().layer(*id)).fold(rustgis_geom::Extent::EMPTY, |e, l| e.union(&l.extent()));
         if !e.is_empty() {
             s.zoom_to(&e);
@@ -2310,7 +2322,7 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
     let skipped: Vec<String> =
         if total > MAX_TABLES { tables.split_off(MAX_TABLES).iter().map(|t| t.label()).collect() } else { Vec::new() };
     let single = tables.len() == 1;
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let (mut ids, mut features, mut streamed, mut empty) = (Vec::new(), 0u64, false, 0usize);
     for t in tables {
         // A table that fails doesn't stop the others.
@@ -2368,7 +2380,7 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
             if let Some(v) = p.get("stream") {
                 q["stream"] = v.clone();
             }
-            let r = match add_source_with(s, &q, origin, Some(src)) {
+            let r = match add_source_with(s, &q, origin, Some(src), None) {
                 Ok(r) => r,
                 Err(e) => {
                     failed = true;
@@ -2512,7 +2524,7 @@ enum ConvertedOrigin {
 /// the layers' source.
 #[cfg(not(target_arch = "wasm32"))]
 fn add_converted(s: &mut Session, p: &Value, label: &str, original: &str, converted: Vec<Converted>) -> CmdResult {
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let single = converted.len() == 1;
     let (mut ids, mut features, mut streamed) = (Vec::new(), 0u64, false);
     for c in converted {
@@ -2525,7 +2537,7 @@ fn add_converted(s: &mut Session, p: &Value, label: &str, original: &str, conver
         }
         let file = c.path.display().to_string();
         // One layer that can't be added doesn't stop the others.
-        let r = match add_source(s, &q, Origin::Path(&file)) {
+        let r = match add_source(s, &q, Origin::Path(&file), None) {
             Ok(r) => r,
             Err(e) if !single => {
                 s.notify(format!("{}: {e}", c.name), true);
@@ -2698,14 +2710,14 @@ fn add_encoded_polyline(s: &mut Session, p: &Value) -> CmdResult {
         let n = pts.len() as i64;
         ds.push_next(Some(Geometry::Line(vec![pts])), vec![V::Int(i as i64 + 1), V::Int(n)]);
     }
-    add_read(s, p, (ds, rustgis_data::ReadReport::default()))
+    add_read(s, p, (ds, rustgis_data::ReadReport::default()), None)
 }
 
 /// Adds a sheet of a spreadsheet (`"layer"` names it; the first by default), read like delimited
 /// text with the same options.
-pub(crate) fn add_sheet(s: &mut Session, p: &Value, file_name: &str, bytes: &[u8]) -> CmdResult {
+pub(crate) fn add_sheet(s: &mut Session, p: &Value, file_name: &str, bytes: &[u8], zoom: Option<bool>) -> CmdResult {
     let read = read_sheet(p, file_name, bytes)?;
-    add_read(s, p, read)
+    add_read(s, p, read, zoom)
 }
 
 fn read_sheet(p: &Value, file_name: &str, bytes: &[u8]) -> Result<(rustgis_data::Dataset, rustgis_data::ReadReport), String> {
@@ -2828,20 +2840,23 @@ fn read_delimited(
 
 /// The file name for data downloaded from `url`: its last path segment when that has an extension
 /// RustGIS reads, else `<segment or "data">.<ext>` with the extension its contents suggest
-/// (an error when they suggest none). JPEG 2000 named or recognised by its contents is refused
-/// where GDAL can't run (the browser).
+/// (an error when they suggest none). The name is cut to 120 characters, keeping an extension
+/// shorter than 60; a `.shp` address whose download is a zip of its parts is named `<stem>.zip`.
+/// JPEG 2000 named or recognised by its contents is refused where GDAL can't run (the browser).
 pub fn url_file_name(url: &str, bytes: &[u8]) -> Result<String, String> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let path = path.split_once("://").map_or(path, |(_, rest)| rest.split_once('/').map_or("", |(_, p)| p));
-    let last: String = path
-        .rsplit('/')
-        .find(|p| !p.is_empty())
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '\\' | ':'))
-        .take(120)
-        .collect();
-    let ext = Path::new(&last).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+    let full: String =
+        path.rsplit('/').find(|p| !p.is_empty()).unwrap_or("").chars().filter(|c| !c.is_control() && !matches!(c, '\\' | ':')).collect();
+    let raw_ext = Path::new(&full).extension().and_then(|e| e.to_str());
+    let ext = raw_ext.map(str::to_ascii_lowercase).unwrap_or_default();
+    // At most 120 characters, keeping an extension shorter than 60 (a long `.shp` name is still one).
+    let last: String = match raw_ext {
+        Some(e) if full.chars().count() > 120 && e.chars().count() < 60 => {
+            format!("{}.{e}", full.chars().take(119 - e.chars().count()).collect::<String>())
+        }
+        _ => full.chars().take(120).collect(),
+    };
     // JPEG 2000 (Sentinel-2's imagery) is read through GDAL, which the browser can't run.
     let jpeg2000_only_on_desktop = |name: String| {
         if cfg!(target_arch = "wasm32") { Err(super::raster::JPEG2000_WEB_LIMITATION.to_string()) } else { Ok(name) }
@@ -2849,7 +2864,13 @@ pub fn url_file_name(url: &str, bytes: &[u8]) -> Result<String, String> {
     if rustgis_data::raster::is_jpeg2000_name(&last) {
         return jpeg2000_only_on_desktop(last);
     }
-    let known = rustgis_data::io::READ_EXTENSIONS.contains(&ext.as_str()) || rustgis_data::raster::is_raster_name(&last) || ext == "tsv";
+    // A `.shp` address comes with its files fetched beside it, zipped ([`download_data`]).
+    if ext == "shp" && is_zip(bytes) {
+        return Ok(format!("{}.zip", Path::new(&last).file_stem().and_then(|s| s.to_str()).unwrap_or("layer")));
+    }
+    let known = rustgis_data::io::READ_EXTENSIONS.contains(&ext.as_str())
+        || rustgis_data::raster::is_raster_name(&last)
+        || matches!(ext.as_str(), "tsv" | "mbtiles" | "pmtiles");
     if (known && ext != "json") || rustgis_data::cityjson::is_cityjson_name(&last) {
         return Ok(last);
     }
@@ -2874,7 +2895,16 @@ pub fn url_file_name(url: &str, bytes: &[u8]) -> Result<String, String> {
 /// app downloads off the frame and adds the bytes). In the browser, where nothing may wait, the
 /// request is kept for the app ([`Session::request_url`]), which downloads and adds it as its own
 /// Home › Add › Add Data › From URL does, so a plugin, a script or the assistant can add data by address too.
+/// Its errors quote addresses without their keys: the assistant's and MCP's tools return them as
+/// they are.
 pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
+    let owner = s.continuation()?;
+    let out = add_url_as_given(s, p).map_err(|e| crate::sources::redact_text(&e))?;
+    s.check_continuation(&owner)?;
+    Ok(out)
+}
+
+fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
     if ["geolibreProject", "geolibreLayer", "geolibreZarr"].iter().any(|key| p.get(key).is_some()) && !s.import_completion(p) {
         return Err("GeoLibre download state is internal; use project.importGeolibre".into());
     }
@@ -2991,8 +3021,13 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        // Errors about the address itself name it already.
-        let named = |e: String| if e.starts_with(url) { e } else { format!("{url}: {e}") };
+        // Errors name the address without its keys, and any address they quote (a redirect's)
+        // without its keys too; those about the address itself name it already.
+        let shown = crate::sources::redact(url);
+        let named = |e: String| match e.strip_prefix(url).or_else(|| e.strip_prefix(shown.as_str())) {
+            Some(rest) => format!("{shown}{}", crate::sources::redact_text(rest)),
+            None => format!("{shown}: {}", crate::sources::redact_text(&e)),
+        };
         // An address without a file name may be a GeoTIFF too: its first bytes are read to see,
         // and anything that doesn't answer as one is downloaded whole, as before.
         let unnamed = !tiff && is_unnamed_url(url);
@@ -3006,10 +3041,258 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
                 return add_cog(s, p, url);
             }
         }
-        let bytes = crate::render::rustgis_tiles::cache::download_blocking(url).map_err(named)?;
+        let bytes = if rustgis_data::io::shapefile_part_urls(url).is_some() {
+            download_shapefile_blocking(url)?
+        } else {
+            crate::render::rustgis_tiles::cache::download_blocking(url).map_err(named)?
+        };
         let name = url_file_name(url, &bytes).map_err(named)?;
-        super::raster::add_named_bytes(s, p, name, bytes).map_err(named)
+        let left_out = parts_left_out(url, &bytes, p);
+        let r = super::raster::add_named_bytes(s, p, name, bytes, b(p, "zoom")).map_err(named)?;
+        if let Some(n) = left_out {
+            s.notify(n, false);
+        }
+        Ok(r)
     }
+}
+
+/// Whether a Shapefile's part other than its `.dbf` can be done without: it isn't there (404 or
+/// 410, or 403, which S3 answers for a missing object to those who can't list the bucket). A 403
+/// to an address read with keys ([`keyed`]) fails instead, as they may not cover the part.
+fn part_not_there(ext: &str, url: &str, e: &str) -> bool {
+    ext != "dbf"
+        && match crate::render::rustgis_tiles::cache::http_status(e) {
+            Some(404 | 410) => true,
+            Some(403) => !keyed(url),
+            _ => false,
+        }
+}
+
+/// The statuses a Shapefile's part answers when it isn't there ([`part_not_there`]): expected, so
+/// they are noted once per server rather than recorded as failed requests.
+fn part_absences(ext: &str, url: &str) -> &'static [u16] {
+    match ext {
+        "dbf" => &[],
+        _ if keyed(url) => &[404, 410],
+        _ => &[404, 410, 403],
+    }
+}
+
+/// Whether an address is read with keys: one with a user and password, or whose query holds a key,
+/// token or signature (what `sources::redact` takes out), or a saved S3 connection.
+fn keyed(url: &str) -> bool {
+    // A user and password, or a key, token or signature in the query, is what redaction takes out;
+    // a query like `?v=2` carries none.
+    // (Redaction drops a fragment too, which carries no key.)
+    // (A trailing `?` or `&`, which redaction drops too, carries none either.)
+    let bare = url.split('#').next().unwrap_or(url).trim_end_matches(['?', '&']);
+    crate::sources::redact(bare) != bare || rustgis_data::s3_address::is_wrapper(url)
+}
+
+/// A part that arrived: itself, or `None` for an optional one that a web page answered for (an
+/// error for the `.dbf`, which can't be done without).
+fn page_part(ext: &str, b: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
+    match (is_web_page(&b), ext) {
+        (false, _) => Ok(Some(b)),
+        (true, "dbf") => Err("a web page answered, not a .dbf".into()),
+        (true, _) => Ok(None),
+    }
+}
+
+/// Whether downloaded bytes are a web page, not a Shapefile's part: a site that serves its page for
+/// any address it doesn't have. A required part (`.shp`, `.dbf`) answered so fails; an optional
+/// one is done without, as one that isn't there.
+fn is_web_page(b: &[u8]) -> bool {
+    b.iter().find(|c| !c.is_ascii_whitespace()) == Some(&b'<')
+}
+
+/// Whether downloaded bytes are a zip archive (its first local file header).
+fn is_zip(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"PK\x03\x04")
+}
+
+/// A Shapefile's `.shp` or part that failed, named by its address without its keys or signature
+/// (the `.shp`'s query, which the parts carry too).
+fn part_failed(url: &str, e: String) -> String {
+    let e = e.strip_prefix(url).map(|r| r.trim_start_matches(": ").to_string()).unwrap_or(e);
+    format!("{}: {}{}", crate::sources::redact(url), crate::sources::redact_text(&e), status_hint(url, &e))
+}
+
+/// What a Shapefile's 403 may mean: S3 answers a signed request for a file that isn't there as it
+/// answers a signature that doesn't cover it, and an unsigned one for a missing file so too.
+fn status_hint(url: &str, e: &str) -> &'static str {
+    match crate::render::rustgis_tiles::cache::http_status(e) {
+        Some(403) if keyed(url) => {
+            " (to an address read with keys, this may also mean the file isn't there, or that the keys or signature don't cover it: a presigned address signs one file, so a Shapefile's parts need addresses of their own; zip them and add the zip)"
+        }
+        Some(403) => " (S3 also answers this for a file that isn't there, to those who can't list its bucket)",
+        _ => "",
+    }
+}
+
+/// A part's download error, saying that a size limit is what was left of the one the Shapefile's
+/// files share (a part is fetched within what the `.shp` and the parts before it left).
+fn over_shared_limit(e: String) -> String {
+    if e.starts_with("larger than ") { format!("{e}, what the .shp and the parts before it left of the download limit") } else { e }
+}
+
+/// What a Shapefile added by its `.shp` address (#1238) was read without, said: its `.shx`, `.prj`
+/// or `.cpg` when they weren't found beside it. The address is said without its keys or signature;
+/// a `crs` given (`p`) stands for the `.prj`.
+fn parts_left_out(url: &str, bytes: &[u8], p: &Value) -> Option<String> {
+    rustgis_data::io::shapefile_part_urls(url)?;
+    let given_crs = ps(p, "crs").is_some_and(|c| !c.trim().is_empty());
+    // Each Shapefile by its name: a zip the address answered with may hold several (the first
+    // few named, the rest counted).
+    const NAMED: usize = 5;
+    // With `layer`, only the Shapefile added is said, picked as the read layers are (by its name
+    // or its last word).
+    let want = ps(p, "layer").map(str::trim).filter(|w| !w.is_empty());
+    let picked = |shp: &str| {
+        let stem = Path::new(shp).file_stem().and_then(|s| s.to_str()).unwrap_or(shp);
+        want.is_none_or(|w| stem.eq_ignore_ascii_case(w) || stem.rsplit(' ').next().is_some_and(|l| l.eq_ignore_ascii_case(w)))
+    };
+    let lacking: Vec<_> = rustgis_data::io::shapefile_zip_lacks(bytes).into_iter().filter(|(shp, _)| picked(shp)).collect();
+    let more = lacking.len().saturating_sub(NAMED);
+    let mut said: Vec<String> = lacking
+        .into_iter()
+        .take(NAMED)
+        // A name from the archive, without control characters and at most 80 characters.
+        .map(|(shp, lacks)| {
+            let shp: String = shp.chars().filter(|c| !c.is_control()).collect();
+            (if shp.chars().count() > 80 { format!("{}…", shp.chars().take(79).collect::<String>()) } else { shp }, lacks)
+        })
+        .map(|(shp, lacks)| {
+            let names = lacks.iter().map(|e| format!(".{e}")).collect::<Vec<_>>().join(", ");
+            let crs = if lacks.contains(&"prj") && !given_crs { "; its coordinates are read as longitude/latitude" } else { "" };
+            let them = if lacks.len() == 1 { "it" } else { "them" };
+            format!(
+                "{shp}: no {names} found or readable beside it ({} of 3 optional files missing), so it was read without {them}{crs}",
+                lacks.len()
+            )
+        })
+        .collect();
+    if more > 0 {
+        said.push(format!("and {more} more Shapefiles without some of theirs"));
+    }
+    (!said.is_empty()).then(|| format!("{}: {}", crate::sources::redact(url), said.join("; ")))
+}
+
+/// A Shapefile by its `.shp` address, waited for (#1238): the `.shp`, then its `.dbf`, `.shx`,
+/// `.prj` and `.cpg` beside it (each but the `.dbf` only when it is there), zipped, within one
+/// download's budget together.
+#[cfg(not(target_arch = "wasm32"))]
+fn download_shapefile_blocking(url: &str) -> Result<Vec<u8>, String> {
+    use crate::render::rustgis_tiles::cache;
+    let parts = rustgis_data::io::shapefile_part_urls(url).unwrap_or_default();
+    // One wait for all the parts together, as for one download.
+    let until = std::time::Instant::now() + cache::BLOCKING_TIMEOUT;
+    // Past it, a part isn't asked for at all (a zero timeout may mean none), and a timeout says
+    // where a large file goes instead.
+    let within = |u: &str, max: usize, omit: &'static [u16]| match until.saturating_duration_since(std::time::Instant::now()) {
+        w if w.is_zero() => Err(cache::large_file_hint("timed out".into())),
+        w => cache::download_blocking_omitting_within(u, max, w, omit).map_err(cache::large_file_hint),
+    };
+    let shp = within(url, cache::MAX_DOWNLOAD, &[]).map_err(|e| part_failed(url, e))?;
+    // Already zipped (a server answering the address with its parts): read as it is.
+    if is_zip(&shp) {
+        return Ok(shp);
+    }
+    if is_web_page(&shp) {
+        return Err(part_failed(url, "a web page answered, not a .shp".into()));
+    }
+    let name = url_file_name(url, &shp).map_err(|e| part_failed(url, e))?;
+    let mut left = cache::MAX_DOWNLOAD.saturating_sub(shp.len());
+    let mut got = Vec::new();
+    for (ext, u) in parts {
+        match within(&u, left, part_absences(ext, &u)).and_then(|b| page_part(ext, b)) {
+            Ok(None) => {}
+            Ok(Some(b)) => {
+                left = left.saturating_sub(b.len());
+                got.push((ext, b));
+            }
+            Err(e) if part_not_there(ext, &u, &e) => {}
+            Err(e) => return Err(part_failed(&u, over_shared_limit(e))),
+        }
+    }
+    cache::check_still(&cache::current_still())?;
+    zipped_within(&name, shp, got, left).map_err(|e| part_failed(url, e))
+}
+
+/// Downloads a file the user named by its address off the frame, as `cache::download_limited`
+/// does, for the app to add when it lands: a Shapefile's `.shp` address brings its `.dbf`, `.shx`,
+/// `.prj` and `.cpg` too, one after another, and `done` gets them zipped (#1238), within `max`
+/// bytes together.
+pub fn download_data(url: &str, max: usize, done: crate::render::rustgis_tiles::cache::Done) {
+    use crate::render::rustgis_tiles::cache;
+    let Some(parts) = rustgis_data::io::shapefile_part_urls(url) else {
+        return cache::download_limited(url, max, done);
+    };
+    let shp_url = url.to_string();
+    cache::download_limited(
+        url,
+        max,
+        Box::new(move |r| match r.and_then(|shp| url_file_name(&shp_url, &shp).map(|name| (name, shp))) {
+            // Already zipped: as it is.
+            Ok((_, shp)) if is_zip(&shp) => done(Ok(shp)),
+            Ok((_, shp)) if is_web_page(&shp) => done(Err("a web page answered, not a .shp".into())),
+            Ok((name, shp)) => {
+                let left = max.saturating_sub(shp.len());
+                download_parts(name, shp, parts.into_iter(), Vec::new(), left, done);
+            }
+            // The app names the address it asked for (redacted), as for any download.
+            Err(e) => {
+                let why = status_hint(&shp_url, &e);
+                done(Err(format!("{}{why}", crate::sources::redact_text(&e))))
+            }
+        }),
+    );
+}
+
+/// A Shapefile's parts zipped, within the budget they were downloaded in (`left` being what is
+/// still free): the archive's own records count too. It runs where the last part lands: on the
+/// download thread natively, on the page's event loop in the web app (as the web app's loose
+/// Shapefiles picked or dropped are zipped, #426).
+fn zipped_within(name: &str, shp: Vec<u8>, got: Vec<(&'static str, Vec<u8>)>, left: usize) -> Result<Vec<u8>, String> {
+    let max = got.iter().fold(shp.len().saturating_add(left), |n, (_, b)| n.saturating_add(b.len()));
+    let zip = rustgis_data::io::zip_shapefile_parts(name, shp, got)?;
+    if zip.len() > max {
+        return Err(format!("larger than {max} bytes, zipped"));
+    }
+    Ok(zip)
+}
+
+/// The next of a Shapefile's parts for [`download_data`], then the zip once they are all in: the
+/// steps of `download_shapefile_blocking` as callbacks, sharing its rules (`part_not_there`,
+/// `part_failed`, `zipped_within`), so a change to one goes in both.
+fn download_parts(
+    name: String,
+    shp: Vec<u8>,
+    mut parts: std::vec::IntoIter<(&'static str, String)>,
+    mut got: Vec<(&'static str, Vec<u8>)>,
+    left: usize,
+    done: crate::render::rustgis_tiles::cache::Done,
+) {
+    let Some((ext, url)) = parts.next() else {
+        done(zipped_within(&name, shp, got, left));
+        return;
+    };
+    let next = url.clone();
+    crate::render::rustgis_tiles::cache::download_limited_omitting(
+        &next,
+        left,
+        part_absences(ext, &url),
+        Box::new(move |r| match r.and_then(|b| page_part(ext, b)) {
+            Ok(None) => download_parts(name, shp, parts, got, left, done),
+            Ok(Some(b)) => {
+                let left = left.saturating_sub(b.len());
+                got.push((ext, b));
+                download_parts(name, shp, parts, got, left, done);
+            }
+            Err(e) if part_not_there(ext, &url, &e) => download_parts(name, shp, parts, got, left, done),
+            Err(e) => done(Err(part_failed(&url, over_shared_limit(e)))),
+        }),
+    );
 }
 
 /// Adds a FlatGeobuf or GeoParquet by its address as a layer read in place: a view's features at
@@ -3017,7 +3300,7 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
 fn add_remote(s: &mut Session, p: &Value, url: &str, src: Box<dyn rustgis_data::source::FeatureSource>) -> CmdResult {
     let info = src.info().clone();
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| info.name.clone());
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let layer = rustgis_map::source::SourceLayer::from_path(url.to_string(), None, src);
     let unique = unique_name(s, &name);
     for n in &info.notes {
@@ -3032,7 +3315,7 @@ fn add_remote(s: &mut Session, p: &Value, url: &str, src: Box<dyn rustgis_data::
     s.notify(format!("{unique}: {count} features, read in place by range from its address, a view at a time"), false);
     // Framed when it is the map's first layer, unless told to keep the view (a catalog's data for
     // the view, such as Overture's).
-    if (empty_before || b(p, "zoom") == Some(true)) && b(p, "zoom") != Some(false) && !info.extent.is_empty() {
+    if b(p, "zoom").unwrap_or(empty_before) && !info.extent.is_empty() {
         s.zoom_to(&info.extent);
     }
     Ok(json!({"layer": id, "layers": [id], "features": info.count, "streamed": true, "inPlace": true}))
@@ -3080,6 +3363,7 @@ pub fn is_unnamed_url(url: &str) -> bool {
 pub(crate) fn add_cog(s: &mut Session, p: &Value, url: &str) -> CmdResult {
     let stem = cog_name(url);
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&stem);
+    let empty_before = super::map_is_empty(s);
     let mut q = json!({"url": url, "kind": "cog", "name": name, "top": true});
     // A dated address's span and steps (see map.addTiles).
     for k in ["start", "end", "unit", "interval", "dates"] {
@@ -3100,7 +3384,11 @@ pub(crate) fn add_cog(s: &mut Session, p: &Value, url: &str) -> CmdResult {
     };
     if let Ok(Some(info)) = crate::render::rustgis_tiles::cog::info(&url) {
         let [w, so, e, n] = info.bounds;
-        s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n));
+        // A cloud-optimised GeoTIFF read in place is framed when it is the first content on the
+        // map, as other data is; `"zoom"` says otherwise (`true`, or `false` to keep the view).
+        if b(p, "zoom").unwrap_or(empty_before) {
+            s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n));
+        }
         r["bounds"] = json!(info.bounds);
         // Drawn in place, the tiles are drawn as values: what the header holds beside them (a
         // colour table, band and class names) comes only with a window, and is said.
@@ -3393,7 +3681,7 @@ fn add_cog_window(s: &mut Session, p: &Value, url: &str) -> CmdResult {
     };
     let (width, height, size) = (r.width, r.height, size_of(lv));
     let layer = rustgis_map::RasterLayer::from_bytes(r, format!("{name}.tif"), bytes);
-    let mut out = super::raster::add_raster(s, &name, layer)?;
+    let mut out = super::raster::add_raster_after(s, &name, layer, b(p, "zoom"))?;
     let of = if level == 0 { "the full image".to_string() } else { format!("overview {level} of {}", layout.levels.len() - 1) };
     let added = s.active_layer.and_then(|id| s.map().layer(id)).map(|l| l.name.clone()).unwrap_or(name);
     s.notify(format!("{added}: a {width} × {height} window of {of}, cells of {size:.1}{unit}, read by range from its address"), false);
@@ -3551,6 +3839,13 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     if (service || coverage) && ps(p, "url").is_none_or(|url| url.trim().is_empty()) {
         return Err("url is required for a service or coverage download".into());
     }
+    // A download read already (an ArcGIS layer's protocol buffer pages, joined): added as read,
+    // with no axes to check against bounds.
+    if let Some(i) = s.landed_reads.iter().position(|(d, _)| *d == id) {
+        let (_, read) = s.landed_reads.remove(i);
+        let r = add_read(s, p, *read, b(p, "zoom"))?;
+        return added_download(s, p, r, service || coverage, &url);
+    }
     let bounds = if service { super::service::bounds_of(p.get("bounds"))? } else { None };
     let i = s.downloaded.iter().position(|(d, _)| *d == id).ok_or("no such download (it was dropped when another project opened)")?;
     let (_, bytes) = s.downloaded.remove(i);
@@ -3580,15 +3875,28 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     } else {
         url_file_name(&url, &bytes).map_err(|e| format!("{url}: {e}"))?
     };
-    let mut r = super::raster::add_named_bytes(s, p, name, bytes)?;
+    let left_out = parts_left_out(&url, &bytes, p);
+    let r = super::raster::add_named_bytes(s, p, name, bytes, b(p, "zoom"))?;
+    if let Some(n) = left_out {
+        s.notify(n, false);
+    }
+    added_download(s, p, r, service || coverage, &url)
+}
+
+/// A download added (`r`, the add's result): a service's features or coverage marked as read from
+/// its address, and the map zoomed to them when asked.
+fn added_download(s: &mut Session, p: &Value, mut r: Value, mark_source: bool, url: &str) -> CmdResult {
     // A service's features or coverage: known by the address it came from (Add From Service).
-    if service || coverage {
-        super::service::mark_service_source(s, &r, &url);
+    if mark_source {
+        super::service::mark_service_source(s, &r, url);
     }
     // `"zoom": true` zooms to everything added, whatever the map held (a link's data); `zoomed`
-    // says whether there was anything to zoom to (a tile archive adds no layer).
+    // says whether framing happened now, including the tile archive's own bounds handling. A photo result
+    // was already framed on the photos this download added; `zoom_to_added` would frame the whole
+    // photo layer, earlier photos included.
     if b(p, "zoom") == Some(true) {
-        let zoomed = zoom_to_added(s, &r);
+        let zoomed =
+            r.get("zoomed").and_then(Value::as_bool).unwrap_or_else(|| if r.get("photos").is_some() { true } else { zoom_to_added(s, &r) });
         if let Some(o) = r.as_object_mut() {
             o.insert("zoomed".into(), json!(zoomed));
         }
@@ -3614,6 +3922,11 @@ fn zoom_to_added(s: &mut Session, r: &Value) -> bool {
 }
 
 pub(crate) fn add_data_text(s: &mut Session, p: &Value) -> CmdResult {
+    add_data_text_after(s, p, None)
+}
+
+/// [`add_data_text`], with the adding command's `"zoom"` (layer.addUrl, layer.addDownload).
+pub(crate) fn add_data_text_after(s: &mut Session, p: &Value, zoom: Option<bool>) -> CmdResult {
     let name = s_req(p, "fileName")?;
     let text = s_req(p, "text")?;
     // A CityJSON model: all its layers, in the coordinate system given or with a layer picked.
@@ -3621,17 +3934,22 @@ pub(crate) fn add_data_text(s: &mut Session, p: &Value) -> CmdResult {
         || (["crs", "layer"].iter().any(|k| ps(p, k).is_some_and(|c| !c.trim().is_empty()))
             && rustgis_data::io::is_cityjson(name, text.as_bytes()))
     {
-        return add_layers(s, p, name, text.as_bytes());
+        return add_layers(s, p, name, text.as_bytes(), zoom);
     }
     if let Some(read) = read_delimited(p, name, || Ok(text.as_bytes().to_vec()))? {
-        return add_read(s, p, read);
+        return add_read(s, p, read, zoom);
     }
     let read = rustgis_data::io::read_bytes(name, text.as_bytes()).map_err(|e| format!("{name}: {e}"))?;
-    add_read(s, p, read)
+    add_read(s, p, read, zoom)
 }
 
 /// Adds an imported dataset as a layer or table, forwarding reader notices for either result.
-pub(crate) fn add_read(s: &mut Session, p: &Value, read: (rustgis_data::Dataset, rustgis_data::ReadReport)) -> CmdResult {
+pub(crate) fn add_read(
+    s: &mut Session,
+    p: &Value,
+    read: (rustgis_data::Dataset, rustgis_data::ReadReport),
+    zoom: Option<bool>,
+) -> CmdResult {
     let (mut ds, report) = read;
     if let Some(n) = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
         ds.name = n.to_string();
@@ -3645,9 +3963,11 @@ pub(crate) fn add_read(s: &mut Session, p: &Value, read: (rustgis_data::Dataset,
         return Ok(json!({"table": name, "id": id}));
     }
     let n = ds.features.len();
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let id = add_dataset(s, ds);
-    if empty_before && let Some(e) = s.map().layer(id).map(|l| l.extent()) {
+    if zoom.unwrap_or(empty_before)
+        && let Some(e) = s.map().layer(id).map(|l| l.extent())
+    {
         s.zoom_to(&e);
     }
     Ok(json!({"layer": id, "features": n}))

@@ -2706,6 +2706,17 @@ pub fn finish_graphic(app: &mut RustGisApp, shape: &str, pts: Vec<Coord>) {
     }
 }
 
+/// The credit in the map's corner: Natural Earth's where the built-in world outline is drawn, then
+/// the sources drawn.
+fn attribution(map: &rustgis_engine::map::Map, sources: &[String]) -> String {
+    map.draws_world_outline()
+        .then_some("Natural Earth")
+        .into_iter()
+        .chain(sources.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// Paints map decorations and interactive readouts, including measurements on the map's body.
 fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t: &Tokens) {
     let accent = t.accent;
@@ -3014,14 +3025,13 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     }
     north_arrow(p, rect, t, bearing, pitch);
     // Attribution.
-    // The built-in world outline is Natural Earth's, drawn only on the Earth.
-    let earth = app.session.map().body().is_earth();
-    let att =
-        earth.then_some("Natural Earth").into_iter().chain(app.map.attribution.iter().map(String::as_str)).collect::<Vec<_>>().join(" | ");
-    let g = p.layout(att, regular(10.5), t.text_dim, (rect.width() - 240.0).max(120.0));
-    let r = Rect::from_min_size(pos2(rect.max.x - g.size().x - 14.0, rect.max.y - g.size().y - 6.0), g.size() + vec2(10.0, 4.0));
-    p.rect_filled(r, CornerRadius::same(3), t.ribbon.gamma_multiply(0.75));
-    p.galley(r.min + vec2(5.0, 2.0), g, t.text_dim);
+    let att = attribution(app.session.map(), &app.map.attribution);
+    if !att.is_empty() {
+        let g = p.layout(att, regular(10.5), t.text_dim, (rect.width() - 240.0).max(120.0));
+        let r = Rect::from_min_size(pos2(rect.max.x - g.size().x - 14.0, rect.max.y - g.size().y - 6.0), g.size() + vec2(10.0, 4.0));
+        p.rect_filled(r, CornerRadius::same(3), t.ribbon.gamma_multiply(0.75));
+        p.galley(r.min + vec2(5.0, 2.0), g, t.text_dim);
+    }
     // Navigation buttons (zoom in/out/full) in the top-right corner.
     let mut y = rect.min.y + 12.0;
     for (icon, id, tip) in
@@ -4131,6 +4141,27 @@ mod picture_tests {
 mod tests {
     use super::*;
 
+    /// Natural Earth is credited only where its world outline is drawn: not on a blank basemap or
+    /// another body, whose sources are still credited.
+    #[test]
+    fn natural_earth_is_credited_only_where_drawn() {
+        use rustgis_engine::map::Basemap;
+        let mut map = RustGisApp::with_sample().session.map().clone();
+        let tiles = ["OpenStreetMap".to_string()];
+        for basemap in [Basemap::Paper, Basemap::Midnight, Basemap::Ocean, Basemap::Atlas] {
+            map.basemap = basemap;
+            assert_eq!(attribution(&map, &[]), "Natural Earth");
+            assert_eq!(attribution(&map, &tiles), "Natural Earth | OpenStreetMap");
+        }
+        map.basemap = Basemap::Blank;
+        assert_eq!(attribution(&map, &[]), "");
+        assert_eq!(attribution(&map, &tiles), "OpenStreetMap");
+        map.basemap = Basemap::Paper;
+        map.body = "mars".into();
+        assert_eq!(attribution(&map, &[]), "");
+        assert_eq!(attribution(&map, &tiles), "OpenStreetMap");
+    }
+
     /// The pop-up stays on the result shown as answers come and results go, the second of two
     /// identical ones too, and goes to the first when that one is left out.
     #[test]
@@ -4294,6 +4325,29 @@ mod tests {
 
     fn selection_rows(h: &egui_kittest::Harness<'_, RustGisApp>) -> Vec<usize> {
         h.state().session.map().layer_by_name("Points").unwrap().selection.clone()
+    }
+
+    /// #1321: the double-click delay applies to the map too, and its 1.2 s ceiling holds however
+    /// slow the frames: two clicks 1.5 s apart at 0.75 s a frame stay two, and don't zoom.
+    #[test]
+    fn map_clicks_past_the_double_click_ceiling_do_not_zoom() {
+        let app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 860.0)).with_step_dt(0.75).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        let at = h.state().map.view_rect.unwrap().0.center();
+        let res = h.state().session.map().camera.res;
+        crate::click_in_one_frame(&mut h, at, 0.75);
+        crate::click_in_one_frame(&mut h, at, 1.5);
+        assert_eq!(h.state().session.map().camera.res, res, "two separate clicks");
+        crate::click_in_one_frame(&mut h, at, 1.0);
+        assert_eq!(h.state().session.map().camera.res, res / 2.0, "a double-click inside the ceiling zooms in");
     }
 
     #[test]
