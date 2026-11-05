@@ -820,6 +820,7 @@ mod tests {
 
     #[test]
     fn a_service_dialog_download_keeps_the_browsed_connection_not_the_current_selection() {
+        let _turn = crate::fetching::turn();
         let base = serve(|_| (200, br#"{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}"#.to_vec()));
         let mut h = harness();
         let app = h.state_mut();
@@ -837,6 +838,7 @@ mod tests {
 
     #[test]
     fn url_downloads_use_the_explicit_basic_or_header_connection_and_record_it() {
+        let _turn = crate::fetching::turn();
         for basic in [false, true] {
             let base = serve(move |head| {
                 let head = head.to_ascii_lowercase();
@@ -1032,6 +1034,7 @@ mod tests {
 
     #[test]
     fn a_tileset_step_names_its_layer_and_a_refused_one_is_not_recorded() {
+        let _turn = crate::fetching::turn();
         let mut h = harness();
         let api = "https://x.org/collections";
         let tiled = r#"{"collections": [{"id": "relief", "links": [{"rel": "tilesets-map", "href": "https://x.org/relief/map/tiles"}]}]}"#;

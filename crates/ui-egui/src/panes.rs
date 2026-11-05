@@ -7135,6 +7135,7 @@ mod tests {
     /// from its menu, and is dragged to another place.
     #[test]
     fn a_tile_layer_is_listed_and_moved_among_the_layers() {
+        let _turn = crate::fetching::turn();
         use egui_kittest::kittest::Queryable;
         let mut app = RustGisApp::with_sample();
         for c in ["Cities", "Countries"] {
@@ -7258,6 +7259,7 @@ mod tests {
     /// mode identifies it), and clicking a layer's row picks that instead.
     #[test]
     fn a_tile_layers_row_is_picked_with_a_click() {
+        let _turn = crate::fetching::turn();
         use egui_kittest::kittest::Queryable;
         let mut app = RustGisApp::with_sample();
         app.run("map.addTiles", json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();

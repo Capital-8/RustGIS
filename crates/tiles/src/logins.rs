@@ -139,7 +139,7 @@ fn activate_with_random(
     method: Method,
     value: &str,
     insecure: bool,
-    random: fn(&mut [u8; 16]) -> Result<(), &'static str>,
+    mut random: impl FnMut(&mut [u8; 16]) -> Result<(), &'static str>,
 ) -> Result<String, &'static str> {
     rustgis_data::login_address::set_validator(check);
     if self::origin(origin).as_deref() != Some(origin) {
@@ -175,7 +175,7 @@ fn activate_with_random(
     // A token is the only thing that scopes a bound address to its login, so it is random. A
     // collision (never expected at 128 bits) is retried rather than replacing a live login.
     for _ in 0..4 {
-        let binding = random_token(random)?;
+        let binding = random_token(&mut random)?;
         if !entries.contains_key(&binding) {
             entries.insert(
                 binding.clone(),
@@ -188,35 +188,16 @@ fn activate_with_random(
 }
 
 /// 128 unpredictable bits as 32 lower-case hex digits.
-fn random_token(random: fn(&mut [u8; 16]) -> Result<(), &'static str>) -> Result<String, &'static str> {
+fn random_token(random: &mut impl FnMut(&mut [u8; 16]) -> Result<(), &'static str>) -> Result<String, &'static str> {
     let mut bytes = [0u8; 16];
     random(&mut bytes)?;
     Ok(format!("{:032x}", u128::from_be_bytes(bytes)))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+// The browser backend calls globalThis.crypto.getRandomValues (windows and workers), catching
+// missing APIs and exceptions. No binding is installed if the secure source fails.
 fn fill_random(bytes: &mut [u8; 16]) -> Result<(), &'static str> {
     getrandom::fill(bytes).map_err(|_| "No random numbers are available for a login binding.")
-}
-
-type RandomSource = fn(&mut [u8; 16]) -> Result<(), ()>;
-static RANDOM_SOURCE: OnceLock<RandomSource> = OnceLock::new();
-
-/// Installs the browser application's cryptographic generator before any session is created.
-/// The first installation wins; native builds continue to use the operating-system generator.
-pub fn set_random_source(source: fn(&mut [u8; 16]) -> Result<(), ()>) {
-    let _ = RANDOM_SOURCE.set(source);
-}
-
-#[cfg(target_arch = "wasm32")]
-fn fill_random(bytes: &mut [u8; 16]) -> Result<(), &'static str> {
-    fill_from_source(&RANDOM_SOURCE, bytes)
-}
-
-#[cfg(any(target_arch = "wasm32", test))]
-fn fill_from_source(source: &OnceLock<RandomSource>, bytes: &mut [u8; 16]) -> Result<(), &'static str> {
-    source.get().ok_or("No random numbers are available for a login binding.")?(bytes)
-        .map_err(|_| "No random numbers are available for a login binding.")
 }
 
 fn add_redactions(redactions: &mut Vec<Redaction>, value: &str) {
@@ -512,21 +493,61 @@ mod tests {
     }
 
     #[test]
-    fn bindings_are_long_distinct_and_not_a_sequence() {
-        let target = "https://token-login.example";
-        let tokens: Vec<String> = (0..8).map(|_| activate(target, "token", Method::Header("X-Key".into()), "k", false).unwrap()).collect();
-        let distinct: std::collections::BTreeSet<_> = tokens.iter().collect();
-        assert_eq!(distinct.len(), tokens.len());
-        for t in &tokens {
-            assert_eq!(t.len(), 32);
-            assert!(t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
-            assert!(bind(t, &format!("{target}/tile")).is_ok());
+    fn failed_random_source_installs_nothing_and_preserves_a_live_login() {
+        let target = "https://random-failure-login.example";
+        let old = activate(target, "random-replacement", Method::Header("X-Key".into()), "old-credential", false).unwrap();
+        let address = bind(&old, &format!("{target}/tile")).unwrap();
+        for owner in ["random-first-login", "random-replacement"] {
+            let mut attempts = 0;
+            let result = activate_with_random(target, owner, Method::Header("X-Key".into()), "failed-credential", false, |bytes| {
+                attempts += 1;
+                // Even a source that writes before failing must never activate those bytes.
+                bytes.fill(0x21);
+                Err("No random numbers are available for a login binding.")
+            });
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+            let expected = usize::from(owner == "random-replacement");
+            assert_eq!(entries().values().filter(|entry| entry.owner == owner).count(), expected);
+            assert_eq!(apply(&address).unwrap().unwrap().header.unwrap().1, "old-credential");
         }
-        let value = |t: &String| u128::from_str_radix(t, 16).unwrap();
-        assert!(tokens.windows(2).all(|w| value(&w[1]).wrapping_sub(value(&w[0])) != 1));
-        for t in &tokens {
-            assert!(deactivate(t));
-        }
+        assert!(deactivate(&old));
+    }
+
+    #[test]
+    fn collisions_retry_without_overwriting_and_exhaust_after_four_attempts() {
+        let target = "https://collision-login.example";
+        let method = || Method::Header("X-Key".into());
+        let old = activate_with_random(target, "collision-old", method(), "old-key", false, |bytes| {
+            bytes.fill(0x3c);
+            Ok(())
+        })
+        .unwrap();
+        let old_address = bind(&old, &format!("{target}/tile")).unwrap();
+        let mut attempts = 0;
+        let next = activate_with_random(target, "collision-new", method(), "new-key", false, |bytes| {
+            attempts += 1;
+            bytes.fill(if attempts == 1 { 0x3c } else { 0x7a });
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        let next_address = bind(&next, &format!("{target}/tile")).unwrap();
+        assert_eq!(apply(&old_address).unwrap().unwrap().header.unwrap().1, "old-key");
+        assert_eq!(apply(&next_address).unwrap().unwrap().header.unwrap().1, "new-key");
+
+        attempts = 0;
+        let result = activate_with_random(target, "collision-exhausted", method(), "failed-key", false, |bytes| {
+            attempts += 1;
+            bytes.fill(0x3c);
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err(), "The service login binding could not be created.");
+        assert_eq!(attempts, 4);
+        assert!(!entries().values().any(|entry| entry.owner == "collision-exhausted"));
+        assert_eq!(apply(&old_address).unwrap().unwrap().header.unwrap().1, "old-key");
+        assert!(deactivate(&old));
+        assert!(deactivate(&next));
     }
 
     #[test]
@@ -576,33 +597,6 @@ mod tests {
         .unwrap();
         assert!(active != account_identity(session).unwrap(), "same credential is a new generation");
         assert!(deactivate(&replacement));
-    }
-
-    /// The browser's exact entropy fallback is exercised through real activation, never a mixer.
-    #[test]
-    fn missing_or_failed_browser_entropy_refuses_activation() {
-        fn missing(bytes: &mut [u8; 16]) -> Result<(), &'static str> {
-            fill_from_source(&OnceLock::new(), bytes)
-        }
-        fn failing(bytes: &mut [u8; 16]) -> Result<(), &'static str> {
-            let source: OnceLock<RandomSource> = OnceLock::new();
-            source.set(|_| Err(())).unwrap();
-            assert!(source.set(|_| Ok(())).is_err(), "the first installation wins");
-            fill_from_source(&source, bytes)
-        }
-        let before = account_identity(9_150_002).unwrap();
-        for source in [missing, failing] {
-            let result = activate_with_random(
-                "https://entropy-login.example",
-                "9150002/connection",
-                Method::Header("X-Key".into()),
-                "synthetic-entropy-check",
-                false,
-                source,
-            );
-            assert!(result.is_err());
-            assert!(before.is_current(), "entropy failure installed no binding");
-        }
     }
 
     #[test]

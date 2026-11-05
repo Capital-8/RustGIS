@@ -89,9 +89,6 @@ fn worth_logging(metadata: &log::Metadata<'_>) -> bool {
 }
 
 pub fn start() {
-    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::logins::set_random_source(|bytes| {
-        web_sys::window().ok_or(())?.crypto().map_err(|_| ())?.get_random_values_with_u8_array(bytes).map(|_| ()).map_err(|_| ())
-    });
     log::set_max_level(log::LevelFilter::Info);
     log::set_boxed_logger(Box::new(Logger(eframe::WebLogger::new(log::LevelFilter::Info)))).ok();
     wasm_bindgen_futures::spawn_local(async {
