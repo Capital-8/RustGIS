@@ -102,6 +102,80 @@ impl Session {
             })
         })
     }
+    /// Admits a file read before its picker, freezes Load All's selector, and seals its owner.
+    pub(crate) fn start_read(&mut self, command: &str, params: &Value) -> Result<crate::cmd::reads::ReadAhead, String> {
+        if self.depth > 0 || !self.policy.nodes.is_empty() || self.policy.cursor.is_some() {
+            return Err("background reads can only start before handler dispatch".into());
+        }
+        if !matches!(command, "layer.addData" | "layer.loadAll") {
+            return Err("only Add Data and Load All can prepare a background read".into());
+        }
+        let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
+        if command == "layer.loadAll" {
+            let id = self.layer_id(&Value::Object(params.clone()))?;
+            params.insert("layer".into(), json!(id));
+        }
+        let op = self.authorize(command, &Value::Object(params))?;
+        self.check_read_command(&op)?;
+        let node = op.node.clone();
+        let owner = self.continuation_for(node.clone())?;
+        owner.check()?;
+        let current = owner.clone();
+        let still = Arc::new(move || current.check().is_ok());
+        self.with_node(node, |s| crate::render::rustgis_tiles::cache::with_still(still, || crate::cmd::reads::prepare(s, op, owner)))
+    }
+    /// Lands only the original read invocation; no result can be claimed by another command.
+    pub(crate) fn finish_read(&mut self, read: crate::cmd::reads::Read) -> CmdResult {
+        let crate::cmd::reads::Read { op, owner, source, ready } = read;
+        let (command, params) = match op.op() {
+            CommandOp::Registered { spec, params } => (spec.id, params.clone()),
+            _ => return Err("not a registered read command".into()),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.with_deferred_downloads(|s| {
+                s.command_epilogue(command, &params, |s| {
+                    s.check_delivery(&owner)?;
+                    if let Some(source) = &source {
+                        let layer = s.map().layer(s.layer_id(&params)?).ok_or("no such layer")?;
+                        if !layer.source.as_ref().is_some_and(|current| current.same_opening(source)) {
+                            return Err("the live source changed since this read started".into());
+                        }
+                    }
+                    s.resume(&owner, |s| {
+                        if !owner.native_tool_owner() && *op.node != s.command_node(command, &params)? {
+                            return Err("the read command changed since it was authorized".into());
+                        }
+                        s.check_read_command(&op)?;
+                        s.read_ahead = ready;
+                        s.invoke(op, Txn::Own)
+                    })?
+                })
+            })
+        }));
+        self.read_ahead = None;
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+    /// Preserves ordinary command conditions for the admitted read's explicit layer selector.
+    fn check_read_command(&mut self, op: &Authorized<CommandOp>) -> Result<(), String> {
+        let CommandOp::Registered { spec, params } = op.op() else { return Err("not a registered read command".into()) };
+        let named = self.layer_id(params).ok();
+        let active = self.active_layer;
+        if named.is_some() {
+            self.active_layer = named;
+        }
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.enabled)(self))).unwrap_or(Some("unavailable"));
+        self.active_layer = active;
+        if let Some(why) = blocked {
+            return Err(format!("{}: {why}", spec.label));
+        }
+        if let Some(why) = self.streamed_edit(spec.id, spec.mutates, spec.label, named.or(active)) {
+            return Err(why);
+        }
+        Ok(())
+    }
     /// Admits an export before its preparation reads any input or creates off-thread work.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn start_export(&mut self, command: &str, params: &Value) -> Result<crate::cmd::exports::ExportRun, String> {

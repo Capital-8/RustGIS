@@ -4232,6 +4232,58 @@ fn map_and_layer_files_report_label_setting_losses() {
     }
 }
 
+/// Two layers whose only features have the same id, each with a locked label and a line anchor.
+fn two_locked_layers() -> (Session, u32, u32) {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let mut s = Session::new(Project::default());
+    let mut layer = |name: &str| {
+        let mut d = Dataset::new(name, GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        d.push(Some(Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![V::Text(name.into())]);
+        s.map_mut().add_dataset(d)
+    };
+    let (a, b) = (layer("A"), layer("B"));
+    let keys = [(a, 1, 0, 0), (b, 1, 0, 0)];
+    s.map_mut().label_lock = Some(keys.map(|k| (k, Default::default())).to_vec());
+    s.map_mut().label_lock_line_anchors = keys.map(|k| (k, Default::default())).into_iter().collect();
+    (s, a, b)
+}
+
+/// The layers a map's lock and line anchors name, each sorted.
+fn locked_layers(s: &Session) -> (Vec<u32>, Vec<u32>) {
+    let mut lock: Vec<u32> = s.map().label_lock.iter().flatten().map(|((l, ..), _)| *l).collect();
+    let mut anchors: Vec<u32> = s.map().label_lock_line_anchors.keys().map(|(l, ..)| *l).collect();
+    lock.sort_unstable();
+    anchors.sort_unstable();
+    (lock, anchors)
+}
+
+/// A removed layer's locked labels and line anchors go with it, and only its own; undo brings them
+/// back.
+#[test]
+fn a_removed_layers_locked_labels_go_with_it() {
+    let (mut s, a, b) = two_locked_layers();
+    s.run("layer.remove", &json!({"layer": a})).unwrap();
+    assert_eq!(locked_layers(&s), (vec![b], vec![b]));
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(locked_layers(&s), (vec![a, b], vec![a, b]));
+    s.run("edit.redo", &Value::Null).unwrap();
+    assert_eq!(locked_layers(&s), (vec![b], vec![b]));
+}
+
+/// A deleted feature's lock entry and line anchor go with it, not those of another layer's feature
+/// with the same id; undo brings them back.
+#[test]
+fn a_deleted_feature_leaves_another_layers_lock_alone() {
+    let (mut s, a, b) = two_locked_layers();
+    s.map_mut().layer_mut(a).unwrap().selection = vec![0];
+    s.run("edit.delete", &Value::Null).unwrap();
+    assert_eq!(locked_layers(&s), (vec![b], vec![b]));
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(locked_layers(&s), (vec![a, b], vec![a, b]));
+    s.run("edit.redo", &Value::Null).unwrap();
+    assert_eq!(locked_layers(&s), (vec![b], vec![b]));
+}
+
 /// A streamed layer holds only the window in view: a lock's entry for a feature outside it stays
 /// when the window changes (#1135).
 #[test]
@@ -28972,4 +29024,193 @@ fn raster_classes_run_on_another_thread() {
     let r = s.run("dl.classify", &with).unwrap();
     assert_eq!((&r["model"], &r["replaced"]), (&json!("scene_model 2"), &json!(false)), "{r}");
     assert_eq!(s.project.dl_models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["scene_model", "scene_model 2"]);
+}
+
+/// Add Data's and Load All's reads made before the command runs (the desktop app's, on a thread
+/// of their own) are the ones the command takes: it adds what they read, without reading again.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn reads_made_ahead_are_taken_by_the_command() {
+    if isolate_account_test("tests::reads_made_ahead_are_taken_by_the_command") {
+        return;
+    }
+    use base64::Engine;
+    use rustgis_analysis::control::Control;
+    let dir = std::env::temp_dir().join(format!("rustgis-reads-ahead-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let points = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"n":1},"geometry":{"type":"Point","coordinates":[8,47]}},{"type":"Feature","properties":{"n":2},"geometry":{"type":"Point","coordinates":[9,46]}}]}"#;
+    let files = [
+        ("points.geojson", points.as_bytes().to_vec()),
+        ("places.csv", b"name,x,y\nA,8,47\nB,9,46\nC,10,45\n".to_vec()),
+        ("places.xlsx", rustgis_data::sheets::xlsx(&[("Places", &[&["name", "longitude", "latitude"], &["A", "10", "20"]])])),
+        ("utm.tif", base64::engine::general_purpose::STANDARD.decode(utm_tiff_b64()).unwrap()),
+    ];
+    let mut s = Session::new(Project::default());
+    for (name, bytes) in files {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let p = json!({"path": path.display().to_string(), "zoom": false});
+        let ahead = crate::cmd::reads::read_ahead(&mut s, "layer.addData", &p).unwrap();
+        assert!(ahead.reads(), "{name} is read ahead");
+        let read = ahead.run(&Control::new()).unwrap();
+        // The file gone: what the command adds can only come from the read.
+        std::fs::remove_file(&path).unwrap();
+        let r = crate::cmd::reads::read_land(&mut s, read).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(s.read_ahead.is_none(), "{name}: the read was taken");
+        assert!(r.get("layer").is_some() || r.get("layers").is_some(), "{name}: {r}");
+    }
+    assert_eq!(s.map().layers.len(), 4, "{:?}", s.map().layers.iter().map(|l| &l.name).collect::<Vec<_>>());
+    // A file read in place (and any the command reads differently) reads as it runs.
+    let gpkg = json!({"path": dir.join("table.gpkg").display().to_string()});
+    assert!(!crate::cmd::reads::read_ahead(&mut s, "layer.addData", &gpkg).unwrap().reads());
+
+    // Load All's read, on a copy of the streamed layer.
+    let path = dir.join("streamed.geojson");
+    std::fs::write(&path, points).unwrap();
+    let inline =
+        crate::cmd::reads::read_ahead(&mut s, "layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap();
+    assert!(!inline.reads(), "an in-place opening still owns its original inline command");
+    let id = crate::cmd::reads::read_land(&mut s, inline.run(&Control::new()).unwrap()).unwrap()["layer"].as_u64().unwrap();
+    assert!(s.map().layer(id as u32).unwrap().is_streamed());
+    let p = json!({"layer": id});
+    let read = crate::cmd::reads::read_ahead(&mut s, "layer.loadAll", &p).unwrap().run(&Control::new()).unwrap();
+    assert_eq!(crate::cmd::reads::read_land(&mut s, read).unwrap()["features"], 2);
+    assert!(s.read_ahead.is_none());
+    assert!(!s.map().layer(id as u32).unwrap().is_streamed());
+    let unread = |s: &Session| s.notices.iter().filter(|n| n.text.contains("couldn't be read and were left out")).count();
+    assert_eq!(unread(&s), 0, "every row read: nothing said");
+
+    // A row that can't be read is left out and said, once, read ahead or here.
+    let bad = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[8,47]}},{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":"x"}}]}"#;
+    let path = dir.join("bad.geojson");
+    std::fs::write(&path, bad).unwrap();
+    for ahead in [true, false] {
+        let mut s = Session::new(Project::default());
+        let id = s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap()["layer"].as_u64().unwrap();
+        let p = json!({"layer": id});
+        let before = unread(&s);
+        let result = if ahead {
+            let read = crate::cmd::reads::read_ahead(&mut s, "layer.loadAll", &p).unwrap().run(&Control::new()).unwrap();
+            crate::cmd::reads::read_land(&mut s, read)
+        } else {
+            s.run("layer.loadAll", &p)
+        };
+        assert_eq!(result.unwrap()["features"], 1);
+        assert_eq!(unread(&s), before + 1, "{:?}", s.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
+    }
+
+    // A field added while the read ran: it is read again, with that field kept.
+    let path = dir.join("fields.geojson");
+    std::fs::write(&path, points).unwrap();
+    let id = s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap()["layer"].as_u64().unwrap();
+    let p = json!({"layer": id});
+    let read = crate::cmd::reads::read_ahead(&mut s, "layer.loadAll", &p).unwrap().run(&Control::new()).unwrap();
+    let mut extra = s.map().layer(id as u32).unwrap().dataset.fields[0].clone();
+    extra.name = "added".into();
+    s.map_mut().layer_mut(id as u32).unwrap().dataset.fields.push(extra);
+    s.run("layer.rename", &json!({"layer": id, "name": "Renamed while reading"})).unwrap();
+    crate::cmd::reads::read_land(&mut s, read).unwrap();
+    assert_eq!(s.map().layer(id as u32).unwrap().name, "Renamed while reading");
+    assert!(s.map().layer(id as u32).unwrap().dataset.fields.iter().any(|f| f.name == "added"));
+
+    // An opening replaced at the same path cannot trigger a new read under old authority.
+    let id = s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap()["layer"].as_u64().unwrap();
+    let read = crate::cmd::reads::read_ahead(&mut s, "layer.loadAll", &json!({"layer": id})).unwrap().run(&Control::new()).unwrap();
+    s.map_mut().layer_mut(id as u32).unwrap().source.as_mut().unwrap().reopen().unwrap();
+    assert!(crate::cmd::reads::read_land(&mut s, read).unwrap_err().contains("source changed"));
+    assert!(s.map().layer(id as u32).unwrap().is_streamed() && s.read_ahead.is_none());
+
+    // A cancelled read gives nothing to add, and says so.
+    let path = dir.join("again.csv");
+    std::fs::write(&path, "name,x,y\nA,8,47\n").unwrap();
+    let ahead = crate::cmd::reads::read_ahead(&mut s, "layer.addData", &json!({"path": path.display().to_string()})).unwrap();
+    let control = Control::new();
+    control.cancel();
+    assert!(ahead.run(&control).err().unwrap().contains("cancelled"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Read admission, the first real source read and delivery retain one revocable owner.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn background_reads_keep_their_owner_before_read_and_landing() {
+    if isolate_account_test("tests::background_reads_keep_their_owner_before_read_and_landing") {
+        return;
+    }
+    use crate::cmd::reads::{read_ahead, read_land};
+    use crate::policy::{AgentAccess, Effects, Revocation, Scope};
+    use rustgis_analysis::control::Control;
+    use rustgis_data::source::{Batch, FeatureSource, Request, SourceInfo};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    struct Live(AtomicBool);
+    impl Revocation for Live {
+        /// This fixture revokes only its own admitted caller.
+        fn allows(&self, _: Effects) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    struct OwnedSource {
+        inner: Box<dyn FeatureSource>,
+        reads: Arc<AtomicUsize>,
+    }
+    impl FeatureSource for OwnedSource {
+        /// The real FlatGeobuf source supplies the schema.
+        fn info(&self) -> &SourceInfo {
+            self.inner.info()
+        }
+        /// The actual worker's first read must carry its admitted live predicate.
+        fn read(&self, request: &Request) -> rustgis_data::Result<Batch> {
+            assert!(rustgis_data::source::remote::current_still().is_some_and(|still| still()));
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.read(request)
+        }
+    }
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let bytes = Arc::new(rustgis_data::source::fgb::write(&s.map().layer(id).unwrap().dataset).unwrap());
+    let inner = rustgis_data::source::open_shared("owned.fgb", bytes.clone(), None).unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    s.map_mut().layer_mut(id).unwrap().source =
+        Some(rustgis_map::source::SourceLayer::from_bytes("owned.fgb", bytes, None, Box::new(OwnedSource { inner, reads: reads.clone() })));
+    let live = Arc::new(Live(AtomicBool::new(true)));
+    let owner = Scope::agent(AgentAccess::Allow, false, "owned-read", None, live.clone());
+    let denied = Scope::agent(AgentAccess::Refuse, false, "denied-read", None, live.clone());
+    // Refuse denies external reads; the owned FlatGeobuf source below is already in memory.
+    assert!(s.with_scope(denied, |s| read_ahead(s, "layer.addData", &json!({"path":"refused-read.geojson"}))).unwrap().is_err());
+    s.guarded("Read fixture", false, |s| {
+        assert!(read_ahead(s, "layer.loadAll", &json!({"layer":id})).is_err(), "a handler cannot queue work beyond its transaction");
+        Ok(Value::Null)
+    })
+    .unwrap();
+    let ahead = s.with_scope(owner.clone(), |s| read_ahead(s, "layer.loadAll", &json!({"layer":id}))).unwrap().unwrap();
+    live.0.store(false, Ordering::SeqCst);
+    assert!(std::thread::spawn(move || ahead.run(&Control::new())).join().unwrap().is_err());
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "denied or revoked reads never enter their source");
+
+    live.0.store(true, Ordering::SeqCst);
+    let ahead = s.with_scope(owner.clone(), |s| read_ahead(s, "layer.loadAll", &json!({"layer":id}))).unwrap().unwrap();
+    let read = std::thread::spawn(move || ahead.run(&Control::new())).join().unwrap().unwrap();
+    assert!(reads.load(Ordering::SeqCst) > 0);
+    let foreign = Scope::agent(AgentAccess::Allow, false, "foreign-read", None, live.clone());
+    assert!(s.with_scope(foreign, |s| read_land(s, read)).unwrap().unwrap_err().contains("another caller"));
+    assert!(s.read_ahead.is_none() && s.map().layer(id).unwrap().is_streamed());
+
+    let ahead = s.with_scope(owner.clone(), |s| read_ahead(s, "layer.loadAll", &json!({"layer":id}))).unwrap().unwrap();
+    let read = ahead.run(&Control::new()).unwrap();
+    live.0.store(false, Ordering::SeqCst);
+    assert!(read_land(&mut s, read).unwrap_err().contains("revoked"), "revocation also refuses delivery at native root");
+    assert!(s.read_ahead.is_none() && s.map().layer(id).unwrap().is_streamed());
+
+    live.0.store(true, Ordering::SeqCst);
+    s.active_layer = Some(id);
+    let ahead = s.with_scope(owner.clone(), |s| read_ahead(s, "layer.loadAll", &json!({}))).unwrap().unwrap();
+    s.active_layer = s.map().layer_by_name("Countries").map(|layer| layer.id);
+    let read = ahead.run(&Control::new()).unwrap();
+    assert_eq!(s.with_scope(owner, |s| read_land(s, read)).unwrap().unwrap()["layer"], id);
+    assert!(!s.map().layer(id).unwrap().is_streamed());
+    assert!(s.read_ahead.is_none() && rustgis_data::source::remote::current_still().is_none());
 }

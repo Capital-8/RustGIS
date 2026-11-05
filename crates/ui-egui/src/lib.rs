@@ -67,6 +67,8 @@ mod pluginstart;
 mod pluginsui;
 mod portalsui;
 #[cfg(not(target_arch = "wasm32"))]
+mod readjob;
+#[cfg(not(target_arch = "wasm32"))]
 mod relayshot;
 mod repairsource;
 mod reportpane;
@@ -933,7 +935,12 @@ impl Default for UiState {
 enum AppDispatch {
     Direct,
     Prepared(Box<rustgis_engine::policy::PreparedCommand>),
-    ResolvedTiles { template: String, crossed_origin: bool },
+    #[cfg(not(target_arch = "wasm32"))]
+    Read(Box<rustgis_engine::cmd::reads::Read>),
+    ResolvedTiles {
+        template: String,
+        crossed_origin: bool,
+    },
 }
 
 /// The resolution of a layout copied to the clipboard.
@@ -958,6 +965,12 @@ pub struct RustGisApp {
     /// An export writing its file on its own thread (see [`exportjob`]).
     #[cfg(not(target_arch = "wasm32"))]
     export_job: Option<exportjob::ExportJob>,
+    /// Add Data's and Load All's reads on their own thread, and those waiting (see [`readjob`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    reads: readjob::Reads,
+    /// Add Data and Load All Features read on a thread of their own (the desktop app; see
+    /// [`readjob`]). Off, as for tests and the examples, they read as the command runs.
+    pub reads_off_frame: bool,
     /// ModelBuilder's view: the model on its canvas.
     pub mb: modelbuilder::ModelBuilder,
     pub ws: workspacepanes::WorkspaceState,
@@ -1172,6 +1185,9 @@ impl RustGisApp {
             workflow: analysispane::Workflow::default(),
             #[cfg(not(target_arch = "wasm32"))]
             export_job: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            reads: readjob::Reads::default(),
+            reads_off_frame: false,
             mb: modelbuilder::ModelBuilder::default(),
             ws: workspacepanes::WorkspaceState::default(),
             time: timebar::TimeBarState::default(),
@@ -2024,6 +2040,7 @@ impl RustGisApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn end_exports(&mut self) {
         exportjob::stop(self, std::time::Duration::from_secs(5));
+        readjob::stop(self, std::time::Duration::from_secs(5));
     }
 
     /// Whether this shell opens files by path (the desktop app; the web app picks them in the
@@ -2111,6 +2128,12 @@ impl RustGisApp {
         self.run_with_prepared(id, params, AppDispatch::Prepared(Box::new(prepared)))
     }
 
+    /// Lands an admitted read through the same notices, recording and preferences as a command.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_read(&mut self, id: &str, params: Value, read: rustgis_engine::cmd::reads::Read) -> Result<Value, String> {
+        self.run_with_prepared(id, params, AppDispatch::Read(Box::new(read)))
+    }
+
     /// Keeps direct, prepared and resolved-service dispatch within the same UI lifecycle.
     fn run_with_prepared(&mut self, id: &str, params: Value, dispatch: AppDispatch) -> Result<Value, String> {
         let _diagnostics = self.session.diagnostics.enter();
@@ -2142,6 +2165,8 @@ impl RustGisApp {
         };
         let mut r = match dispatch {
             AppDispatch::Prepared(prepared) => self.session.run_prepared(*prepared),
+            #[cfg(not(target_arch = "wasm32"))]
+            AppDispatch::Read(read) => rustgis_engine::cmd::reads::read_land(&mut self.session, *read),
             AppDispatch::ResolvedTiles { template, crossed_origin } => {
                 rustgis_engine::cmd::service::add_resolved_tiles(&mut self.session, &params, &template, crossed_origin)
             }
@@ -4890,11 +4915,17 @@ impl RustGisApp {
         fieldmenu::play(self, &ctx);
         chrome::shortcuts(self, &ctx);
         panes::follow_layer_filter(self);
-        // A Zarr summary, a trend, a workflow or an export running on its thread lands whatever is
-        // in view, the File menu's backstage too, so a project saved there holds it (all are looked
-        // at: `|`, not `||`), and the frames go on while one runs so it's taken when it ends.
+        // A Zarr summary, a trend, a workflow, an export or a read running on its thread lands
+        // whatever is in view, the File menu's backstage too, so a project saved there holds it
+        // (all are looked at: `|`, not `||`), and the frames go on while one runs so it's taken
+        // when it ends.
         #[cfg(not(target_arch = "wasm32"))]
-        if workspacepanes::land_summary(self) | analysispane::land_trend(self) | analysispane::land_job(self) | exportjob::land(self) {
+        if workspacepanes::land_summary(self)
+            | analysispane::land_trend(self)
+            | analysispane::land_job(self)
+            | exportjob::land(self)
+            | readjob::land(self)
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         if self.ui.backstage {
