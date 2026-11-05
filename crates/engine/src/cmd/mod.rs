@@ -8,6 +8,7 @@ pub mod cube;
 pub mod cube_catalog;
 pub mod deeplearning;
 pub mod design;
+pub mod diagram;
 pub mod directions;
 pub mod earthdata;
 pub mod edit;
@@ -77,6 +78,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(sources::commands());
     v.extend(connections::commands());
     v.extend(layer::commands());
+    v.extend(diagram::commands());
     v.extend(group::commands());
     v.extend(layer_copy::commands());
     v.extend(raster::commands());
@@ -318,6 +320,19 @@ impl Inputs {
 }
 
 impl Inputs {
+    /// Keeps scalar names and evolving defaults on the planner's existing in-run target paths.
+    pub fn single_layer(s: &InputContext<'_>, p: &serde_json::Value) -> Result<Self, String> {
+        match p.get("layer") {
+            Some(serde_json::Value::String(name)) => Self::primary(s, p).or_else(|_| Self::named(s.map(), [name.as_str()])),
+            Some(serde_json::Value::Number(_)) => Self::primary(s, p),
+            _ => {
+                let mut inputs = Self::layers(std::iter::empty());
+                inputs.uses_default = true;
+                Ok(inputs)
+            }
+        }
+    }
+
     /// Literal names, exactly as map.layer_by_name resolves them (no numeric/default fallback).
     pub fn named<'a>(map: &rustgis_map::Map, names: impl IntoIterator<Item = &'a str>) -> Result<Self, String> {
         let mut inputs = Self::layers(std::iter::empty());

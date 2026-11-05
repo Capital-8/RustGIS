@@ -348,7 +348,7 @@ pub(crate) fn template_archive(address: &str) -> Option<(&str, &str)> {
 /// S3 presigned URL), and a PostgreSQL connection string's password. A MySQL, MariaDB or SQL Server
 /// address keeps its user (the one to connect as), never its password. An address read through a
 /// saved S3 connection is redacted inside (its inner address), and its length-prefixed form
-/// rebuilt; a tile template, in its archive.
+/// rebuilt; a tile template, in its archive. Web-login runtime bindings are never published.
 pub fn redact(address: &str) -> String {
     match crate::durable::public_address(address) {
         crate::durable::Kept::Changed(s) => return s,

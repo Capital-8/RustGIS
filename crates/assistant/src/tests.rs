@@ -246,6 +246,24 @@ fn connection_management_requires_fresh_approval_but_can_run_in_app() {
 
 #[test]
 fn connection_commands_require_fresh_approval_before_login_or_scripts() {
+    // The S3 logins change a process-wide registry that parallel approval readers snapshot.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        const SCENARIO: &str = "tests::connection_commands_require_fresh_approval_before_login_or_scripts";
+        if std::env::var("RUSTGIS_ASSISTANT_CONNECTION_APPROVAL_CHILD").as_deref() != Ok(SCENARIO) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", SCENARIO])
+                .env("RUSTGIS_ASSISTANT_CONNECTION_APPROVAL_CHILD", SCENARIO)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut summaries = stdout.lines().filter(|line| line.starts_with("test result:"));
+            let ran_one = summaries.next().is_some_and(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"))
+                && summaries.next().is_none();
+            assert!(output.status.success() && ran_one, "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+    }
     use rustgis_engine::render::rustgis_tiles::s3;
 
     for command in ["connection.browse", "connection.test", "connection.login"] {

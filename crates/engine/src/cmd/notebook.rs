@@ -354,9 +354,10 @@ fn run_cells(s: &mut Session, p: &Value) -> CmdResult {
                     .collect();
                 if lines.is_empty() { "(nothing to run)".to_string() } else { lines.join("\n") }
             }
-            Err(e) => rustgis_data::diagnostics::Redacted::new(&e).into_string(),
+            Err(e) => e,
         };
-        let text = rustgis_data::address::scrub_addresses(&text).0.into_owned();
+        let text = crate::durable::generated_text(&text);
+        let text = if failed { rustgis_data::diagnostics::Redacted::new(&text).into_string() } else { text };
         // Into the cell that ran, which a command removing or adding cells may have moved: the
         // cell with its source nearest to where it was.
         let ran_cell = find(s).and_then(|i| s.project.notebooks.get_mut(i)).and_then(|nb| {
@@ -364,6 +365,7 @@ fn run_cells(s: &mut Session, p: &Value) -> CmdResult {
             nb.cells.get_mut(at)
         });
         if let Some(c) = ran_cell {
+            // Scrubbed before the cut, so no part of a login binding a result quoted is kept.
             c.output = Some(text.chars().take(MAX_OUTPUT).collect());
             c.error = failed;
             // The Jupyter outputs are from an earlier run; this one's output replaces them.

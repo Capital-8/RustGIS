@@ -96,6 +96,7 @@ pub(crate) enum Leaf {
     Task(usize),
     ModelStep(usize),
     ModelNode(usize),
+    ModelLayer(usize),
     HistoryParams,
     HistoryCommand,
     Message(usize),
@@ -190,6 +191,7 @@ pub(crate) trait Durable {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
+    Runtime,
     Credential,
     Path,
     Generated,
@@ -242,10 +244,17 @@ impl<'a> Prepare<'a> {
             };
             if replacement.is_some() {
                 kind = Kind::Credential;
-                if matches!(leaf, Leaf::Video(_)) {
-                    self.report.videos = self.report.videos.saturating_add(1);
-                } else {
-                    self.report.addresses = self.report.addresses.saturating_add(1);
+                let binding_only =
+                    crate::project::without_login_binding(value).is_some_and(|public| matches!(public_address(&public), Kept::Unchanged));
+                if binding_only {
+                    kind = Kind::Runtime;
+                }
+                if !binding_only {
+                    if matches!(leaf, Leaf::Video(_)) {
+                        self.report.videos = self.report.videos.saturating_add(1);
+                    } else {
+                        self.report.addresses = self.report.addresses.saturating_add(1);
+                    }
                 }
             }
         }
@@ -265,6 +274,10 @@ impl<'a> Prepare<'a> {
     /// Prepares a command's replayable parameters using explicit data/configuration roles.
     pub(crate) fn command(&mut self, leaf: Leaf, id: &str, value: &Value) {
         let (clean, report) = crate::roles::command(id, value, self.depth);
+        let clean = match clean {
+            Some(clean) => Some(crate::project::public_login_params(&clean).unwrap_or(clean)),
+            None => crate::project::public_login_params(value),
+        };
         self.report.merge(&report);
         if let Some(clean) = clean {
             self.report.steps = self.report.steps.saturating_add(1);
@@ -275,6 +288,10 @@ impl<'a> Prepare<'a> {
     /// Model and history tool params have the same roles as the corresponding `gp.run` params.
     pub(crate) fn tool(&mut self, leaf: Leaf, id: &str, value: &Value) {
         let (clean, report) = crate::roles::tool(id, value, self.depth);
+        let clean = match clean {
+            Some(clean) => Some(crate::project::public_login_params(&clean).unwrap_or(clean)),
+            None => crate::project::public_login_params(value),
+        };
         self.report.merge(&report);
         if let Some(clean) = clean {
             self.report.steps = self.report.steps.saturating_add(1);
@@ -285,6 +302,10 @@ impl<'a> Prepare<'a> {
     /// Rewrites only changed command lines; comments, data and foreign-language cells stay exact.
     pub(crate) fn script(&mut self, leaf: Leaf, source: &str) {
         let (clean, report) = crate::roles::script(source, self.depth);
+        let clean = match clean {
+            Some(clean) => Some(crate::project::without_recorded_login_bindings(&clean).unwrap_or(clean)),
+            None => crate::project::without_recorded_login_bindings(source),
+        };
         self.report.merge(&report);
         if let Some(clean) = clean {
             self.edit(leaf, Payload::Text(clean), Kind::Credential);
@@ -293,11 +314,20 @@ impl<'a> Prepare<'a> {
 
     /// Cleans only addresses in text RustGIS generated, without claiming opaque text detection.
     pub(crate) fn generated(&mut self, leaf: Leaf, source: &str) {
-        let (clean, n) = rustgis_data::address::scrub_addresses(source);
-        if n > 0 {
-            self.edit(leaf, Payload::Text(clean.into_owned()), Kind::Generated);
+        let clean = generated_text(source);
+        if clean != source {
+            self.edit(leaf, Payload::Text(clean), Kind::Generated);
         }
     }
+}
+
+/// Generated display text only: remove capability headers structurally, sanitize addresses
+/// while their syntax is intact, then mask active secrets. Never use as execution or approval.
+pub(crate) fn generated_text(source: &str) -> String {
+    let public = crate::project::without_recorded_login_bindings(source);
+    let source = public.as_deref().unwrap_or(source);
+    let (clean, _) = rustgis_data::address::scrub_addresses(source);
+    crate::render::rustgis_tiles::logins::scrub(&clean)
 }
 
 struct Transaction<'a, T: Durable> {
@@ -468,7 +498,15 @@ pub(crate) fn output_remembered<T: Durable>(
     } else if bytes > 0 {
         let mut edits = Vec::new();
         for e in std::mem::take(&mut t.edits).into_iter().filter(|e| e.kind == Kind::Credential) {
-            let original = t.live.field_mut(&e.at.owners, &e.at.leaf).ok_or("internal output location changed")?.payload();
+            let mut original = t.live.field_mut(&e.at.owners, &e.at.leaf).ok_or("internal output location changed")?.payload();
+            match &mut original {
+                Payload::Text(text) => crate::project::clear_login_bindings([text]),
+                Payload::Json(value) => {
+                    if let Some(public) = crate::project::public_login_params(value) {
+                        *value = public;
+                    }
+                }
+            }
             edits.push(Remembered { at: e.at, written: e.held, original });
         }
         insert(&mut cache, Written { len, hash, bytes, edits });
@@ -525,12 +563,31 @@ fn public_address_at(address: &str, depth: usize) -> Kept {
     }
     let text = address.trim_start();
     let lower = text.to_ascii_lowercase();
-    let recognized = ["rustgis-anonymous:", "rustgis-s3:", "pmtiles:", "cog:", "postgresql:", "postgres:", "pg:", "https:", "http:", "s3:"]
-        .into_iter()
-        .find(|p| lower.starts_with(p));
+    let recognized = [
+        "rustgis-login:",
+        "rustgis-anonymous:",
+        "rustgis-s3:",
+        "pmtiles:",
+        "cog:",
+        "postgresql:",
+        "postgres:",
+        "pg:",
+        "https:",
+        "http:",
+        "s3:",
+    ]
+    .into_iter()
+    .find(|p| lower.starts_with(p));
     let Some(prefix) = recognized else { return Kept::Unchanged };
     if depth >= 8 {
         return Kept::Withheld(prefix);
+    }
+    if prefix == "rustgis-login:" {
+        let Ok(Some(bound)) = rustgis_data::login_address::parse(text) else { return Kept::Withheld(prefix) };
+        return match public_address_at(bound.url, depth + 1) {
+            Kept::Unchanged => Kept::Changed(bound.url.to_string()),
+            other => other,
+        };
     }
     if prefix == "rustgis-anonymous:" {
         let Some(inner) = text.get(prefix.len()..) else { return Kept::Withheld(prefix) };

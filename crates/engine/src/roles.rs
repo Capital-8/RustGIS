@@ -189,9 +189,21 @@ fn address_like(v: &Value) -> bool {
     match v {
         Value::String(s) => {
             let s = s.trim_start();
-            ["http:", "https:", "s3:", "rustgis-anonymous:", "rustgis-s3:", "pmtiles:", "cog:", "postgres:", "postgresql:", "pg:"]
-                .iter()
-                .any(|p| s.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)))
+            [
+                "http:",
+                "https:",
+                "s3:",
+                "rustgis-login:",
+                "rustgis-anonymous:",
+                "rustgis-s3:",
+                "pmtiles:",
+                "cog:",
+                "postgres:",
+                "postgresql:",
+                "pg:",
+            ]
+            .iter()
+            .any(|p| s.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)))
         }
         Value::Array(a) => a.iter().any(|v| v.is_string() && address_like(v)),
         _ => false,

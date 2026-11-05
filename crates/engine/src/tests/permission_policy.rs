@@ -56,6 +56,97 @@ fn permission_policy_consent_binds_raw_params_and_default_targets() {
     assert!(!shown.review().what.contains("RGSYNTH_"));
     let long = Call::command("layer.addUrl", json!({"url":"https://example.invalid/clean.csv","note":"safe".repeat(1500)}));
     assert!(matches!(s.review(&scope, &long), Outcome::Refused(e) if e.contains("too long")));
+
+    // A single-layer owner falls back to the active layer for a non-scalar selector.
+    // Review diagram and manual-label operations against their actual effect in an asking script.
+    let mut s = world();
+    for name in ["Diagram A", "Diagram B"] {
+        s.run(
+            "layer.addDataText",
+            &json!({"name":name,"fileName":"diagram.geojson","text":r#"{"type":"Feature","properties":{"n":1},"geometry":{"type":"Point","coordinates":[0,0]}}"#}),
+        )
+        .unwrap();
+    }
+    let (scope, _) = assistant(130);
+    for selector in [json!({"layer":["Diagram A"]}), json!({"layer":"Diagram A"}), json!({})] {
+        for name in ["Diagram A", "Diagram B"] {
+            s.run("layer.diagram", &json!({"layer":name,"kind":"pie","fields":["n"],"size":8})).unwrap();
+            let feature = s.map().layer_by_name(name).unwrap().dataset.features.first().unwrap().id;
+            s.run("labels.move", &json!({"layer":name,"feature":feature,"to":[1,2]})).unwrap();
+        }
+        s.run("layer.select", &json!({"layer":"Diagram B"})).unwrap();
+        let expected = if selector["layer"].is_string() { "Diagram A" } else { "Diagram B" };
+        let other = if expected == "Diagram A" { "Diagram B" } else { "Diagram A" };
+        let mut set = selector.clone();
+        set["kind"] = json!("bar");
+        set["fields"] = json!(["n"]);
+        set["size"] = json!(12);
+        let mut moved = selector.clone();
+        moved["feature"] = json!(s.map().layer_by_name(expected).unwrap().dataset.features.first().unwrap().id);
+        moved["to"] = json!([3, 4]);
+        let call = Call::script(&format!(
+            "layer.diagram {set}\nlayer.diagramInfo {selector}\nlayer.clearDiagram {selector}\nlabels.move {moved}\nlabels.resetMoved {selector}\nmap.addTiles {{\"url\":\"https://diagram.invalid/{{z}}/{{x}}/{{y}}.png\"}}"
+        ));
+        let p = pending(&s, &scope, &call);
+        let details = p.review().details.clone();
+        let defaults = p.review().defaults.clone();
+        s.run_permitted(scope.clone(), p.allow(), &call).unwrap();
+        assert!(s.map().layer_by_name(expected).unwrap().diagram.is_none(), "the executor clears its actual target");
+        assert!(s.map().layer_by_name(other).unwrap().diagram.is_some(), "the other layer retains its diagram");
+        assert!(s.map().layer_by_name(expected).unwrap().labels.default.moved.is_empty(), "the label owner clears its actual target");
+        assert_eq!(s.map().layer_by_name(other).unwrap().labels.default.moved.len(), 1, "the other layer keeps its saved label move");
+        let commands = ["layer.diagram", "layer.diagramInfo", "layer.clearDiagram", "labels.move", "labels.resetMoved"];
+        if selector["layer"].is_string() {
+            for id in commands {
+                let detail = details.iter().find(|d| d.operation == id).unwrap();
+                assert_eq!(
+                    detail.targets,
+                    [format!("{} / {expected}", s.map().name)],
+                    "single-layer review target differs from execution: {id}"
+                );
+            }
+        } else {
+            // Defaults are named once in Starting selection, not repeated as explicit targets.
+            assert_eq!(defaults, Some((Some(expected.to_string()), vec![expected.to_string()])));
+            for detail in details.iter().filter(|d| commands.contains(&d.operation.as_str())) {
+                assert_eq!(detail.targets, [format!("{} / {expected}", s.map().name)], "no contradictory target may appear for a default");
+            }
+        }
+    }
+    // A scalar name created or renamed by an earlier step remains a bound in-run target.
+    for (first, params, name, named) in [
+        (
+            "layer.addDataText",
+            json!({"name":"Fresh created","fileName":"fresh.geojson","text":r#"{"type":"Feature","properties":{"n":1},"geometry":{"type":"Point","coordinates":[0,0]}}"#}),
+            "Fresh created",
+            true,
+        ),
+        ("layer.rename", json!({"layer":"Diagram A","name":"Fresh renamed"}), "Fresh renamed", true),
+        (
+            "layer.addDataText",
+            json!({"name":"Fresh default","fileName":"fresh.geojson","text":r#"{"type":"Feature","properties":{"n":1},"geometry":{"type":"Point","coordinates":[0,0]}}"#}),
+            "Fresh default",
+            false,
+        ),
+    ] {
+        let selector = if named { json!({"layer":name}) } else { json!({}) };
+        let mut diagram = selector.clone();
+        diagram["kind"] = json!("pie");
+        diagram["fields"] = json!(["n"]);
+        diagram["size"] = json!(8);
+        let mut moved = selector.clone();
+        moved["feature"] = json!(0);
+        moved["to"] = Value::Null;
+        let call = Call::script(&format!(
+            "{first} {params}\nlayer.diagram {diagram}\nlayer.diagramInfo {selector}\nlayer.clearDiagram {selector}\nlabels.move {moved}\nlabels.resetMoved {selector}\nmap.addTiles {{\"url\":\"https://diagram.invalid/{{z}}/{{x}}/{{y}}.png\"}}"
+        ));
+        let p = pending(&s, &scope, &call);
+        s.run_permitted(scope.clone(), p.allow(), &call).unwrap();
+        assert!(s.map().layer_by_name(name).unwrap().diagram.is_none(), "the in-run target is created, styled and cleared");
+    }
+    let unknown =
+        Call::script("layer.diagramInfo {\"layer\":\"Never made\"}\nmap.addTiles {\"url\":\"https://diagram.invalid/{z}/{x}/{y}.png\"}");
+    assert!(matches!(s.review(&scope, &unknown), Outcome::Refused(why) if why.contains("no earlier output")));
 }
 
 /// A displayed task is frozen by content, including its project-only edits; undo restores trust.
@@ -968,4 +1059,83 @@ fn permission_policy_plugin_preparation_keeps_owner_before_remote_send() {
         assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     }
     rustgis_plugins::unload(plugin);
+}
+
+/// Choosing another already-active login changes consent without rotating either bearer.
+#[test]
+fn permission_policy_web_login_reselection_refuses_old_consent_and_landing() {
+    use crate::{render::rustgis_tiles::logins, service_logins};
+    let mut s = Session::new(Project::default());
+    let origin = "https://policy-choice-r15.example.invalid";
+    let mut ids = Vec::new();
+    for name in ["A", "B"] {
+        let id =
+            s.run("connection.new", &json!({"kind":"wms","name":name,"address":origin,"auth":"header","keyName":"X-Key"})).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        s.run("connection.login", &json!({"id":id,"apiKey":format!("RGSYNTH_choice_r15_{name}")})).unwrap();
+        ids.push(id);
+    }
+    s.run("connection.login", &json!({"id":ids[0]})).unwrap();
+    let registry = logins::account_identity(s.web_logins.session_id()).unwrap();
+    let url = format!("{origin}/roads.geojson");
+    let selected_a = service_logins::request(&mut s, None, &url).unwrap();
+    let call = Call::command("layer.addUrl", json!({"url":url,"zoom":true})).with_request("choice-r15");
+    let (scope, _) = assistant(1501);
+    let old = pending(&s, &scope, &call);
+    let run = pending(&s, &scope, &call);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        s.leave_downloads = true;
+    }
+    s.run_permitted(scope.clone(), run.allow(), &call).unwrap();
+    let request = s.take_url_requests().pop().unwrap();
+    assert_eq!(request.params()["url"], selected_a);
+    assert_eq!(request.params()["connection"], ids[0]);
+    let claim = s.download_started_for(&request).unwrap();
+    s.run("connection.login", &json!({"id":ids[1]})).unwrap();
+    assert!(registry.is_current(), "reselection keeps both active generations");
+    let selected_b = service_logins::request(&mut s, None, &url).unwrap();
+    assert_ne!(selected_a, selected_b);
+    assert_eq!(logins::apply(&selected_a).unwrap().unwrap().header.unwrap().1, "RGSYNTH_choice_r15_A");
+    assert!(s.run_permitted(scope, old.allow(), &call).unwrap_err().contains("changed"));
+    assert!(s.take_url_requests().is_empty(), "the old approval started no fresh request");
+    assert!(s.download_continues(claim).unwrap_err().contains("account changed"));
+    assert!(s.map().layers.is_empty());
+}
+
+/// Runtime snapshots include absence and this owner's logout, while another Session is separate.
+#[test]
+fn permission_policy_web_accounts_ignore_other_sessions_and_revoke_owned_sends() {
+    use crate::render::rustgis_tiles::logins;
+    let mut s = Session::new(Project::default());
+    let origin = "https://policy-owner-r15.example.invalid";
+    let definition = json!({"kind":"wms","address":origin,"auth":"header","keyName":"X-Key"});
+    let id = s.run("connection.new", &definition).unwrap()["id"].as_str().unwrap().to_string();
+    let absent = logins::account_identity(s.web_logins.session_id()).unwrap();
+    s.run("connection.login", &json!({"id":id,"apiKey":"fake002"})).unwrap();
+    assert!(!absent.is_current(), "a newly covering login is a different runtime identity");
+    let registry = logins::account_identity(s.web_logins.session_id()).unwrap();
+    let (scope, _) = assistant(1502);
+    let call = Call::command("layer.addUrl", json!({"url":format!("{origin}/roads.geojson")})).with_request("owner-r15");
+    let approved = pending(&s, &scope, &call);
+    let mut other = Session::new(Project::default());
+    let other_id = other.run("connection.new", &definition).unwrap()["id"].as_str().unwrap().to_string();
+    other.run("connection.login", &json!({"id":other_id,"apiKey":"fake003"})).unwrap();
+    assert!(registry.is_current());
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        s.leave_downloads = true;
+    }
+    s.run_permitted(scope, approved.allow(), &call).unwrap();
+    let request = s.take_url_requests().pop().unwrap();
+    let claim = s.download_started_for(&request).unwrap();
+    let still = s.download_still(claim).unwrap();
+    assert!(still());
+    s.run("connection.logout", &json!({"id":id})).unwrap();
+    assert!(!registry.is_current());
+    assert!(!still(), "the actual send predicate sees this owner's logout");
+    assert!(!s.download_landed(claim, b"late".to_vec()));
+    assert!(s.map().layers.is_empty());
 }

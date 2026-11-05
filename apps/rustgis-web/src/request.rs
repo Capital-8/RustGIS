@@ -142,6 +142,30 @@ mod tests {
         auth::sign_out(Some("https://browser-identity.example.org/server"));
     }
 
+    /// A new service account binding cannot cross a browser preparation await under old consent.
+    #[test]
+    fn permission_transport_service_binding_refuses_after_preparation() {
+        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::logins::{self, Method};
+        let url = "https://browser-service-identity.example";
+        let binding = logins::activate(url, "9150003/connection", Method::Header("X-Key".into()), "synthetic-browser", false).unwrap();
+        let identity = logins::account_identity(9_150_003).unwrap();
+        let still = Some(Arc::new(move || identity.is_current()) as cache::Still);
+        let released = Rc::new(Cell::new(false));
+        let sends = Cell::new(0);
+        let mut held = Box::pin(prepare_and_send(&still, || Held(released.clone()), |()| sends.set(sends.get() + 1)));
+        assert!(poll(held.as_mut()).is_pending());
+        let other = logins::activate(url, "91500030/connection", Method::Header("X-Key".into()), "synthetic-other", false).unwrap();
+        assert!(cache::check_still(&still).is_ok(), "another session preserves consent");
+        assert!(logins::deactivate(&binding));
+        let replacement = logins::activate(url, "9150003/connection", Method::Header("X-Key".into()), "synthetic-browser", false).unwrap();
+        released.set(true);
+        assert!(matches!(poll(held.as_mut()), Poll::Ready(Err(_))));
+        assert_eq!(sends.get(), 0);
+        assert!(cache::current_still().is_none(), "no context crosses the await");
+        assert!(logins::deactivate(&replacement));
+        assert!(logins::deactivate(&other));
+    }
+
     /// A callback's follow-on adapter owns the same predicate after the callback returns.
     #[test]
     fn permission_transport_callback_follow_on_keeps_owned_context() {

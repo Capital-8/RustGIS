@@ -375,6 +375,11 @@ impl Bridge<'_> {
         if id.starts_with(rustgis_plugins::PREFIX) {
             return Err("plugins can't run other plugins' commands".into());
         }
+        if let Some(connection) = params.get("connection").and_then(Value::as_str).map(str::trim)
+            && self.s.connections.connections.iter().any(|c| c.id == connection && crate::service_logins::is_service(c))
+        {
+            return Err(format!("plugins can't use a saved web-service connection's login ('{id}')"));
+        }
         let spec = self.s.registry.get(id).ok_or_else(|| format!("unknown command '{id}'"))?;
         let (enabled, label, mutates) = (spec.enabled, spec.label, spec.mutates);
         let named = params.get("layer").and_then(|_| self.s.layer_id(params).ok());
@@ -400,10 +405,10 @@ impl Bridge<'_> {
         // command that only left a request for the front end ([`Session::request_url`]) changed
         // nothing; a later one must not erase the undo step for an earlier edit.
         self.s.request_only = false;
-        let mut res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let op = self.s.authorize(id, params)?;
-            self.s.invoke(op, crate::policy::Txn::Shared)
-        }))
+        let mut res = crate::service_logins::anonymously(self.s, true, |s| {
+            let op = s.authorize(id, params)?;
+            s.invoke(op, crate::policy::Txn::Shared)
+        })
         .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
         let requested = std::mem::take(&mut self.s.request_only);
         self.requested |= requested;

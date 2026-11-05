@@ -75,6 +75,11 @@ impl Session {
         let c = Arc::new(self.continuation()?);
         self.check_continuation(&c)?;
         self.retire_abandoned_requests();
+        let mut params = std::borrow::Cow::Borrowed(p);
+        if self.web_logins.is_anonymous() {
+            params.to_mut().as_object_mut().ok_or("download parameters must be an object")?.insert("anonymous".into(), json!(true));
+        }
+        let p = params.as_ref();
         let duplicate = self.url_requests.iter().any(|q| q.params == *p && q.authority.scope.same_caller(&c.scope));
         if !duplicate {
             if self.policy.work.queued.len() >= crate::MAX_URL_REQUESTS {

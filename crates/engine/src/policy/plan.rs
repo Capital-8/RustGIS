@@ -742,7 +742,7 @@ impl<'a> Builder<'a> {
         let session = self.s;
         if reads {
             if self.auth.is_none() {
-                self.auth = Some(Arc::new(super::scope::RuntimeAccounts::capture()?));
+                self.auth = Some(Arc::new(super::scope::RuntimeAccounts::capture(session)?));
             }
             n.auth = self.auth.clone();
             self.charge(&session.connections)?;
@@ -819,7 +819,13 @@ impl<'a> Builder<'a> {
                 let uses_default = inputs.uses_default;
                 for name in inputs.future_layers {
                     if let Some(target) = self.symbols.get(&(self.context().map().instance_id(), name.to_lowercase())) {
-                        n.targets.push(self.bound_symbol(target, reads));
+                        // Owner callbacks keep the same map-qualified representation after an in-run rename.
+                        n.targets.push(match self.bound_symbol(target, reads) {
+                            Target::Layer { key, source } => {
+                                Target::LayerInMap { map: key.map, id: key.id, instance: key.instance, source }
+                            }
+                            other => other,
+                        });
                     } else if self.outputs.contains(&(self.context().map().instance_id(), name.to_lowercase())) {
                         n.targets.push(Target::MadeLayer { map: self.context().map().instance_id(), name });
                     } else if self.strict {
@@ -1344,13 +1350,14 @@ pub(super) fn private_source(l: &rustgis_map::Layer) -> Value {
 impl Session {
     /// Captures only already available connection state; never reads the secret store.
     pub(super) fn policy_accounts(&self) -> Value {
-        json!(
+        json!({"connections":
             self.connections
                 .connections
                 .iter()
                 .map(|c| json!({"definition":c,"password":self.database_logins.known_password(&c.id).map(|p|p.expose())}))
-                .collect::<Vec<_>>()
-        )
+                .collect::<Vec<_>>(),
+            "web":{"selected":self.database_logins.web_selections(),"active":self.web_logins.active_ids()}
+        })
     }
 }
 

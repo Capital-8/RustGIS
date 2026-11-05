@@ -189,7 +189,9 @@ mod tests {
             let requests = h.state_mut().session.take_url_requests();
             assert_eq!(requests.len(), 1, "the queued plugin leaves an opaque request for the frame loop");
             let request = &requests[0];
-            assert_eq!(request.params(), &params);
+            let mut expected = params.clone();
+            expected["anonymous"] = json!(true);
+            assert_eq!(request.params(), &expected, "the claim also preserves the plugin's anonymous reads");
             let app = h.state_mut();
             app.session.map_mut().camera = camera;
             app.ui.link_zoomed = false;
@@ -203,6 +205,8 @@ mod tests {
             app.poll_data_downloads();
             let places = app.session.map().layer_by_name(&name).unwrap();
             assert_eq!(places.dataset.features.len(), 2);
+            assert!(places.anonymous);
+            assert!(places.connection.is_empty());
             if zoom == "false" {
                 assert_eq!(app.session.map().camera, camera, "false keeps the view");
             } else {

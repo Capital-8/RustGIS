@@ -9,18 +9,20 @@ use std::sync::Arc;
 pub(super) struct RuntimeAccounts {
     arcgis: crate::render::rustgis_tiles::arcgis_auth::AccountIdentity,
     earthdata: crate::render::rustgis_tiles::earthdata::AccountIdentity,
+    web: crate::render::rustgis_tiles::logins::AccountIdentity,
 }
 impl RuntimeAccounts {
     /// Dynamic commands may choose multiple URLs, so their entire active stores are bound.
-    pub(super) fn capture() -> Result<Self, String> {
+    pub(super) fn capture(s: &crate::Session) -> Result<Self, String> {
         Ok(Self {
             arcgis: crate::render::rustgis_tiles::arcgis_auth::account_identity()?,
             earthdata: crate::render::rustgis_tiles::earthdata::account_identity()?,
+            web: crate::render::rustgis_tiles::logins::account_identity(s.web_logins.session_id())?,
         })
     }
     /// A rotation/replacement, including renewal, invalidates old consent and held sends.
     pub(super) fn is_current(&self) -> bool {
-        self.arcgis.is_current() && self.earthdata.is_current()
+        self.arcgis.is_current() && self.earthdata.is_current() && self.web.is_current()
     }
 }
 

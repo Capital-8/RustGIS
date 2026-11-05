@@ -674,7 +674,23 @@ impl Session {
                 let run = |s: &mut Session| {
                     s.with_node(node, |s| {
                         let editor = s.trust_editor(spec.id, &params);
-                        let result = spec.run.call(s, &params);
+                        let add = |s: &mut Session| {
+                            let before = crate::service_logins::before(s, spec.id, &params)?;
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| spec.run.call(s, &params)))
+                                .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.label)));
+                            // A nested plugin command may fail after making additions. Its outer
+                            // transaction owns rollback; mark those additions anonymous meanwhile.
+                            if let Some(before) = before {
+                                crate::service_logins::tag(s, &params, before, result.as_ref().unwrap_or(&Value::Null))?;
+                            }
+                            result
+                        };
+                        let anonymous = s.web_logins.is_anonymous()
+                            || (matches!(spec.id, "layer.addUrl" | "layer.addDownload")
+                                && params.get("anonymous").and_then(Value::as_bool) == Some(true));
+                        let result = crate::service_logins::anonymously(s, anonymous, add)
+                            .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.label)))
+                            .map_err(|e| crate::render::rustgis_tiles::logins::scrub(&e));
                         if let Ok(value) = &result {
                             s.trust_after(spec.id, &params, value, editor);
                         }
