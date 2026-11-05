@@ -24,7 +24,9 @@ pub struct Report {
 }
 
 impl Report {
-    /// The existing `project.save` result's `stripped` count: changed layer addresses only.
+    /// The existing `project.save` result's `stripped` count, not a count of unique URLs or layers.
+    /// Changed address fields, including streamed provenance and source paths, count separately.
+    /// Explicit saves also add layers whose runtime login has no recorded connection to restore it.
     pub fn layer_addresses(&self) -> u32 {
         self.addresses
     }

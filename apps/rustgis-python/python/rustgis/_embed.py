@@ -68,6 +68,7 @@ class _Embedded(_Api):
         self._held: List[Tuple[str, bool]] = []
         self._held_lock = threading.Lock()
         self._sent_keys = 0
+        self._sent_notices: List[str] = []
         if sample:
             self._session.run("project.sample")
         if data is not None:
@@ -203,7 +204,10 @@ class _Embedded(_Api):
         """Sends the session's project to the app, when it changed."""
         try:
             text, keys, notices = self._session._engine._peer_text()
-            self._hold([(notice, False) for notice in notices])
+            # A new loss may leave the public project text unchanged.
+            if text != self._project or notices != self._sent_notices:
+                self._hold([(notice, False) for notice in notices])
+            self._sent_notices = notices
             if keys > self._sent_keys:
                 self._hold([(f"{keys} layer address(es) went to the map widget without their keys: those layers stay empty there", False)])
             self._sent_keys = keys

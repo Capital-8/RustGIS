@@ -2851,7 +2851,7 @@ impl Map {
 }
 
 impl Layer {
-    /// Classifies whole owning fields; a source serving as provenance and a path occurs once.
+    /// Classifies each whole owning field once; equal addresses in different fields stay distinct.
     pub fn output_slots(&self) -> Vec<(LayerRole, &str, bool, bool)> {
         let Layer {
             id: _,

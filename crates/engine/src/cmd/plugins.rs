@@ -407,7 +407,7 @@ impl Bridge<'_> {
         self.s.request_only = false;
         let mut res = crate::service_logins::anonymously(self.s, true, |s| {
             let op = s.authorize(id, params)?;
-            s.invoke(op, crate::policy::Txn::Shared)
+            super::workflows::steps_of(s, |s| s.invoke(op, crate::policy::Txn::Shared))
         })
         .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
         let requested = std::mem::take(&mut self.s.request_only);

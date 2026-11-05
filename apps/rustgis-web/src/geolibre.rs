@@ -16,17 +16,22 @@ use wasm_bindgen::prelude::*;
 // safeguards: the same trust as installing the npm package.
 #[wasm_bindgen(inline_js = r#"
 const BASE = "https://cdn.jsdelivr.net/npm/geolibre-wasm@1.8.0";
+let loaded = null;
 let ready = null;
-function tools(still = () => true) {
+async function tools(still = () => true) {
+  if (!still()) throw new Error("GeoLibre run cancelled before loading");
+  if (!loaded) {
+    loaded = import(`${BASE}/tools.mjs/+esm`);
+    loaded.catch(() => { loaded = null; });
+  }
+  const mod = await loaded;
+  if (!still()) throw new Error("GeoLibre run cancelled before initialization");
   if (!ready) {
     ready = (async () => {
-      if (!still()) throw new Error("GeoLibre run cancelled before loading");
-      const mod = await import(`${BASE}/tools.mjs/+esm`);
-      if (!still()) throw new Error("GeoLibre run cancelled before initialization");
       await mod.initTools(`${BASE}/geolibre-cli.wasm`);
       return mod;
     })();
-    // A failed download can be retried.
+    // A failed initialization can be retried without importing the module again.
     ready.catch(() => { ready = null; });
   }
   return ready;

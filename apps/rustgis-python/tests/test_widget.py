@@ -116,6 +116,10 @@ def test_widget_exchange_never_sends_keys_and_checks_the_current_slot():
     m = rustgis.Map(session=s)
     assert secret not in m._project
     assert any("without their keys" in notice for notice, _ in m.notices())
+    before = m._project
+    m.run("info.project")
+    assert m._project == before
+    assert m.notices() == []
     incoming = json.loads(m._project)
     incoming["maps"][0]["layers"][0]["name"] = "Styled by app"
     from_app(m, json.dumps(incoming))
@@ -127,6 +131,38 @@ def test_widget_exchange_never_sends_keys_and_checks_the_current_slot():
     incoming["maps"][0]["layers"][0]["name"] = "Stale app slot"
     from_app(m, json.dumps(incoming))
     assert m.session._engine._peer_text()[1] == 0
+
+    for command, params, kind in [
+        ("connection.login", {"apiKey": "demo"}, "executable step(s)"),
+        ("plugin.unknown", {"nested": {"token": "demo"}}, "opaque parameters"),
+    ]:
+        s = rustgis.Session()
+        project = json.loads(s.project_json())
+        clean = {"apiKey": ""} if command == "connection.login" else {"nested": {}}
+        project["tasks"] = [{"name": "Notice fixture", "steps": [{"title": "Stored only", "command": command, "params": clean}]}]
+        s.run("project.openText", text=json.dumps(project))
+        s.notices()
+        m = rustgis.Map(session=s)
+        assert m.notices() == [], "clean bridge output needs no loss notice"
+        before = m._project
+        project["tasks"][0]["steps"][0]["params"] = params
+        s.run("project.openText", text=json.dumps(project))
+        s.notices()
+        m.run("info.project")
+        if command == "connection.login":
+            assert m._project == before, "a newly removed credential need not change public project text"
+        notices = m.notices()
+        assert len(notices) == 1 and kind in notices[0][0] and not notices[0][1]
+        before = m._project
+        m.run("info.project")
+        m.run("info.project")
+        assert m._project == before
+        assert m.notices() == [], "unchanged internal pushes must not repeat bridge notices"
+        m.run("layer.template", template="points", name="Changed output")
+        assert m._project != before
+        assert m.notices() == notices, "changed outgoing content reports its losses again"
+        m.run("info.project")
+        assert m.notices() == []
 
 
 def test_widget_repeated_table_id_cannot_gain_a_retained_key():

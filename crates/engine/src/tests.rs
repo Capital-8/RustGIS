@@ -14929,6 +14929,106 @@ fn geocoding_places_and_addresses() {
     assert!(crate::cmd::geocode::check_batch(&g, 101).unwrap_err().contains("100"));
 }
 
+/// PDOK's Locatieserver as the geocoder (a local server answering as it does): places found by
+/// name, a table's Dutch addresses turned into points, and the answers' entries without a usable
+/// point counted in a notice (and no notice when every entry has one).
+#[test]
+fn geocoding_with_the_locatieserver() {
+    use crate::render::rustgis_tiles::geocode::Geocoder;
+    let clean = br#"{"response":{"numFound":2,"start":0,"docs":[
+        {"weergavenaam":"Damrak 1, 1012LG Amsterdam","centroide_ll":"POINT(4.89803846 52.37714446)"},
+        {"weergavenaam":"Damrak, Amsterdam","centroide_ll":"POINT(4.89580599 52.37513402)"}]}}"#;
+    let lossy = br#"{"response":{"numFound":2,"start":0,"docs":[
+        {"weergavenaam":"Coolsingel, Rotterdam","centroide_ll":"POINT(4.4795)"},
+        {"weergavenaam":"Coolsingel 40, 3011AD Rotterdam","centroide_ll":"POINT(4.47920127 51.92272076)"}]}}"#;
+    let nothing = br#"{"response":{"numFound":0,"start":0,"docs":[]}}"#;
+    // Each request's path and query exactly as the Locatieserver kind builds them.
+    let path = |q: &str, limit: usize| {
+        let g = Geocoder::new(Some("locatieserver"), Some("http://127.0.0.1")).unwrap();
+        g.url(q, limit).trim_start_matches("http://127.0.0.1").to_string()
+    };
+    let (base, asked) = serve_files(vec![
+        (path("Damrak 1, Amsterdam", 5), clean.to_vec()),
+        (path("Damrak 1, Amsterdam", 1), clean.to_vec()),
+        (path("Coolsingel 40, Rotterdam", 1), lossy.to_vec()),
+        (path("Nergensstraat 9, Nergenshuizen", 1), nothing.to_vec()),
+        (path("Kapot", 5), br#"{"response":{"docs":[{"weergavenaam":"x","centroide_ll":"POINT(x y)"}]}}"#.to_vec()),
+    ]);
+    let url = format!("{base}/free");
+    let left_out =
+        |s: &Session| s.notices.iter().filter(|n| n.text.contains("no usable position")).map(|n| n.text.clone()).collect::<Vec<_>>();
+    let mut s = Session::new(Project::default());
+    let r = s.run("map.findPlace", &json!({"query": "Damrak 1, Amsterdam", "provider": "locatieserver", "url": url})).unwrap();
+    assert_eq!(r["count"], 2, "{r}");
+    assert_eq!(r["places"][0]["name"], "Damrak 1, 1012LG Amsterdam");
+    assert_eq!((r["places"][0]["lon"].as_f64(), r["places"][0]["lat"].as_f64()), (Some(4.89803846), Some(52.37714446)));
+    // The camera went to the first place, longitude and latitude the right way round.
+    let c = s.map().to_lonlat(s.map().camera.center).unwrap();
+    assert!((c.x - 4.898).abs() < 0.01 && (c.y - 52.377).abs() < 0.01, "{c:?}");
+    assert!(left_out(&s).is_empty(), "a clean answer leaves nothing out: {:?}", left_out(&s));
+    // A table of Dutch addresses: one found, one found after an entry without a usable point
+    // (counted), one not found.
+    let csv = "id,street,city\n1,Damrak 1,Amsterdam\n2,Coolsingel 40,Rotterdam\n3,Nergensstraat 9,Nergenshuizen\n";
+    s.run("layer.addDataText", &json!({"fileName": "adressen.csv", "text": csv})).unwrap();
+    let r = s
+        .run("layer.geocode", &json!({"table": "adressen", "address": ["street", "city"], "provider": "locatieserver", "url": url}))
+        .unwrap();
+    assert_eq!((r["matched"].as_u64(), r["unmatched"].as_u64()), (Some(2), Some(1)), "{r}");
+    let l = s.map().layer_by_name("adressen (geocoded)").unwrap();
+    let points: Vec<_> = l.dataset.features.iter().map(|f| f.geometry.clone()).collect();
+    assert_eq!(points[0], Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(4.89803846, 52.37714446))));
+    assert_eq!(points[1], Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(4.47920127, 51.92272076))));
+    assert_eq!(points[2], None);
+    let geocoded = l.dataset.fields.len() - 1;
+    assert_eq!(l.dataset.value(1, geocoded).to_string(), "Coolsingel 40, 3011AD Rotterdam");
+    assert_eq!(left_out(&s).len(), 1, "one notice for the run: {:?}", left_out(&s));
+    assert!(left_out(&s)[0].starts_with("1 of the geocoder's places"), "{:?}", left_out(&s));
+    // An answer whose every place is unusable is an error, not "nothing found"; a query longer
+    // than the Locatieserver takes isn't sent cut short.
+    let e = s.run("map.findPlace", &json!({"query": "Kapot", "provider": "locatieserver", "url": url})).unwrap_err();
+    assert!(e.contains("none with a usable position"), "{e}");
+    let e = s.run("map.findPlace", &json!({"query": "a".repeat(401), "provider": "locatieserver", "url": url})).unwrap_err();
+    assert!(e.contains("up to 400"), "{e}");
+    // Every request asked the Locatieserver's search, for the kinds of place it is given.
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 5, "{asked:?}");
+    assert!(asked.iter().all(|p| p.starts_with("/free?q=") && p.contains("&fq=type%3A%28provincie%20OR")), "{asked:?}");
+    // The public server takes a whole table, a few requests a second.
+    let g = Geocoder::new(Some("locatieserver"), None).unwrap();
+    assert!(crate::cmd::geocode::check_batch(&g, 5000).is_ok());
+    assert!(crate::cmd::geocode::check_batch(&g, 10_001).unwrap_err().contains("10000"));
+    assert!(g.spacing_ms() > 0);
+}
+
+/// Addresses longer than the Locatieserver takes, ahead of one it finds: each fails on its own
+/// (counted in the run's notice) and isn't sent, rather than counting as the server refusing
+/// requests, which would stop the run before the address it finds.
+#[test]
+fn geocoding_skips_addresses_too_long_for_the_server() {
+    use crate::render::rustgis_tiles::geocode::Geocoder;
+    let clean = br#"{"response":{"numFound":1,"start":0,"docs":[
+        {"weergavenaam":"Damrak 1, 1012LG Amsterdam","centroide_ll":"POINT(4.89803846 52.37714446)"}]}}"#;
+    let g = Geocoder::new(Some("locatieserver"), Some("http://127.0.0.1")).unwrap();
+    let path = g.url("Damrak 1, Amsterdam", 1).trim_start_matches("http://127.0.0.1").to_string();
+    let (base, asked) = serve_files(vec![(path, clean.to_vec())]);
+    let mut csv = "id,address\n".to_string();
+    for (i, c) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+        csv.push_str(&format!("{i},{}\n", c.repeat(401)));
+    }
+    csv.push_str("9,\"Damrak 1, Amsterdam\"\n");
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataText", &json!({"fileName": "lang.csv", "text": csv})).unwrap();
+    let r = s
+        .run("layer.geocode", &json!({"table": "lang", "address": "address", "provider": "locatieserver", "url": format!("{base}/free")}))
+        .unwrap();
+    assert_eq!((r["matched"].as_u64(), r["unmatched"].as_u64()), (Some(1), Some(6)), "{r}");
+    let failed: Vec<_> = s.notices.iter().filter(|n| n.text.contains("couldn't be looked up")).map(|n| n.text.clone()).collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(failed[0].starts_with("6 addresses") && failed[0].contains("401 characters"), "{failed:?}");
+    // Only the address that fits was sent.
+    assert_eq!(asked.lock().unwrap().len(), 1);
+}
+
 /// The SQL workspace's commands: a query's first rows without a layer, and a database's columns
 /// (through DuckDB when it is installed; without it, they say how to get it).
 #[cfg(not(target_arch = "wasm32"))]
@@ -16020,6 +16120,14 @@ fn lidar_sample_refuses_exports_and_statistics() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The Zarr tests that read steps share the process's slice cache: one at a time, so another's
+/// steps don't push out the one a test expects kept.
+#[cfg(not(target_arch = "wasm32"))]
+fn zarr_cache_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    L.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A Zarr store in a temporary folder: `t` over three monthly steps (days since 2001-01-01: 0,
 /// 31, 59) on a 3 × 4 grid, step `k`'s values `100·k + i`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -16074,6 +16182,7 @@ fn zarr_store_at(tag: &str, days: &[i32]) -> (std::path::PathBuf, String) {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_zarr_series_at_a_point() {
+    let _cache = zarr_cache_lock();
     let (dir, path) = zarr_store_over_time("series");
     let mut s = Session::new(Project::default());
     // At 1°E 30°N: the stored row 2 (latitudes 10, 20, 30), column 0, so 100·k + 8 at step k.
@@ -16129,6 +16238,7 @@ fn a_zarr_series_at_a_point() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_zarr_variable_summarised_over_time() {
+    let _cache = zarr_cache_lock();
     let (dir, path) = zarr_store_over_time("reduce");
     let mut s = Session::new(Project::default());
     // The first pixel (north up) is the stored cell 8: 8, 108 and 208 at the three steps.
@@ -17101,6 +17211,7 @@ fn a_stac_collection_summarised_over_time() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_zarr_variable_follows_the_time_slider() {
+    let _cache = zarr_cache_lock();
     let (dir, path) = zarr_store_over_time("follow");
     let mut s = Session::new(Project::default());
     let id = s.run("layer.addZarr", &json!({"path": path, "variable": "t", "time": true})).unwrap()["layer"].as_u64().unwrap() as u32;
@@ -17181,6 +17292,169 @@ fn a_zarr_variable_follows_the_time_slider() {
     let _ = std::fs::remove_dir_all(dir3);
     let _ = std::fs::remove_dir_all(dir2);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Step `k`'s cells of [`zarr_store_at`]'s variable (`100 k + cell`), as its chunk file holds them.
+#[cfg(not(target_arch = "wasm32"))]
+fn f32s_of(base: i32) -> Vec<u8> {
+    (0..12).flat_map(|i| ((base + i) as f32).to_le_bytes()).collect()
+}
+
+/// In the app a time slider move doesn't wait for a Zarr step (#1291 step 3): the step is read on
+/// a thread of its own, the layer showing the step before until it lands; one that fails says why
+/// once it lands. An animation's frames still read each step before they draw.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_zarr_step_is_read_off_the_frame_in_the_app() {
+    let _cache = zarr_cache_lock();
+    let (dir, path) = zarr_store_over_time("offframe");
+    let mut s = Session::new(Project::default());
+    s.zarr_off_frame = true;
+    let id = s.run("layer.addZarr", &json!({"path": path, "variable": "t", "time": true})).unwrap()["layer"].as_u64().unwrap() as u32;
+    let first = |s: &Session| s.map().layer(id).and_then(|l| l.raster.as_ref()).and_then(|r| r.data.as_ref()).map(|d| d.bands[0].data[0]);
+    assert_eq!(first(&s), Some(8.0));
+    let landed = |s: &mut Session, want: Option<f32>| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while first(s) != want {
+            assert!(std::time::Instant::now() < end, "the step never landed: {:?}", first(s));
+            s.follow_time_landed();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    // The move returns at once: the layer shows the step before, then step 2 once it lands;
+    // playing waits for it meanwhile.
+    s.run("time.goTo", &json!({"step": 2})).unwrap();
+    landed(&mut s, Some(208.0));
+    assert!(!s.zarr_waiting(), "the step shown is the slider's");
+    // A step read before shows at once.
+    s.run("time.goTo", &json!({"step": 0})).unwrap();
+    assert_eq!(first(&s), Some(8.0), "a kept step shows without waiting");
+    // A step that can't be read empties the layer and says why, once.
+    std::fs::write(std::path::Path::new(&path).join("t/1.0.0"), b"short").unwrap();
+    let mark = s.notice_mark();
+    s.run("time.goTo", &json!({"step": 1})).unwrap();
+    landed(&mut s, None);
+    let errors: Vec<_> = s.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    s.follow_time_landed();
+    assert_eq!(s.notices_since(mark).iter().filter(|n| n.error).count(), 1, "said once");
+    // Two layers on the failing step: one notice, with a count.
+    s.run("time.goTo", &json!({"step": 0})).unwrap();
+    s.run("layer.addZarr", &json!({"path": path, "variable": "t", "time": true, "name": "again"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("time.goTo", &json!({"step": 1})).unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while s.zarr_waiting() {
+        assert!(std::time::Instant::now() < end, "the failing step never landed");
+        s.follow_time_landed();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let errors: Vec<_> = s.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
+    assert!(errors.len() == 1 && errors[0].contains("and 1 more layer:"), "{errors:?}");
+    // A script's line waits for its step, so the next line reads it.
+    s.run("time.goTo", &json!({"step": 0})).unwrap();
+    std::fs::write(std::path::Path::new(&path).join("t/1.0.0"), f32s_of(100)).unwrap();
+    let ran = s.run("script.run", &json!({"script": "time.goTo {\"step\": 1}"})).unwrap();
+    assert!(ran["ran"].as_array().is_some_and(|r| r.len() == 1), "{ran}");
+    assert_eq!(first(&s), Some(108.0), "a script's move is read before its next line");
+    // The animation's frames draw their own steps: step 2 is read before its frame.
+    let zip = std::env::temp_dir().join(format!("rustgis-zarr-offframe-{}.zip", std::process::id()));
+    s.run("time.goTo", &json!({"step": 0})).unwrap();
+    let r = s.run("time.export", &json!({"path": zip.display().to_string(), "width": 64, "height": 48, "from": "2001-03-01"})).unwrap();
+    assert_eq!(r["frames"], 1, "{r}");
+    let _ = std::fs::remove_file(zip);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn permission_review_zarr_actorless_scoped_moves_wait_for_the_requested_step() {
+    use crate::policy::{AgentAccess, Call, Effects, Outcome, Revocation, Scope};
+    use std::sync::Arc;
+    struct Live;
+    impl Revocation for Live {
+        fn allows(&self, _: Effects) -> bool {
+            true
+        }
+    }
+    let _cache = zarr_cache_lock();
+    for agent in [false, true] {
+        let (dir, path) = zarr_store_over_time(if agent { "review-agent-step" } else { "review-assistant-step" });
+        let mut s = Session::new(Project::default());
+        s.zarr_off_frame = true;
+        let id = s.run("layer.addZarr", &json!({"path":path,"variable":"t","time":true})).unwrap()["layer"].as_u64().unwrap() as u32;
+        let live = Arc::new(Live);
+        let scope =
+            if agent { Scope::agent(AgentAccess::Allow, false, "zarr-actorless", None, live) } else { Scope::assistant(1461, live) };
+        let call = Call::command("time.goTo", json!({"step":1}));
+        if agent {
+            assert!(matches!(s.review(&scope, &call), Outcome::Allowed));
+            s.run_scoped(scope, &call).unwrap();
+        } else {
+            let Outcome::NeedsApproval(pending) = s.review(&scope, &call) else { panic!("the assistant's local read must ask") };
+            s.run_permitted(scope, pending.allow(), &call).unwrap();
+        }
+        // No frame has landed a worker: the actual command must have shown its own requested step.
+        let raster = s.map().layer(id).unwrap().raster.as_ref().unwrap();
+        assert_eq!(raster.time_zarr.as_ref().unwrap().shown, Some(1));
+        assert_eq!(raster.data.as_ref().unwrap().bands[0].data[0], 108.0);
+        assert!(s.actor.is_none() && !s.zarr_waiting());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn permission_review_zarr_worker_rechecks_captured_still_before_a_local_read() {
+    use crate::render::rustgis_tiles::cache;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    let _cache = zarr_cache_lock();
+    for revoke in [false, true] {
+        let (dir, path) = zarr_store_over_time(&format!("review-worker-{revoke}"));
+        let mut s = Session::new(Project::default());
+        s.zarr_off_frame = true;
+        let id = s.run("layer.addZarr", &json!({"path":path,"variable":"t","time":true})).unwrap()["layer"].as_u64().unwrap() as u32;
+        let zt = s.map().layer(id).unwrap().raster.as_ref().unwrap().time_zarr.as_ref().unwrap();
+        let key = crate::cmd::zarr::slice_key(zt, 1);
+        let caller = std::thread::current().id();
+        let live = Arc::new(AtomicBool::new(true));
+        let current = live.clone();
+        let held = AtomicBool::new(false);
+        let (started, entered) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let released = Mutex::new(released);
+        let still = Arc::new(move || {
+            if std::thread::current().id() != caller && !held.swap(true, Ordering::SeqCst) {
+                let _ = started.send(());
+                if released.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+                    return false;
+                }
+            }
+            current.load(Ordering::SeqCst)
+        });
+        let mark = s.notice_mark();
+        cache::with_still(still, || s.run("time.goTo", &json!({"step":1}))).unwrap();
+        entered.recv_timeout(std::time::Duration::from_secs(10)).expect("the worker must check its captured predicate before reading");
+        assert_eq!(s.map().layer(id).unwrap().raster.as_ref().unwrap().time_zarr.as_ref().unwrap().shown, Some(0));
+        live.store(!revoke, Ordering::SeqCst);
+        release.send(()).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while s.zarr_waiting() {
+            assert!(std::time::Instant::now() < end, "the held Zarr worker never landed");
+            s.follow_time_landed();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let raster = s.map().layer(id).unwrap().raster.as_ref().unwrap();
+        assert_eq!(raster.time_zarr.as_ref().unwrap().shown, Some(1));
+        assert_eq!(raster.data.as_ref().map(|data| data.bands[0].data[0]), if revoke { None } else { Some(108.0) });
+        assert_eq!(crate::cmd::zarr::kept_slice(&key).is_some(), !revoke);
+        assert_eq!(s.notices_since(mark).iter().any(|notice| notice.error), revoke);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 /// A Zarr store in a folder: its variables listed (with time labels), a slice added by command

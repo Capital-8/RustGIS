@@ -150,7 +150,7 @@ impl Session {
         self.policy.scopes.is_empty()
     }
     /// Only the native user scope may record executable-content provenance.
-    pub(super) fn policy_user(&self) -> bool {
+    pub(crate) fn policy_user(&self) -> bool {
         self.policy.scopes.last().is_none_or(|s| matches!(s.kind, Kind::User))
     }
     /// Inherits the current named scope; absence is the documented trusted native convention.

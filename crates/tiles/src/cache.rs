@@ -380,8 +380,8 @@ pub fn wait_for_news_unless(since: u64, timeout: Duration, stop: impl Fn() -> bo
     let _ = (since, timeout, stop);
 }
 
-/// A waiting fetch: what to decode it as, whose diagnostics it goes to, and its expected statuses.
-type Job = (Want, Capture, &'static [u16]);
+/// A waiting fetch: its decode kind, diagnostics owner, expected statuses and initiating context.
+type Job = (Want, Capture, &'static [u16], Option<Still>);
 
 fn queue() -> &'static Mutex<Queue<Job>> {
     static Q: OnceLock<Mutex<Queue<Job>>> = OnceLock::new();
@@ -391,13 +391,14 @@ fn queue() -> &'static Mutex<Queue<Job>> {
 /// Asks for a tile: fetched now when its server has room, else it waits its turn.
 fn start(url: String, want: Want, omit: &'static [u16]) {
     let capture = Capture::current();
+    let still = current_still();
     IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
     let mut swept = Vec::new();
     let now = {
         let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
         let mut c = lock();
         let latest = c.latest.unwrap_or_else(Instant::now);
-        let now = q.push(url, (want, capture, omit), |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept);
+        let now = q.push(url, (want, capture, omit, still), |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept);
         // Under the same lock as the choice: a tile asked for again meanwhile isn't forgotten.
         forget_dropped(&mut c, &swept);
         now
@@ -456,9 +457,9 @@ fn launch(jobs: Vec<Waiting<Job>>) {
             }
             let _lower = Lower;
             while let Some(w) = pop() {
-                let (want, capture, omit) = w.job;
+                let (want, capture, omit, still) = w.job;
                 let _scope = capture.enter();
-                fetch_tile(w.url, w.host, want, omit);
+                with_optional_still(still, || fetch_tile(w.url, w.host, want, omit));
             }
         }
         // A tile queued after the last `pop` and before the flag went down is started here.
@@ -2932,6 +2933,75 @@ mod tests {
         for i in 0..n {
             assert!(matches!(get(&format!("test://held/{i}.json"), Want::Json), State::Ready(_)), "{i}");
         }
+
+        // Waiting at the server cap must retain the initiating request's revocation and
+        // diagnostics owner, even when another owner's completion starts the fetch.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fetched = seen.clone();
+        set_fetcher(move |url, done| {
+            if url.starts_with("test://held/") {
+                fetched.lock().unwrap().push(url.clone());
+                if url == "test://held/context/diagnostics.json" {
+                    let mut diagnostics = RequestDiagnostics::new(&url, "GET");
+                    diagnostics.answered(503);
+                    diagnostics.failed(&Failure::new(&url, "http status: 503"));
+                    done(Err("http status: 503".into()));
+                } else {
+                    HELD.lock().unwrap().push((url, done));
+                }
+            } else {
+                done(Ok(b"1".to_vec()));
+            }
+        });
+        let drain_held = || loop {
+            let Some((_, done)) = HELD.lock().unwrap().pop() else { break };
+            done(Ok(b"3".to_vec()));
+        };
+        let cancelled =
+            |url: &str| lock().slots.get(url).is_some_and(|slot| matches!(&slot.entry, Entry::Failed(e, _) if e.contains("cancelled")));
+        let owner = rustgis_data::diagnostics::History::default();
+        let launcher = rustgis_data::diagnostics::History::default();
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = live.clone();
+        let still: Still = Arc::new(move || flag.load(Ordering::SeqCst));
+        for i in 0..crate::schedule::PER_HOST {
+            let _ = get(&format!("test://held/context/filler-{i}.json"), Want::Json);
+        }
+        let revoked = "test://held/context/revoked.json";
+        let diagnostic = "test://held/context/diagnostics.json";
+        let healthy = "test://held/context/healthy.json";
+        let admitted = {
+            let _scope = owner.enter();
+            [with_still(still, || get(revoked, Want::Json)), get(diagnostic, Want::Json)]
+        };
+        let control = get(healthy, Want::Json);
+        let held_before = HELD.lock().unwrap().len();
+        live.store(false, Ordering::SeqCst);
+        {
+            let _scope = launcher.enter();
+            drain_held();
+        }
+        // Drain before asserting: the RED result must not strand the other queued requests.
+        assert_eq!(held_before, crate::schedule::PER_HOST);
+        assert!(admitted.iter().all(|state| matches!(state, State::Pending)) && matches!(control, State::Pending));
+        assert!(!seen.lock().unwrap().iter().any(|url| url == revoked), "a revoked waiting request reached the fetcher");
+        assert!(cancelled(revoked), "the refused request keeps its cached cancellation");
+        assert!(peek(healthy).is_some(), "the unscoped waiting control still completes");
+        assert_eq!(network_records(&owner, diagnostic).len(), 1);
+        assert!(launcher.records().is_empty(), "a queued request keeps its original diagnostics owner");
+        assert!(current_still().is_none());
+
+        // Restoring an initiator must also preserve the launcher's existing revocation floor.
+        for i in 0..crate::schedule::PER_HOST {
+            let _ = get(&format!("test://held/context-floor/filler-{i}.json"), Want::Json);
+        }
+        let floor = "test://held/context-floor/queued.json";
+        let admitted = with_still(Arc::new(|| true), || get(floor, Want::Json));
+        with_still(Arc::new(|| false), drain_held);
+        assert!(matches!(admitted, State::Pending));
+        assert!(!seen.lock().unwrap().iter().any(|url| url == floor));
+        assert!(cancelled(floor), "the unrelated launcher's revocation still applies");
+        assert!(current_still().is_none());
 
         // A fetcher that drops a request unanswered (or panics) gives its server's place back:
         // more requests than the cap still all reach it, and each is forgotten, not stuck.
