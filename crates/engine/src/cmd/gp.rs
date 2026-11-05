@@ -1158,7 +1158,9 @@ pub(crate) fn execute(
     let inputs = map_inputs(s, Some(spec), params)?;
     let mut res = if let Some(plugin) = pin.plugin() {
         let (_, tool) = rustgis_plugins::split_id(spec.id).ok_or("invalid plugin tool id")?;
-        rustgis_plugins::tools::prepare_pinned(plugin.plugin(), tool, &inputs, params)?.run(&rustgis_plugins::tools::Control::default())
+        rustgis_analysis::run_under(spec.name, control, || {
+            rustgis_plugins::tools::prepare_pinned(plugin.plugin(), tool, &inputs, params)?.run(&rustgis_plugins::tools::Control::default())
+        })
     } else {
         pin.run(&inputs, params, control, &|| continuation.check())
     };

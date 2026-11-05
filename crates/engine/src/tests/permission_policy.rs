@@ -1102,6 +1102,77 @@ fn permission_policy_plugin_preparation_keeps_owner_before_remote_send() {
     rustgis_plugins::unload(plugin);
 }
 
+/// Cancellation after a real plugin process starts stops both pinned engine and analysis
+/// calls before its valid result is released. The fallback releases and joins a broken run.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn permission_policy_plugin_tools_follow_the_callers_control_while_running() {
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    struct Input(rustgis_data::Dataset);
+    impl rustgis_analysis::Inputs for Input {
+        fn dataset(&self, name: &str) -> Option<&rustgis_data::Dataset> {
+            (name == "Cities").then_some(&self.0)
+        }
+        fn selection(&self, _: &str) -> &[usize] {
+            &[]
+        }
+    }
+    let plugin = "policy-plugin-control";
+    let tool = "plugin:policy-plugin-control/m";
+    let dir = std::env::temp_dir().join(format!("rustgis-policy-plugin-control-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = rustgis_plugins::testing::child_run("tests::plugin_process_child");
+    std::fs::write(dir.join("plugin.json"), rustgis_plugins::testing::process_manifest(plugin, &[], &run)).unwrap();
+    rustgis_plugins::load(rustgis_plugins::Package::from_dir(&dir).unwrap(), "test").unwrap();
+    let mut outcomes = Vec::new();
+    for engine in [true, false] {
+        let mut s = world();
+        let before = serde_json::to_value(&s.map().layers).unwrap();
+        let ready = dir.join(format!("ready-{engine}"));
+        let release = dir.join(format!("release-{engine}"));
+        let params = json!({"input":"Cities", "control_ready":ready, "control_release":release});
+        let control = rustgis_analysis::control::Control::new();
+        let caller = control.clone();
+        let (finished, done) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = if engine {
+                crate::cmd::gp::run_tool_with(&mut s, tool, &params, &caller)
+            } else {
+                let input = Input(s.map().layer_by_name("Cities").unwrap().dataset.clone());
+                rustgis_analysis::run_with(tool, &input, &params, &caller).map(|_| Value::Null)
+            };
+            finished.send(()).unwrap();
+            (s, result)
+        });
+        let start = Instant::now();
+        while !ready.is_file() && !worker.is_finished() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let entered = ready.is_file();
+        control.cancel();
+        let stopped = done.recv_timeout(Duration::from_secs(5)).is_ok();
+        std::fs::write(release, b"finish if cancellation was ignored").unwrap();
+        let (s, result) = worker.join().unwrap();
+        let unchanged = serde_json::to_value(&s.map().layers).unwrap() == before;
+        let failed_history = !engine || s.project.gp_history.last().is_some_and(|h| !h.ok && h.outputs.is_empty());
+        outcomes.push((engine, entered, stopped, result.err(), unchanged, failed_history));
+    }
+    let mut clean = world();
+    crate::cmd::gp::run_tool_with(&mut clean, tool, &json!({"input":"Cities"}), &rustgis_analysis::control::Control::new()).unwrap();
+    assert!(clean.map().layer_by_name("Made").is_some());
+    rustgis_plugins::unload(plugin);
+    std::fs::remove_dir_all(dir).unwrap();
+    for (engine, entered, stopped, error, unchanged, failed_history) in outcomes {
+        assert!(
+            entered && stopped && error.as_ref().is_some_and(|e| e.contains("cancelled")) && unchanged && failed_history,
+            "engine={engine}, entered={entered}, stopped={stopped}, error={error:?}, unchanged={unchanged}, failed_history={failed_history}"
+        );
+    }
+}
+
 /// Choosing another already-active login changes consent without rotating either bearer.
 #[test]
 fn permission_policy_web_login_reselection_refuses_old_consent_and_landing() {

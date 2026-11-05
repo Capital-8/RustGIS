@@ -335,6 +335,16 @@ pub fn serve_if_child() {
             }
         }
         Some('m') => {
+            // Hold an actual tool request for cancellation tests; ordinary calls do not wait.
+            if let (Some(ready), Some(release)) =
+                (params.get("control_ready").and_then(Value::as_str), params.get("control_release").and_then(Value::as_str))
+            {
+                let _ = std::fs::write(ready, b"started");
+                let start = std::time::Instant::now();
+                while !std::path::Path::new(release).is_file() && start.elapsed() < std::time::Duration::from_secs(20) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
             let _ = writeln!(out, "{}", json!({"progress": "making"}));
             json!({"ok": {"layers": [{"name": "Made", "geojson": {"type": "FeatureCollection", "features": [
             {"type": "Feature", "properties": {"n": 1}, "geometry": {"type": "Point", "coordinates": [1, 2]}}]}}], "messages": ["made"]}})

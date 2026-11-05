@@ -186,7 +186,8 @@ impl Host for Messages<'_> {
         }
     }
     fn cancelled(&self) -> bool {
-        self.control.is_cancelled()
+        // An analysis caller carries its cancellation through the existing data progress probe.
+        self.control.is_cancelled() || rustgis_data::progress::check().is_err()
     }
 }
 
