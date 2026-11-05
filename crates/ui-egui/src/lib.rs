@@ -2297,6 +2297,7 @@ impl RustGisApp {
     }
 
     /// Applies a workflow's admitted raster completion and records its replayable command.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn finish_raster(&mut self, command: &str, id: u64, params: &Value) -> rustgis_engine::CmdResult {
         let result = self.session.finish_raster(command, id, params);
         if result.is_ok() {
@@ -3233,6 +3234,10 @@ impl RustGisApp {
                     let (exts, kinds): (&[&str], _) =
                         if pdf_only { (&["pdf"], tl!("PDF")) } else { (&["pdf", "png", "svg"], tl!("PDF, PNG or SVG")) };
                     if let Some(path) = dialogs::pick_save(&format!("{name}.pdf"), exts, kinds) {
+                        // Drawn on a thread of its own, with progress and Cancel in the status bar.
+                        #[cfg(not(target_arch = "wasm32"))]
+                        return exportjob::start(self, "layout.export", json!({"layout": li, "path": path, "dpi": 200}));
+                        #[cfg(target_arch = "wasm32")]
                         return self.run("layout.export", json!({"layout": li, "path": path, "dpi": 200}));
                     }
                 }
@@ -3743,6 +3748,15 @@ impl RustGisApp {
             "ui.exportMap" => {
                 let name = format!("{}.png", self.session.map().name);
                 if let Some(path) = dialogs::pick_save(&name, &["png"], tl!("PNG image")) {
+                    // Drawn on a thread of its own, with progress and Cancel in the status bar;
+                    // here while a style added with its own view loads, as the command waits for
+                    // it to move the map there first.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.session.style_view.is_none() {
+                        return exportjob::start(self, "share.exportMap", json!({"path": path, "dpi": 192}));
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    exportjob::idle(self)?;
                     return self.run("share.exportMap", json!({"path": path, "dpi": 192}));
                 }
             }
@@ -4015,6 +4029,9 @@ impl RustGisApp {
             if p.get("geolibreZarr").and_then(Value::as_bool) == Some(true) {
                 if let Err(e) = geolibreui::start(self, p, claim) {
                     rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, p);
+                    if let Some(id) = claim {
+                        self.session.download_failed(id);
+                    }
                     return Err(e);
                 }
                 return Ok(Value::Null);

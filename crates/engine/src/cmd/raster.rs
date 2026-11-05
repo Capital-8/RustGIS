@@ -958,7 +958,13 @@ fn write_geotiff(r: &Raster, bi: usize, cog: bool, path: &str) -> Result<super::
     if let (Some(o), Some(c)) = (v.as_object_mut(), cog) {
         o.insert("cog".into(), json!({"overviews": c.levels.len().saturating_sub(1), "bigTiff": c.big, "bytes": c.bytes}));
     }
-    Ok(super::exports::Wrote { answer: v, notes: vec![format!("Exported {path}{note}")], then: None, owner: None })
+    Ok(super::exports::Wrote {
+        answer: v,
+        notes: vec![format!("Exported {path}{note}")],
+        then: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        owner: None,
+    })
 }
 
 /// Pixel values of the topmost visible raster under a longitude/latitude point.

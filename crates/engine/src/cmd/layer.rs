@@ -2895,6 +2895,29 @@ pub fn url_file_name(url: &str, bytes: &[u8]) -> Result<String, String> {
     }
 }
 
+/// Identifies a bounded data download using the same filename and companion rules as its reader.
+/// Discovery, content-sniffed imports and external drivers keep conservative account checks.
+pub(crate) fn fixed_download_urls(p: &Value) -> Option<Vec<String>> {
+    let url = p.get("url")?.as_str()?;
+    if url.is_empty()
+        || url.trim() != url
+        || ["service", "coverage"].iter().any(|key| p.get(key).is_some_and(|v| !v.is_null() && v.as_bool() != Some(false)))
+        || ["geolibreProject", "geolibreLayer", "geolibreZarr"].iter().any(|key| p.get(key).is_some())
+        || rustgis_data::time::is_template(url)
+    {
+        return None;
+    }
+    let name = url_file_name(url, &[]).ok()?;
+    if rustgis_data::raster::is_jpeg2000_name(&name) {
+        return None;
+    }
+    let mut urls = vec![url.to_string()];
+    if let Some(parts) = rustgis_data::io::shapefile_part_urls(url) {
+        urls.extend(parts.into_iter().map(|(_, url)| url));
+    }
+    Some(urls)
+}
+
 /// Downloads data from a web address and adds it (the command line, MCP and the assistant; the
 /// app downloads off the frame and adds the bytes). In the browser, where nothing may wait, the
 /// request is kept for the app ([`Session::request_url`]), which downloads and adds it as its own

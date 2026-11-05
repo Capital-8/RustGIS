@@ -14,6 +14,14 @@ pub fn public_label(s: &str) -> Option<String> {
     let t = s.trim();
     let lower = t.to_ascii_lowercase();
     if lower.starts_with("postgresql://") || lower.starts_with("postgres://") {
+        let (_, raw) = t.split_once("://")?;
+        let authority = raw.split(['/', '?', '#']).next()?;
+        let path = raw.get(authority.len()..)?.split(['?', '#']).next()?;
+        // A path `@` after userinfo may be a malformed password tail. Refuse ambiguous output
+        // rather than choosing another host; percent-encode a database name's `@` to keep it.
+        if authority.contains('@') && path.contains('@') {
+            return None;
+        }
         let public = split_secrets(t, SECRET_KEYS).0;
         let (_, rest) = public.split_once("://")?;
         let authority = rest.split(['/', '?', '#']).next()?;
@@ -230,6 +238,20 @@ mod tests {
         assert_eq!(password.as_deref(), Some("RGSYNTH_pg_20261103"));
         let clean = "postgresql://u@h.invalid/db?sslmode=require";
         assert_eq!(super::public_label(clean).as_deref(), Some(clean));
+        // A later path `@` could be a password tail, even after an earlier split removed its
+        // colon. Withhold the ambiguous label, including an intentional raw `@` database name;
+        // percent-encoding the database's `@` keeps that name unambiguous.
+        for ambiguous in [
+            "postgresql://user:p@ss/word@host.invalid/db",
+            "postgresql://user@ss/word@host.invalid/db",
+            "postgresql://user@host.invalid/db@tag",
+        ] {
+            assert_eq!(super::public_label(ambiguous), None, "{ambiguous}");
+        }
+        let encoded = "postgresql://user:p%40ss%2Fword@host.invalid/db%40tag";
+        assert_eq!(super::public_label(encoded).as_deref(), Some("postgresql://user@host.invalid/db%40tag"));
+        let query_at = "postgresql://user@host.invalid/db?application_name=x@y";
+        assert_eq!(super::public_label(query_at).as_deref(), Some(query_at));
         assert_eq!(super::public_label("postgresql://u:RGSYNTH_unreadable_20261103/path"), None);
         let keyword = "host=h.invalid dbname='a%20b' user=u password='RGSYNTH_keyword_20261103'";
         let (public, password) = super::split_secrets(keyword, super::SECRET_KEYS);

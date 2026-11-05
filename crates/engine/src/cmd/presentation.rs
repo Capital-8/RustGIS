@@ -564,11 +564,10 @@ fn export_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::In
     for page in pres.pages.iter().take(if png { 1 } else { usize::MAX }) {
         if let PageKind::Map { map, .. } = &page.kind {
             let map = page_map(input, map);
-            inputs.maps.push(map.instance_id());
-            inputs.layers.extend(map.layers.iter().map(|l| (map.instance_id(), l.id)));
+            inputs.extend(super::tiles::render_inputs(map));
         }
     }
-    inputs.state = json!({"presentation":i,"name":pres.name,"maps":pres.pages.iter().take(if png {1}else {usize::MAX}).enumerate().filter_map(|(i,p)|match &p.kind {PageKind::Map{map,..}=>Some((i,map)),_=>None}).collect::<Vec<_>>()});
+    inputs.state = json!({"presentation":i,"name":pres.name,"maps":pres.pages.iter().take(if png {1}else {usize::MAX}).enumerate().filter_map(|(i,p)|match &p.kind {PageKind::Map{map,..}=>Some((i,map)),_=>None}).collect::<Vec<_>>(),"tiles":inputs.state});
     Ok(inputs)
 }
 

@@ -63,6 +63,7 @@ fn now() -> f64 {
     web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
+/// Separates in-memory cache controls from commands that read or remove files on disk.
 pub fn commands() -> Vec<C> {
     vec![
         C::new("view.linkViews", "Link Views", "View › Link", |s, p| {
@@ -299,7 +300,7 @@ pub fn commands() -> Vec<C> {
                 }
             }
             Ok(json!({"emptied": n}))
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
         // The Shapefile index cache on disk, shared by every project (#1259). Command search,
         // scripts and the CLI run it; it has no ribbon button.
@@ -309,7 +310,7 @@ pub fn commands() -> Vec<C> {
         C::new("cache.cancel", "Cancel Caching", "Data › Feature Cache", |s, _| {
             s.auto_cache = false;
             Ok(Value::Null)
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
         C::new("cache.auto", "Auto Cache", "Data › Feature Cache", |s, p| {
             s.auto_cache = b(p, "on").unwrap_or(!s.auto_cache);

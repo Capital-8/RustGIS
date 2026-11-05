@@ -82,6 +82,12 @@ const INVALID_PARAMS: i64 = -32602;
 /// MCP's code for a resource that doesn't exist.
 const RESOURCE_NOT_FOUND: i64 = -32002;
 
+/// Binds an ingress request to its complete-message position, independently of wire ids.
+/// Count batch entries before filtering; an unbatched message always uses position zero.
+pub(crate) fn request_key(root: &str, position: usize) -> String {
+    format!("{root}/{position}")
+}
+
 impl Server {
     /// A server with the built-in skills. `rustgis-cli mcp` and the desktop's relay replace them
     /// with the skills switched on (`skills::installed`): the user's, the plugins' and shared ones.
@@ -115,13 +121,17 @@ impl Server {
                 error_value(&Value::Null, INVALID_REQUEST, &format!("a batch holds at most {MAX_BATCH} messages"))
             }
             Value::Array(batch) => {
-                let replies: Vec<Value> = batch.iter().filter_map(|m| self.handle_value(s, m, &scope, &mut permits, request)).collect();
+                let replies: Vec<Value> = batch
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, m)| self.handle_value(s, m, &scope, &mut permits, &request_key(request, position)))
+                    .collect();
                 if replies.is_empty() {
                     return None;
                 }
                 Value::Array(replies)
             }
-            _ => self.handle_value(s, &msg, &scope, &mut permits, request)?,
+            _ => self.handle_value(s, &msg, &scope, &mut permits, &request_key(request, 0))?,
         };
         Some(reply.to_string())
     }
@@ -151,7 +161,7 @@ impl Server {
             return Some(error_value(&Value::Null, INVALID_REQUEST, "id must be a string or a number"));
         }
         let params = obj.get("params").cloned().unwrap_or(Value::Null);
-        Some(match self.call(s, method, &params, scope, permits, &format!("{request}/{}", id)) {
+        Some(match self.call(s, method, &params, scope, permits, request) {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
             Err((code, message)) => error_value(&id, code, &message),
         })
@@ -449,6 +459,7 @@ pub fn snapshot_result(s: &mut Session, png: &[u8], mode: &str, settled: bool, a
     snapshot_result_with(s, png, mode, settled, a, note, None)
 }
 /// Formats a delivered screenshot inside its already resumed initiating scope.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn snapshot_result_checked(
     s: &mut Session,
     png: &[u8],

@@ -16,6 +16,7 @@ const MAX_PICTURE: usize = 16 << 20;
 /// Most vertices in one graphic.
 const MAX_POINTS: usize = 100_000;
 
+/// Keeps in-memory graphics available without file access; explicit picture paths add that reach.
 pub fn commands() -> Vec<C> {
     vec![
         C::new("graphics.newLayer", "Add Graphics Layer", "Home › Add", |s, p| {
@@ -24,7 +25,7 @@ pub fn commands() -> Vec<C> {
             Ok(json!({"layer": id}))
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name"?: string}"#),
-        C::new("graphics.add", "Add Graphic", "Edit › Graphics", add).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
+        C::new("graphics.add", "Add Graphic", "Edit › Graphics", add).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r##"{"shape": "point"|"text"|"line"|"curve"|"freehand"|"polygon"|"lasso"|"rectangle"|"circle"|"ellipse"|"picture", "points": [[lon, lat], …] (rectangle, ellipse, picture: two corners; circle: centre and a point on the edge), "layer"?: graphics layer, "text"?: string (dynamic tokens: {map} {scale} {date} {time} {crs} {layers} {center}), "fill"?: "#RRGGBBAA", "outline"?: "#RRGGBBAA", "width"?: number, "size"?: number, "fontSize"?: number, "bold"?: bool, "italic"?: bool, "align"?: "left"|"center"|"right" (a text's lines in their block, which stays centred on its point), "letterSpacing"?: points, -5 to 50, "image"?: base64 PNG/JPEG, "path"?: picture file}"##,
         ),
         C::new("graphics.style", "Graphic Style", "Edit › Graphics", style).roles(&[]).effects(crate::policy::Effects::NONE)

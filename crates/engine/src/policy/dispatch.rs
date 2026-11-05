@@ -34,6 +34,12 @@ pub struct PreparedCommand {
     op: Authorized<CommandOp>,
     completion: super::Deferred,
 }
+impl PreparedCommand {
+    /// Checks the held invocation without consuming it or granting a replacement load authority.
+    pub fn is_current(&self) -> bool {
+        self.completion.0.check().is_ok()
+    }
+}
 pub(crate) struct ToolOp {
     pub(crate) pin: ToolPin,
     pub(crate) params: Value,
@@ -74,7 +80,7 @@ impl Session {
             return Err("only plugin commands can wait in the UI command queue".into());
         }
         let op = self.authorize(id, params)?;
-        let completion = super::Deferred(self.continuation_for(op.node.clone()));
+        let completion = super::Deferred(self.continuation_for(op.node.clone())?);
         Ok(PreparedCommand { op, completion })
     }
     /// Consumes the held invocation under its initiating owner, with ordinary command bookkeeping.
@@ -474,12 +480,12 @@ impl Session {
     fn with_node<T>(&mut self, node: Arc<Node>, f: impl FnOnce(&mut Session) -> Result<T, String>) -> Result<T, String> {
         let before_layers = self.project.maps.iter().flat_map(|m| m.layers.iter().map(move |l| LayerKey::of(m, l))).collect::<Vec<_>>();
         let before_tables = self.project.tables.iter().map(|t| t.id).collect::<Vec<_>>();
+        let continuation = (!matches!(self.scope().kind, Kind::User)).then(|| self.continuation_for(node.clone())).transpose()?;
         let depth = self.policy.nodes.len();
         self.policy.nodes.push(node.clone());
         if let Some(cursor) = &mut self.policy.cursor {
             cursor.frames.push((node.children.clone(), 0));
         }
-        let continuation = (!matches!(self.scope().kind, Kind::User)).then(|| self.continuation_for(node));
         let still = continuation.map(|c| Arc::new(move || c.check().is_ok()) as crate::render::rustgis_tiles::cache::Still);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::render::rustgis_tiles::cache::with_optional_still(still, || f(self))
@@ -709,11 +715,11 @@ impl Session {
         self.policy.epoch.store(self.opened, std::sync::atomic::Ordering::SeqCst);
     }
     /// Copies the admitted tool authority without consulting its public name again.
-    pub(crate) fn tool_continuation(&self, op: &Authorized<ToolOp>) -> Continuation {
+    pub(crate) fn tool_continuation(&self, op: &Authorized<ToolOp>) -> Result<Continuation, String> {
         self.continuation_for(op.node.clone())
     }
     /// Own private identity snapshots cross workers; display copies never become authority.
-    fn continuation_for(&self, node: Arc<Node>) -> Continuation {
+    fn continuation_for(&self, node: Arc<Node>) -> Result<Continuation, String> {
         let reads = node.effects.iter().any(|e| matches!(e, super::Effect::Files | super::Effect::Network | super::Effect::Plugin));
         let mut sources = Vec::new();
         let mut tables = Vec::new();
@@ -747,7 +753,7 @@ impl Session {
                 }
             }
         }
-        Continuation {
+        Ok(Continuation {
             scope: self.scope(),
             node: node.clone(),
             opened: self.opened,
@@ -757,8 +763,8 @@ impl Session {
             sources,
             time_sources: node_time_sources(&node),
             tables,
-            s3: reads.then(crate::render::rustgis_tiles::s3::connections),
-        }
+            s3: reads.then(|| crate::render::rustgis_tiles::s3::account_identity().map(|identity| vec![identity])).transpose()?,
+        })
     }
     /// Native UI delivery re-enters the engine-held owner; a JSON completion cannot select it.
     pub fn finish_gp(&mut self, id: u64) -> CmdResult {
@@ -820,7 +826,7 @@ impl Session {
     /// Captures restricted authority only while an admitted operation is executing.
     pub(crate) fn continuation(&self) -> Result<Continuation, String> {
         let node = self.policy.nodes.last().cloned().ok_or("late work needs an authorized initiating operation")?;
-        Ok(self.continuation_for(node))
+        self.continuation_for(node)
     }
     /// Checks generation, map, revocation, current load and private source/account identity.
     pub(crate) fn check_continuation(&self, c: &Continuation) -> Result<(), String> {

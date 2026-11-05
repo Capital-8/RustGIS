@@ -43,7 +43,12 @@ pub struct State {
 /// same parameters, already waiting, isn't asked twice.
 pub(crate) fn ask(app: &mut RustGisApp, id: &str, params: Value) -> Result<(), String> {
     let opened = app.session.opened;
-    if app.ui.plugin_start.waiting.iter().any(|s| s.id == id && s.params == params && s.opened == opened) {
+    if let Some(start) = app.ui.plugin_start.waiting.iter_mut().find(|s| s.id == id && s.params == params && s.opened == opened) {
+        if !start.prepared.is_current() {
+            let prepared = app.session.prepare_command(id, &params)?;
+            start.prepared = prepared;
+            start.frames = 0;
+        }
         return Ok(());
     }
     let prepared = app.session.prepare_command(id, &params)?;
@@ -238,6 +243,28 @@ mod tests {
         assert!(h.state_mut().run_by_user("plugin:ui-pinned/f", rename("Rivers", "Streams")).is_err());
         assert_eq!(h.state().session.notices_since(mark).iter().filter(|n| n.error).count(), 1, "preparation failures are reported too");
         assert!(running(h.state()).is_none());
+    }
+
+    #[test]
+    fn a_fresh_click_replaces_a_stale_queued_plugin_load() {
+        let mut h = launch("ui-pinned-retry");
+        let id = "plugin:ui-pinned-retry/f";
+        let params = rename("Rivers", "Streams");
+        let mark = h.state().session.notice_mark();
+        h.state_mut().run_by_user(id, params.clone()).unwrap();
+        h.state_mut().run_by_user(id, params.clone()).unwrap();
+        assert_eq!(h.state().ui.plugin_start.waiting.len(), 1, "current identical clicks still deduplicate");
+        plugins::unload("ui-pinned-retry");
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-pinned-retry", &["edit"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        h.state_mut().run_by_user(id, params).unwrap();
+        assert_eq!(h.state().ui.plugin_start.waiting.len(), 1, "the explicit retry replaces the stale start");
+        h.run();
+        assert!(h.state().session.map().layer_by_name("Rivers").is_none());
+        assert!(h.state().session.map().layer_by_name("Streams").is_some());
+        assert!(!h.state().session.notices_since(mark).iter().any(|n| n.error));
+        assert!(running(h.state()).is_none());
+        plugins::unload("ui-pinned-retry");
     }
 
     /// Asked for by the user, a command runs only after a frame has said so; asked twice, once.

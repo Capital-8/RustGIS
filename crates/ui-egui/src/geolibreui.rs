@@ -336,6 +336,11 @@ mod tests {
                         error: None,
                     });
                 }
+                let unrelated = app.session.download_started();
+                let error = app.add_url(&json!({"url":"https://example.org/unclaimed.zarr","geolibreZarr":true}), None, None).unwrap_err();
+                assert!(error.contains("16 imported Zarr stores"), "{error}");
+                assert!(app.session.download_is_pending(unrelated), "an unclaimed failure must leave other downloads alone");
+                app.session.download_failed(unrelated);
             }
             app.session
                 .run_leaving_downloads(
@@ -355,6 +360,9 @@ mod tests {
                 // later frame after a map switch. Its cleanup owns the original reservation.
                 let request = app.session.take_url_requests().pop().unwrap();
                 app.add_url(request.params(), Some(&request), None).unwrap();
+                let claim = app.ui.geolibre_zarr[0].id;
+                assert!(app.session.download_is_pending(claim));
+                assert!(app.session.download_still(claim).unwrap()(), "a successful start retains its live claim");
                 app.ui.geolibre_zarr[0].queue.clear();
                 app.ui.geolibre_zarr[0].error = Some("synthetic imported read failure".into());
                 app.run("map.new", json!({"name":"Other"})).unwrap();
@@ -368,6 +376,18 @@ mod tests {
             assert!(app.session.project.maps[target].groups.iter().all(|g| !g.children.contains(&id)));
             assert_eq!(app.ui.geolibre_zarr.len(), if late_failure { 0 } else { 16 });
             assert!(app.session.take_url_requests().is_empty());
+            // Queue/claim only: no reads start. A failed import must leave all 64 claim slots reusable.
+            let mut claims = Vec::new();
+            for n in 0..64 {
+                app.session.request_url(&json!({"url":format!("https://example.org/capacity-{n}.csv")})).unwrap();
+                let request = app.session.take_url_requests().pop().unwrap();
+                let claim = app.session.download_started_for(&request);
+                assert!(claim.is_ok(), "claim {n} after failed imported read: {claim:?}");
+                claims.push(claim.unwrap());
+            }
+            for claim in claims {
+                app.session.download_failed(claim);
+            }
         }
     }
 

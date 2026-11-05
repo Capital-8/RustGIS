@@ -196,7 +196,7 @@ pub(crate) struct Continuation {
     pub(super) sources: Vec<(super::plan::LayerKey, serde_json::Value)>,
     pub(super) tables: Vec<(u32, serde_json::Value)>,
     pub(super) time_sources: Option<Vec<(u64, u32, String)>>,
-    pub(super) s3: Option<Vec<crate::render::rustgis_tiles::s3::Connection>>,
+    pub(super) s3: Option<Vec<crate::render::rustgis_tiles::s3::AccountIdentity>>,
 }
 impl Continuation {
     /// Only an engine-created root native User may deliver owned tool snapshots this way.
@@ -204,6 +204,7 @@ impl Continuation {
         matches!(self.scope.kind, Kind::User)
     }
     /// Distinguishes two invocations of the same command without exposing their raw nodes.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn same_run(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.node, &other.node)
     }
@@ -212,7 +213,7 @@ impl Continuation {
         if self.epoch.load(std::sync::atomic::Ordering::SeqCst) != self.opened {
             return Err("this run belongs to a replaced project".into());
         }
-        if self.s3.as_ref().is_some_and(|old| *old != crate::render::rustgis_tiles::s3::connections()) {
+        if self.s3.as_ref().is_some_and(|identities| identities.iter().any(|identity| !identity.is_current())) {
             return Err("the live storage account changed since this request started".into());
         }
         self.scope.check(self.node.effects)?;

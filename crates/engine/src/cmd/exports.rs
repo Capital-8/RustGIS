@@ -1,27 +1,31 @@
 //! Exports that write a file from what the session shares (a layer's features, a raster's
-//! pixels). A script or the command line writes it where the command is called; the app writes it
-//! on a thread of its own with progress and Cancel (#1291 step 3): [`export_start`] reads the
-//! session, [`ExportRun::run`] writes the file, and [`export_land`] says what was written, as the
-//! command would have. The admitted operation owns both phases, including file commit checks;
-//! a completed write remains written even if delivery is subsequently refused.
+//! pixels, a copy of the map or project to draw). A script or the command line writes it where
+//! the command is called; the app writes it on a thread of its own with progress and Cancel
+//! (#1291 step 3): [`export_start`] reads the session, [`ExportRun::run`] writes the file, and
+//! [`export_land`] says what was written, as the command would have. The admitted operation owns
+//! preparation, file commit and delivery; a completed write remains written even if delivery
+//! is subsequently refused.
 
 use serde_json::Value;
 
 use crate::{CmdResult, Session};
 
 /// What an export wrote: the command's answer, and what it says of the file (the last says it
-/// was exported).
+/// was exported, unless `then` says it).
 pub struct Wrote {
     pub(crate) answer: Value,
     pub(crate) notes: Vec<String>,
     /// What it does to the session once written, after its notes, and adds to its answer (a
     /// GeoPackage table replaced: the layers reading it read it again).
     pub(crate) then: Option<Then>,
+    /// Authority retained for delivery from the native export worker.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) owner: Option<crate::policy::Continuation>,
 }
 
-/// What an export does to the session once its file is written, and adds to its answer.
-pub(crate) type Then = Box<dyn FnOnce(&mut Session, &mut Value) + Send>;
+/// What an export does to the session once its file is written, and adds to its answer; or the
+/// failure it says once what came before it was said (a layout's warnings, then its error).
+pub(crate) type Then = Box<dyn FnOnce(&mut Session, &mut Value) -> Result<(), String> + Send>;
 
 /// The writing of an export, its inputs read: it needs no session.
 pub(crate) type Work = Box<dyn FnOnce() -> Result<Wrote, String> + Send>;
@@ -34,6 +38,8 @@ type Start = fn(&Session, &Value) -> Result<Work, String>;
 const IN_BACKGROUND: &[(&str, &str, Start)] = &[
     ("share.exportLayer", "Export Features", super::share::layer_work),
     ("share.exportRaster", "Export Raster", super::raster::export_work),
+    ("share.exportMap", "Export Map", super::share::map_work),
+    ("layout.export", "Export Layout", super::layout::export_work),
 ];
 
 /// `command` and what it is called, when the app writes its file on another thread (see
@@ -49,14 +55,14 @@ pub(crate) fn write_here(s: &mut Session, p: &Value, command: &str) -> CmdResult
     owner.check()?;
     let current = owner.clone();
     let still = std::sync::Arc::new(move || current.check().is_ok());
-    // Where a person at a terminal can stop it with Ctrl-C, as on the app's thread.
+    // The probe keeps authority checks at file commit even when the user cannot cancel this run.
     let control = if s.stoppable { rustgis_analysis::control::Control::stoppable() } else { rustgis_analysis::control::Control::new() };
     let wrote = crate::render::rustgis_tiles::cache::with_still(still, || {
         let work = start(s, p)?;
         written_under(name, &control, work)
     })?;
     s.check_continuation(&owner)?;
-    Ok(said(s, wrote))
+    said(s, wrote)
 }
 
 /// `work` under `control`, as [`rustgis_analysis::run_under`] runs it, except that a file once
@@ -70,16 +76,83 @@ fn written_under(name: &str, control: &std::sync::Arc<rustgis_analysis::control:
     }
 }
 
-/// Says what an export wrote, and gives its answer.
-fn said(s: &mut Session, wrote: Wrote) -> Value {
+/// Says what an export wrote, and gives its answer (or the failure its `then` says).
+fn said(s: &mut Session, wrote: Wrote) -> CmdResult {
     let Wrote { mut answer, notes, then, .. } = wrote;
     for note in notes {
         s.notify(note, false);
     }
     if let Some(then) = then {
-        then(s, &mut answer);
+        then(s, &mut answer)?;
     }
-    answer
+    Ok(answer)
+}
+
+/// Lands an export drawn on a copy of the map or project (Export Map, Export Layout): what
+/// drawing it said, with each notice's severity; the streamed layers whose source failed on the
+/// copy, marked on their live layers as drawing them there would have (or, where that layer is
+/// gone or opened afresh, said in one notice to be missing from the file); then that it was
+/// written to `path`, or why not. A cancelled one says only that it was cancelled.
+pub(crate) fn drawn(
+    maps: &[rustgis_map::Map],
+    notices: Vec<(rustgis_data::diagnostics::Severity, String)>,
+    written: Result<Value, String>,
+    path: String,
+) -> Result<Wrote, String> {
+    if let (Err(e), Err(_)) = (&written, rustgis_data::progress::check()) {
+        return Err(e.clone());
+    }
+    // Each by its live layer, with the source it failed on: one the user removed, or opened
+    // afresh meanwhile (`SourceLayer::same_opening`), is left as it is.
+    let failed: Vec<_> = maps
+        .iter()
+        .flat_map(|m| &m.layers)
+        .filter_map(|l| {
+            let src = l.source.as_ref()?;
+            Some((l.instance_id(), l.name.clone(), src.error.clone()?, src.clone()))
+        })
+        .collect();
+    let answer = written.as_ref().map_or(Value::Null, Value::clone);
+    let then: Then = Box::new(move |s: &mut Session, _: &mut Value| {
+        use rustgis_data::diagnostics::Severity;
+        for (severity, text) in notices {
+            match severity {
+                Severity::Error => s.notify(text, true),
+                Severity::Warning => s.warn(text),
+                Severity::Info => s.notify(text, false),
+            }
+        }
+        let mut missing = Vec::new();
+        for (instance, name, error, copied) in failed {
+            let live = s.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()).find(|l| l.instance_id() == instance);
+            match live.and_then(|l| l.source.as_mut()) {
+                // The same open: its failure shows on the layer (it may already).
+                Some(src) if src.same_opening(&copied) => {
+                    src.error.get_or_insert(error);
+                }
+                _ => missing.push((name, error)),
+            }
+        }
+        // One notice for them all, with a count, naming the first.
+        if let Some((name, error)) = missing.first() {
+            let n = missing.len();
+            s.warn(if n == 1 {
+                format!("{path}: {name} isn't in the file, as its source couldn't be read: {error}")
+            } else {
+                format!("{path}: {n} layers aren't in the file, as their sources couldn't be read; the first, {name}: {error}")
+            });
+        }
+        written?;
+        s.notify(format!("Exported {path}"), false);
+        Ok(())
+    });
+    Ok(Wrote {
+        answer,
+        notes: Vec::new(),
+        then: Some(then),
+        #[cfg(not(target_arch = "wasm32"))]
+        owner: None,
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -90,17 +163,36 @@ fn said(s: &mut Session, wrote: Wrote) -> Value {
 pub struct ExportRun {
     /// What the export is called, for its progress and a cancelled run's error.
     pub name: &'static str,
+    started: Started,
     work: Work,
-    owner: crate::policy::Continuation,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The command an export started on another thread runs, with what and when: [`export_land`]
+/// says what it wrote as that command, and puts it in the session's log as `Session::run` does.
+#[derive(Clone)]
+pub struct Started {
+    pub(crate) command: &'static str,
+    pub(crate) params: Value,
+    pub(crate) at: u64,
+    pub(crate) start: web_time::Instant,
+    /// The admitted invocation; cloned metadata never selects replacement authority.
+    pub(crate) owner: crate::policy::Continuation,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ExportRun {
+    /// What [`export_land`] needs of it once it has run.
+    pub fn started(&self) -> Started {
+        self.started.clone()
+    }
+
     /// Writes the file, blocking until it's written; `control` stops it and counts its progress
     /// (see [`rustgis_analysis::control`]). A cancelled export leaves no file, or the one there
     /// before.
     pub fn run(self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> Result<Wrote, String> {
-        let ExportRun { name, work, owner } = self;
+        let ExportRun { name, work, started } = self;
+        let owner = started.owner;
         owner.check()?;
         let current = owner.clone();
         let still = std::sync::Arc::new(move || current.check().is_ok());
@@ -131,15 +223,41 @@ pub(crate) fn export_start_raw(s: &mut Session, op: crate::policy::Authorized<cr
     owner.check()?;
     let current = owner.clone();
     let still = std::sync::Arc::new(move || current.check().is_ok());
+    let started = Started { command, params: p.clone(), at: crate::project_log::now_ms(), start: web_time::Instant::now(), owner };
     let work = crate::render::rustgis_tiles::cache::with_still(still, || start(s, p))?;
-    Ok(ExportRun { name, work, owner })
+    Ok(ExportRun { name, started, work })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// Says what [`ExportRun::run`] wrote, as its command would have, and gives its answer.
-pub fn export_land(s: &mut Session, mut wrote: Wrote) -> CmdResult {
-    let owner = wrote.owner.take().ok_or("the export has no initiating authority")?;
-    s.finish_export(&owner, |s| said(s, wrote))
+/// Says what [`ExportRun::run`] wrote (or why it failed), as its command would have, and gives
+/// its answer: the troubleshooting history files what it says (its failure too) under that
+/// command, and the session's log has its entry, as when it runs here.
+pub fn export_land(s: &mut Session, started: Started, done: Result<Wrote, String>) -> CmdResult {
+    let Started { command, params, at, start, owner } = started;
+    let before = s.diagnostic_source.replace(command);
+    let mark = s.notice_mark();
+    let landed: CmdResult = (|| {
+        if let Ok(wrote) = &done {
+            let completed = wrote.owner.as_ref().ok_or("the export has no initiating authority")?;
+            if !owner.same_run(completed) {
+                return Err("this export result belongs to another run".into());
+            }
+        }
+        s.finish_export(&owner, |s| done.and_then(|wrote| said(s, wrote)))?
+    })();
+    // Its failure said once, under the command, as `Session::run` says one.
+    if let Err(e) = &landed {
+        let text = Session::redacted(e);
+        if !s.notices_since(mark).iter().any(|n| n.error && n.text == text.as_str()) {
+            s.notify_redacted(text, true);
+        }
+    }
+    s.diagnostic_source = before;
+    if s.log.on() && crate::project_log::is_logged(s, command, &params) {
+        let entry = crate::project_log::entry(command, crate::project_log::kept_params(&params), &landed, at, start.elapsed());
+        s.log.push(entry);
+    }
+    landed
 }
 
 #[cfg(test)]
@@ -155,7 +273,13 @@ mod tests {
         // The work places its file, then Cancel comes before the run returns.
         let work: Work = Box::new(move || {
             late.cancel();
-            Ok(Wrote { answer: serde_json::json!({"path": "x"}), notes: vec!["Exported x".into()], then: None, owner: None })
+            Ok(Wrote {
+                answer: serde_json::json!({"path": "x"}),
+                notes: vec!["Exported x".into()],
+                then: None,
+                #[cfg(not(target_arch = "wasm32"))]
+                owner: None,
+            })
         });
         let wrote = written_under("Export Raster", &control, work).unwrap();
         assert_eq!(wrote.notes, ["Exported x"]);

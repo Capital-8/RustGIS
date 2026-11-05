@@ -356,17 +356,24 @@ fn permission_policy_export_worker_keeps_its_initiating_owner() {
     assert!(!path("revoked.geojson").exists());
     live.0.store(true, Ordering::SeqCst);
     let run = s.with_scope(scope, |s| export_start(s, "share.exportLayer", &params("completed.geojson"))).unwrap().unwrap();
-    let wrote = run.run(&Control::new()).unwrap();
+    let started = run.started();
+    let wrote = run.run(&Control::new());
     s.run("project.new", &Value::Null).unwrap();
-    assert!(export_land(&mut s, wrote).unwrap_err().contains("replaced project"));
+    assert!(export_land(&mut s, started, wrote).unwrap_err().contains("replaced project"));
     assert!(path("completed.geojson").exists(), "a completed write is not undone");
     s.run("project.sample", &Value::Null).unwrap();
     let run = export_start(&mut s, "share.exportLayer", &params("native.geojson")).unwrap();
+    let started = run.started();
     s.run("map.new", &json!({"name":"Other"})).unwrap();
-    let wrote = run.run(&Control::new()).unwrap();
+    let wrote = run.run(&Control::new());
     let count = s.map().layers.len();
-    assert_eq!(export_land(&mut s, wrote).unwrap()["path"], json!(path("native.geojson")));
+    assert_eq!(export_land(&mut s, started, wrote).unwrap()["path"], json!(path("native.geojson")));
     assert_eq!(s.map().layers.len(), count);
+    // A completion cannot borrow another invocation's command/log envelope.
+    s.run("map.activate", &json!({"name":s.project.maps[0].name.clone()})).unwrap();
+    let a = export_start(&mut s, "share.exportLayer", &params("owner-a.geojson")).unwrap();
+    let b = export_start(&mut s, "share.exportLayer", &params("owner-b.geojson")).unwrap();
+    assert!(export_land(&mut s, b.started(), a.run(&Control::new())).unwrap_err().contains("another run"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1138,4 +1145,96 @@ fn permission_policy_web_accounts_ignore_other_sessions_and_revoke_owned_sends()
     assert!(!still(), "the actual send predicate sees this owner's logout");
     assert!(!s.download_landed(claim, b"late".to_vec()));
     assert!(s.map().layers.is_empty());
+}
+
+/// Both export owners refer to the original map, even when another map is active.
+fn map_export_session() -> Session {
+    let mut s = Session::new(Project::default());
+    let map = s.map().name.clone();
+    s.run("layout.new", &json!({"name":"Tile consent","template":"blank"})).unwrap();
+    s.run("layout.addFrame", &json!({"map":map})).unwrap();
+    s.run("presentation.new", &json!({"name":"Tile consent"})).unwrap();
+    s.run("presentation.mapPage", &json!({"map":map})).unwrap();
+    s
+}
+
+/// Rendering consent binds private tile addresses, including changes hidden by redaction.
+#[test]
+fn permission_policy_render_exports_bind_raw_tile_sources() {
+    use rustgis_map::{TileKind, TileLayer};
+    for (i, command) in ["layout.export", "presentation.export", "share.exportMap"].into_iter().enumerate() {
+        let mut s = map_export_session();
+        s.map_mut().tiles.push(TileLayer::new(
+            "Reviewed tiles",
+            TileKind::Raster,
+            "https://tiles-r16.invalid/{z}/{x}/{y}.png?token=RGSYNTH_render_one",
+        ));
+        // The unsupported suffix stops the old handler before rendering or writing a file.
+        let call = Call::command(command, json!({"path":"policy-render.unsupported"}));
+        let (scope, _) = assistant(1600 + i as u64);
+        let approved = pending(&s, &scope, &call);
+        assert!(!format!("{:?}", approved.review()).contains("RGSYNTH_render_"));
+        s.map_mut().tiles[0].url = "https://tiles-r16.invalid/{z}/{x}/{y}.png?token=RGSYNTH_render_two".into();
+        let error = s.run_permitted(scope, approved.allow(), &call).unwrap_err();
+        assert!(error.contains("changed"), "{command} admitted a changed tile source: {error}");
+    }
+}
+
+/// Only maps consumed by the exporter contribute network reach; unrelated maps stay local.
+#[test]
+fn permission_policy_render_exports_require_referenced_tile_reach() {
+    use crate::policy::{AgentAccess, Effect};
+    use rustgis_map::{TileKind, TileLayer};
+    struct LocalOnly;
+    impl Revocation for LocalOnly {
+        fn allows(&self, effects: Effects) -> bool {
+            !effects.contains(Effect::Network)
+        }
+    }
+    let scope = Scope::agent(AgentAccess::Allow, false, "render-local-r16", None, Arc::new(LocalOnly));
+    let mut s = map_export_session();
+    s.run("map.duplicate", &json!({"name":"Unused map"})).unwrap();
+    let calls = ["layout.export", "presentation.export"].map(|command| Call::command(command, json!({"path":"policy-render.pdf"})));
+    for call in &calls {
+        assert!(matches!(s.review(&scope, call), Outcome::Allowed), "in-memory maps need no network access");
+    }
+    s.map_mut().tiles.push(TileLayer::new("Unused tiles", TileKind::Raster, "https://unused-r16.invalid/{z}/{x}/{y}.png"));
+    for call in &calls {
+        assert!(matches!(s.review(&scope, call), Outcome::Allowed), "an unreferenced map is not rendered");
+    }
+    let tile = s.map_mut().tiles.pop().unwrap();
+    s.project.maps[0].tiles.push(tile);
+    for call in &calls {
+        assert!(matches!(s.review(&scope, call), Outcome::Refused(_)), "rendering referenced web tiles requires network access");
+    }
+}
+
+/// Advertised bounds are an in-memory zoom; absent archive/COG bounds require source access.
+#[test]
+fn permission_policy_zoom_to_tiles_reads_only_unknown_metadata() {
+    use crate::policy::AgentAccess;
+    use rustgis_map::{TileKind, TileLayer};
+    let refuse = Scope::agent(AgentAccess::Refuse, false, "tile-metadata-refuse-r16", None, Arc::new(Live(AtomicBool::new(true))));
+    let review = Scope::agent(AgentAccess::Review, false, "tile-metadata-review-r16", None, Arc::new(Live(AtomicBool::new(true))));
+    let local = std::env::temp_dir().join("rustgis-policy-r16.mbtiles").display().to_string();
+    for (kind, url) in [
+        (TileKind::PmTiles, "https://metadata-r16.invalid/map.pmtiles?token=RGSYNTH_metadata"),
+        (TileKind::Cog, "https://metadata-r16.invalid/map.tif?token=RGSYNTH_metadata"),
+        (TileKind::MbTiles, local.as_str()),
+    ] {
+        let mut s = Session::new(Project::default());
+        s.map_mut().tiles.push(TileLayer::new("Coverage", kind, url));
+        let call = Call::command("map.zoomToTiles", json!({"index":0}));
+        assert!(matches!(s.review(&refuse, &call), Outcome::Refused(_)), "{kind:?} metadata needs source access");
+        let Outcome::NeedsApproval(approved) = s.review(&review, &call) else { panic!("{kind:?} metadata needs review") };
+        assert!(!format!("{:?}", approved.review()).contains("RGSYNTH_metadata"));
+        s.map_mut().tiles[0].bounds = Some([-12.0, 40.0, 12.0, 60.0]);
+        assert!(matches!(s.review(&refuse, &call), Outcome::Allowed), "stored bounds need no source read");
+        assert_eq!(s.run_scoped(refuse.clone(), &call).unwrap()["bounds"], json!([-12.0, 40.0, 12.0, 60.0]));
+    }
+    let mut s = Session::new(Project::default());
+    s.map_mut().tiles.push(TileLayer::new("No metadata", TileKind::Raster, "https://metadata-r16.invalid/{z}/{x}/{y}.png"));
+    let call = Call::command("map.zoomToTiles", json!({"index":0}));
+    assert!(matches!(s.review(&refuse, &call), Outcome::Allowed), "ordinary XYZ tiles have no metadata read");
+    assert!(s.run_scoped(refuse, &call).unwrap_err().contains("doesn't say what it covers"));
 }

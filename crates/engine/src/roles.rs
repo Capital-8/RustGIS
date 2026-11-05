@@ -150,6 +150,15 @@ fn object(id: &str, value: &Value, depth: usize, config_depth: usize, registered
             match v {
                 Value::String(s) if !s.is_empty() => Some(Value::String(String::new())),
                 Value::Number(_) => Some(Value::String(String::new())),
+                // Unknown structured credentials keep their shape and are reported as unchecked.
+                Value::Object(o) if !o.is_empty() => {
+                    unchecked = true;
+                    None
+                }
+                Value::Array(a) if !a.is_empty() => {
+                    unchecked = true;
+                    None
+                }
                 _ => None,
             }
         } else if role == Some(Role::Dataset) || DATA.contains(&k.as_str()) {

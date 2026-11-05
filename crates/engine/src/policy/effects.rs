@@ -54,6 +54,9 @@ pub(super) fn declared(spec: &CommandSpec, params: &Value) -> Effects {
     if spec.mutates {
         effects = effects.with(Effect::Edits);
     }
+    if spec.id == "map.body" && params.get("basemap").and_then(Value::as_bool) != Some(false) {
+        effects = effects.with(Effect::Network);
+    }
     if spec.id == "cube.open" && crate::cmd::cube_catalog::opens_zarr(params) {
         effects = effects.with(Effect::Files).with(Effect::Network);
     }
@@ -78,6 +81,20 @@ pub(super) fn declared(spec: &CommandSpec, params: &Value) -> Effects {
 /// Adds only source reach of the actual current execution targets, without opening them.
 pub(super) fn command(s: &crate::cmd::InputContext<'_>, spec: &CommandSpec, params: &Value) -> Effects {
     let mut effects = declared(spec, params);
+    if spec.id == "map.zoomToTiles" {
+        effects = effects.union(crate::cmd::tiles::metadata_reach(s, params));
+    }
+    if matches!(spec.id, "layout.export" | "presentation.export" | "share.exportMap")
+        && let Some(select) = spec.inputs
+        && let Ok(inputs) = select(s, params)
+    {
+        // Reuse the export owner's actual frame/page selection, never every project map.
+        for id in inputs.maps {
+            if let Some(map) = s.project.maps.iter().find(|m| m.instance_id() == id) {
+                effects = effects.union(crate::cmd::tiles::render_reach(map));
+            }
+        }
+    }
     if spec.id == "layer.loadAll"
         && let Ok(id) = s.layer_id(params)
         && let Some(layer) = s.map().layer(id)

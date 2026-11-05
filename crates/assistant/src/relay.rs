@@ -775,8 +775,8 @@ impl Relay {
         Ok(Grant { token, file, shared: Arc::downgrade(shared) })
     }
 
-    /// A local agent still has file/network capability, but every gated MCP message waits for
-    /// RustGIS-side approval. Neither --yes nor the global relay checkbox bypasses this queue.
+    /// With automatic approval off, gated MCP messages attached with this grant wait for
+    /// RustGIS-side approval. Neither --yes nor the global relay checkbox widens the grant.
     pub fn grant_reviewed(&self, auto: bool) -> Result<Grant, String> {
         let grant = self.grant(true)?;
         let grants = lock(&self.owner.shared.grants);
@@ -905,7 +905,11 @@ impl Relay {
                     AgentAccess::Refuse
                 };
                 let scope = self.request_scope(&req, mode, None);
-                let call = crate::provider::ToolCall { id: format!("{}/{}", req.id, id), name: "snapshot".into(), args: args.clone() };
+                let call = crate::provider::ToolCall {
+                    id: crate::mcp::request_key(&req.id.to_string(), 0),
+                    name: "snapshot".into(),
+                    args: args.clone(),
+                };
                 let completion = (|| {
                     let engine = crate::tools::policy_call(&call)?.ok_or("missing snapshot adapter")?;
                     let permit = req.plans.iter().position(|(id, _)| id == &call.id).map(|i| req.plans.remove(i).1.allow());
@@ -1466,7 +1470,7 @@ fn approval_plans(s: &Session, line: &str, scope: &Scope, request: &str) -> Opti
     }
     let mut summaries = Vec::new();
     let mut plans = Vec::new();
-    for msg in messages {
+    for (position, msg) in messages.iter().enumerate() {
         if msg.get("method").and_then(Value::as_str) != Some("tools/call") {
             continue;
         }
@@ -1478,7 +1482,7 @@ fn approval_plans(s: &Session, line: &str, scope: &Scope, request: &str) -> Opti
         }
         let Some(params) = msg.get("params").filter(|p| p.is_object()) else { continue };
         let Ok((name, arguments)) = crate::mcp::tool_request(params) else { continue };
-        let call = crate::provider::ToolCall { id: format!("{request}/{id}"), name: name.into(), args: arguments };
+        let call = crate::provider::ToolCall { id: crate::mcp::request_key(request, position), name: name.into(), args: arguments };
         if let Ok(Some(engine)) = crate::tools::policy_call(&call)
             && let Outcome::NeedsApproval(p) = s.review(scope, &engine)
         {
@@ -1666,6 +1670,21 @@ mod tests {
         assert_eq!(relay.poll(&mut s), 1);
         assert!(rx.recv().unwrap().unwrap().contains("declined"));
         assert!(!batch_path.exists());
+        // Repeated wire ids must not let a read consume the export's approval.
+        let duplicate_path = root.path().join("duplicate-id.png");
+        let (id, rx, _) = queue(json!([
+            {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_layers","arguments":{}}},
+            export(&duplicate_path)
+        ]));
+        assert_eq!(relay.poll(&mut s), 0);
+        assert!(!duplicate_path.exists());
+        grant.decide(id, true);
+        assert_eq!(relay.poll(&mut s), 1);
+        let reply: Value = serde_json::from_str(&rx.recv().unwrap().unwrap()).unwrap();
+        let replies = reply.as_array().unwrap();
+        assert_eq!(replies.len(), 2, "{reply}");
+        assert!(replies.iter().all(|r| r["id"] == 1 && r["result"]["isError"] == false), "{reply}");
+        assert!(duplicate_path.exists());
         let expired = root.path().join("expired.png");
         let (id, _, state) = queue(export(&expired));
         assert_eq!(relay.poll(&mut s), 0);

@@ -623,8 +623,9 @@ async fn fetch_bytes(
                     if prepared.signed { None } else { rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::arcgis_auth::with_token(login_url) };
                 // Only the request carries credentials: messages and cache keys keep the original address.
                 let request = arcgis.as_deref().unwrap_or(login_url);
+                let authenticated = prepared.signed || arcgis.is_some() || login.is_some();
                 let err = |e: wasm_bindgen::JsValue| {
-                    if login.is_some() { "the browser couldn't process the authenticated request".to_string() } else { format!("{e:?}") }
+                    if authenticated { "the browser couldn't process the authenticated request".to_string() } else { format!("{e:?}") }
                 };
                 let login_header = login.as_ref().and_then(|applied| applied.header.as_ref());
                 let asked = match (range, tail) {
@@ -654,7 +655,7 @@ async fn fetch_bytes(
                     init.set_headers(&headers);
                 }
                 // A signed or authorized request goes only where its credentials are for.
-                if prepared.signed || arcgis.is_some() || login.is_some() {
+                if authenticated {
                     init.set_redirect(web_sys::RequestRedirect::Error);
                 }
                 // A credential-bearing address goes nowhere else: no referrer from it, no cookies with it.
@@ -662,7 +663,7 @@ async fn fetch_bytes(
                     init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
                     init.set_credentials(web_sys::RequestCredentials::Omit);
                 }
-                Ok((window, request.to_string(), init, abort, range, tail, max, prepared.url, bound.to_string(), login.is_some()))
+                Ok((window, request.to_string(), init, abort, range, tail, max, prepared.url, bound.to_string(), authenticated))
             },
             |(window, request, init, abort, range, tail, max, url, bound, authenticated)| {
                 (window.fetch_with_str_and_init(&request, &init), abort, range, tail, max, url, bound, authenticated)

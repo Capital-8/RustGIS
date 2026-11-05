@@ -324,6 +324,8 @@ fn append_percent_encoded(result: &mut String, value: &str) {
 /// Redacts active raw credentials, percent-encoded credentials (with either hex case), and
 /// the bare Base64 payload of Basic credentials. Matching the original input in one pass
 /// prevents overlapping values or a credential resembling `[redacted]` from leaking secrets.
+/// Matching covers every active login in this process; short passwords can replace ordinary
+/// text in another session's output. Revoked credentials are not retained for redaction.
 pub fn scrub(text: &str) -> String {
     let entries = entries();
     let mut patterns: Vec<_> = entries.values().flat_map(|entry| &entry.redactions).collect();

@@ -5,6 +5,9 @@ use crate::{Project, Session, sample};
 #[path = "tests/permission_policy.rs"]
 mod permission_policy;
 
+#[path = "tests/review_boundaries.rs"]
+mod review_boundaries;
+
 #[path = "tests/task_reentry.rs"]
 mod task_reentry;
 
@@ -5833,17 +5836,56 @@ fn layout_surrounds_take_cartographic_options() {
     ));
     s.run("layout.update", &json!({"element": bar, "divisions": "2"})).unwrap();
     assert!(matches!(find(&s, "scaleBar").kind, ElementKind::ScaleBar { units: ScaleUnits::Miles, divisions: 2, .. }));
-    for bad in [json!({"units": "parsecs"}), json!({"divisions": "many"}), json!({"style": "zigzag"})] {
+    // Its colours: the lines and labels, and the alternating bar's light divisions; one given
+    // leaves the other as it was.
+    assert!(matches!(
+        find(&s, "scaleBar").kind,
+        ElementKind::ScaleBar { color, fill, .. } if color == Rgba::rgb(0x22, 0x22, 0x22) && fill == Rgba::rgb(0xFF, 0xFF, 0xFF)
+    ));
+    s.run("layout.update", &json!({"element": bar, "color": "#1F4E79"})).unwrap();
+    s.run("layout.update", &json!({"element": bar, "fill": "#00000080"})).unwrap();
+    assert!(matches!(find(&s, "scaleBar").kind, ElementKind::ScaleBar { fill, .. } if fill == Rgba::new(0, 0, 0, 0x80)));
+    s.run("layout.update", &json!({"element": bar, "fill": "#FDE68A"})).unwrap();
+    assert!(matches!(
+        find(&s, "scaleBar").kind,
+        ElementKind::ScaleBar { color, fill, divisions: 2, .. }
+            if color == Rgba::rgb(0x1F, 0x4E, 0x79) && fill == Rgba::rgb(0xFD, 0xE6, 0x8A)
+    ));
+    let bad = [
+        json!({"units": "parsecs"}),
+        json!({"divisions": "many"}),
+        json!({"style": "zigzag"}),
+        json!({"color": "red"}),
+        json!({"fill": "#12"}),
+        json!({"fill": 5}),
+        json!({"color": [255, 0, 0]}),
+    ];
+    for bad in bad {
         let mut p = bad.clone();
         p["element"] = json!(bar);
         assert!(s.run("layout.update", &p).is_err(), "{bad}");
     }
-    let added = s.run("layout.addElement", &json!({"kind": "scaleBar", "units": "feet", "style": "line"})).unwrap()["element"]
-        .as_u64()
-        .unwrap() as u32;
+    // A text's colour is refused as anything but text, when updated as when added; null keeps it.
+    let text = s.run("layout.addElement", &json!({"kind": "text", "text": "T", "color": "#1F4E79"})).unwrap();
+    let text = text["element"].as_u64().unwrap() as u32;
+    let text_color = |s: &Session| match &s.project.layouts[0].element(text).unwrap().kind {
+        ElementKind::Text { color, .. } => *color,
+        _ => panic!("a text"),
+    };
+    for bad in [json!(5), json!([255, 0, 0]), json!(true)] {
+        assert!(s.run("layout.addElement", &json!({"kind": "text", "text": "U", "color": bad})).is_err(), "{bad}");
+        assert!(s.run("layout.update", &json!({"element": text, "color": bad})).is_err(), "{bad}");
+    }
+    s.run("layout.update", &json!({"element": text, "color": null, "text": "V"})).unwrap();
+    assert_eq!(text_color(&s), Rgba::rgb(0x1F, 0x4E, 0x79));
+    s.run("layout.update", &json!({"element": text, "color": "#B91C1C"})).unwrap();
+    assert_eq!(text_color(&s), Rgba::rgb(0xB9, 0x1C, 0x1C));
+    let added = s.run("layout.addElement", &json!({"kind": "scaleBar", "units": "feet", "style": "line", "color": "#B91C1C"})).unwrap();
+    let added = added["element"].as_u64().unwrap() as u32;
     assert!(matches!(
         s.project.layouts[0].element(added).unwrap().kind,
-        ElementKind::ScaleBar { units: ScaleUnits::Feet, divisions: 4, style: ScaleBarStyle::Line, .. }
+        ElementKind::ScaleBar { units: ScaleUnits::Feet, divisions: 4, style: ScaleBarStyle::Line, color, fill, .. }
+            if color == Rgba::rgb(0xB9, 0x1C, 0x1C) && fill == Rgba::rgb(0xFF, 0xFF, 0xFF)
     ));
     // The page draws with them all, and they survive a save.
     let out = std::env::temp_dir().join(format!("rustgis-surrounds-{}.png", std::process::id()));
@@ -17589,6 +17631,7 @@ fn layer_address_redaction_preserves_templates_and_local_paths() {
         ("/tmp/data?key=not-a-web-secret", "/tmp/data?key=not-a-web-secret"),
         ("upload:map?token=local", "upload:map?token=local"),
         ("postgres:host=localhost dbname=gis", "postgres:host=localhost dbname=gis"),
+        ("postgresql://user@host.invalid/db%40tag", "postgresql://user@host.invalid/db%40tag"),
     ];
     for (original, expected) in cases {
         let address = match crate::durable::public_address(original) {
@@ -17598,6 +17641,14 @@ fn layer_address_redaction_preserves_templates_and_local_paths() {
         };
         assert_eq!(address, expected);
     }
+    let original = "postgresql://user:p@ss/word@host.invalid/db";
+    let mut s = world();
+    s.map_mut().layers[0].dataset.source = Some(original.into());
+    let (text, report) = s.project.saved_text(None).unwrap();
+    let saved: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(saved["maps"][0]["layers"][0]["dataset"]["source"], "postgresql:");
+    assert_eq!(report.withheld, 1, "ambiguous connection output is counted instead of retargeted");
+    assert_eq!(s.map().layers[0].dataset.source.as_deref(), Some(original), "the live connection is unchanged");
     let prefix = crate::render::rustgis_tiles::s3::ANONYMOUS;
     let crate::durable::Kept::Changed(anonymous) =
         crate::durable::public_address(&format!("{prefix}https://bucket.example/a?token=secret"))
@@ -28417,6 +28468,11 @@ fn raster_tools_run_on_another_thread() {
 #[test]
 fn exports_run_on_another_thread() {
     use crate::cmd::exports::{export_land, export_start, runs_in_background};
+    // A path as it appears in JSON, as `PATH`: on Windows its backslashes are escaped there.
+    let unpathed_json = |v: &Value, path: &str| {
+        let escaped = json!(path).to_string();
+        v.to_string().replace(escaped.trim_matches('"'), "PATH")
+    };
     use rustgis_analysis::control::Control;
     let mut s = world();
     s.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": dem_b64()})).unwrap();
@@ -28424,7 +28480,12 @@ fn exports_run_on_another_thread() {
     let dir = std::env::temp_dir().join(format!("rustgis-exports-thread-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let at = |name: &str| dir.join(name).display().to_string();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
     for (command, file, p) in [
+        ("share.exportMap", "map.png", json!({"width": 64, "height": 48})),
+        ("layout.export", "layout.png", json!({"dpi": 48})),
+        ("layout.export", "layout.pdf", json!({"dpi": 48})),
+        ("layout.export", "layout.svg", json!({"dpi": 48})),
         ("share.exportLayer", "countries.geojson", json!({"layer": "Countries"})),
         ("share.exportLayer", "countries.shp", json!({"layer": "Countries"})),
         ("share.exportLayer", "countries.gpkg", json!({"layer": "Countries", "crs": "EPSG:3857"})),
@@ -28444,11 +28505,19 @@ fn exports_run_on_another_thread() {
         let mark = s.notice_mark();
         let answer_here = s.run(command, &with(&here)).unwrap();
         let said_here = said(&s, mark, &here);
+        let logged = |s: &Session| s.log.entries().last().map(|e| (e.command.clone(), e.params.clone(), e.ok));
+        let logged_here = logged(&s);
+        assert!(logged_here.as_ref().is_some_and(|(c, ..)| c == command), "{command}: logged where it's called");
         let run = export_start(&mut s, command, &with(&there)).unwrap();
-        let mark = s.notice_mark();
-        let wrote = std::thread::spawn(move || run.run(&Control::new())).join().unwrap().unwrap();
+        let (mark, started) = (s.notice_mark(), run.started());
+        let wrote = std::thread::spawn(move || run.run(&Control::new())).join().unwrap();
         assert!(s.notices_since(mark).is_empty(), "{command}: nothing is said before it lands");
-        let answer_there = export_land(&mut s, wrote).unwrap();
+        let answer_there = export_land(&mut s, started, wrote).unwrap();
+        // The session's log has it as it has the export run here.
+        let there_params = logged(&s).map(|(c, p, ok)| (c, unpathed_json(&p, &there), ok));
+        assert_eq!(there_params, logged_here.map(|(c, p, ok)| (c, unpathed_json(&p, &here), ok)), "{command} {file}");
+        let filed = s.diagnostics.records().last().map(|r| r.source.clone());
+        assert_eq!(filed.as_deref(), Some(command), "the history files what it said under the command");
         assert_eq!(said(&s, mark, &there), said_here, "{command} {file}");
         // The path as it appears in JSON: on Windows its backslashes are escaped there.
         let unpathed = |v: &Value, path: &str| {
@@ -28473,8 +28542,77 @@ fn exports_run_on_another_thread() {
     assert!(export_start(&mut s, "share.exportLayer", &json!({"layer": "nowhere", "path": at("x.geojson")})).is_err());
     assert!(export_start(&mut s, "share.exportLayer", &json!({"layer": "Countries", "path": at("x.gpkg"), "crs": "EPSG:nope"})).is_err());
     assert!(export_start(&mut s, "share.exportRaster", &json!({"layer": dem, "path": at("x.tif"), "band": 99})).is_err());
-    // Map and layout exports draw the map: they still run where they're called.
-    assert!(runs_in_background("share.exportMap").is_none() && runs_in_background("layout.export").is_none());
+    assert!(export_start(&mut s, "layout.export", &json!({"path": at("x.jpg")})).is_err(), "a format it can't write");
+    // Map and layout exports draw a copy of what was there when they started: moving the map or
+    // removing the layout meanwhile changes nothing in the file.
+    let (here, there) = (at("still_here.png"), at("still_there.png"));
+    s.run("share.exportMap", &json!({"path": here, "width": 64, "height": 48})).unwrap();
+    let run = export_start(&mut s, "share.exportMap", &json!({"path": there, "width": 64, "height": 48})).unwrap();
+    s.map_mut().camera.res *= 4.0;
+    run.run(&Control::new()).unwrap();
+    assert_eq!(std::fs::read(&there).unwrap(), std::fs::read(&here).unwrap());
+    let (here, there) = (at("still_here.svg"), at("still_there.svg"));
+    s.map_mut().camera.res /= 4.0;
+    s.run("layout.export", &json!({"path": here, "dpi": 48})).unwrap();
+    let run = export_start(&mut s, "layout.export", &json!({"path": there, "dpi": 48})).unwrap();
+    let layouts = std::mem::take(&mut s.project.layouts);
+    run.run(&Control::new()).unwrap();
+    assert_eq!(std::fs::read(&there).unwrap(), std::fs::read(&here).unwrap());
+    s.project.layouts = layouts;
+    // A layout export that fails says why when it lands, as it does here.
+    let nowhere = dir.join("no").join("such.png").display().to_string();
+    let here = s.run("layout.export", &json!({"path": nowhere, "dpi": 48})).unwrap_err();
+    let run = export_start(&mut s, "layout.export", &json!({"path": nowhere, "dpi": 48})).unwrap();
+    let started = run.started();
+    let mark = s.notice_mark();
+    assert_eq!(export_land(&mut s, started, run.run(&Control::new())).unwrap_err(), here);
+    let errors: Vec<_> = s.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
+    assert_eq!(errors, std::slice::from_ref(&here), "its failure is said once");
+    let filed = s.diagnostics.records().last().map(|r| (r.source.clone(), r.severity));
+    assert_eq!(filed, Some(("layout.export".to_string(), rustgis_data::diagnostics::Severity::Error)), "under the command");
+    assert!(s.log.entries().last().is_some_and(|e| e.command == "layout.export" && !e.ok), "a failed one is logged as failed");
+    // A streamed layer's source that failed on the copy is marked on its live layer, unless that
+    // was opened from somewhere else meanwhile.
+    let li = s.map().layers.iter().position(|l| l.name == "Countries").unwrap();
+    let mut src = rustgis_map::source::SourceLayer::default();
+    src.path = Some("gone.fgb".into());
+    s.map_mut().layers[li].source = Some(src.clone());
+    let mut copy = s.map().detached();
+    let mut failed = src.clone();
+    failed.error = Some("gone.fgb: not found".into());
+    copy.layers[li].source = Some(failed);
+    let land = |s: &mut Session, copy: &rustgis_map::Map| {
+        let mut wrote = crate::cmd::exports::drawn(std::slice::from_ref(copy), Vec::new(), Ok(json!({})), at("drawn.png")).unwrap();
+        let started = export_start(s, "share.exportMap", &json!({"path": at("drawn.png")})).unwrap().started();
+        // This fixture supplies a drawn result directly, using the actual admitted run's owner.
+        wrote.owner = Some(started.owner.clone());
+        export_land(s, started, Ok(wrote)).unwrap();
+        s.map().layers[li].source.as_ref().and_then(|src| src.error.clone())
+    };
+    assert_eq!(land(&mut s, &copy).as_deref(), Some("gone.fgb: not found"));
+    s.map_mut().layers[li].source.as_mut().unwrap().error = None;
+    s.map_mut().layers[li].source.as_mut().unwrap().path = Some("found.fgb".into());
+    let mark = s.notice_mark();
+    assert_eq!(land(&mut s, &copy), None, "a source opened afresh keeps its own state");
+    let said = s.notices_since(mark).iter().map(|n| n.text.clone()).collect::<Vec<_>>().join("\n");
+    assert!(said.contains("Countries isn't in the file") && said.contains("gone.fgb: not found"), "and the file's gap is said: {said}");
+    // Opened afresh and failing again: still said, as the file lacks the layer either way.
+    s.map_mut().layers[li].source.as_mut().unwrap().error = Some("found.fgb: not found".into());
+    let mark = s.notice_mark();
+    land(&mut s, &copy);
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("Countries isn't in the file")));
+    // Several left out: one notice, with a count.
+    let mut two = copy.clone();
+    let other = two.layers.iter().position(|l| l.name != "Countries").unwrap();
+    let mut gone = rustgis_map::source::SourceLayer::default();
+    gone.path = Some("gone.fgb".into());
+    gone.error = Some("gone.fgb: not found".into());
+    two.layers[other].source = Some(gone);
+    let mark = s.notice_mark();
+    land(&mut s, &two);
+    let missing: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("in the file")).map(|n| n.text.clone()).collect();
+    assert!(missing.len() == 1 && missing[0].contains("2 layers aren't in the file"), "{missing:?}");
+    s.map_mut().layers[li].source = None;
     let _ = std::fs::remove_dir_all(&dir);
 }
 

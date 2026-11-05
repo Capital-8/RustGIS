@@ -272,8 +272,7 @@ impl Session {
         report.lost = slots(&self.project)
             .into_iter()
             .filter(|slot| {
-                !matches!(slot.key, SlotKey::Video { .. })
-                    && !matches!(durable::public_address(slot.value), Kept::Unchanged)
+                !matches!(durable::public_address(slot.value), Kept::Unchanged)
                     && !incoming.get(&slot.key).is_some_and(|(count, value)| *count == 1 && *value == slot.value)
             })
             .count()

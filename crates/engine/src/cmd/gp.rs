@@ -207,7 +207,7 @@ pub fn external_start(s: &mut Session, tool: &str, params: &Value) -> Result<Ext
     #[cfg(feature = "geolibre")]
     {
         let op = s.authorize_tool(tool, params)?;
-        let continuation = s.tool_continuation(&op);
+        let continuation = s.tool_continuation(&op)?;
         let crate::policy::ToolOp { pin, params } = op.op();
         let spec = pin.spec();
         if pin.resolved().source() != Some(rustgis_geolibre::SOURCE) {
@@ -346,7 +346,7 @@ fn preparing<T>(continuation: &crate::policy::Continuation, f: impl FnOnce() -> 
 /// checked and its layers read now, so that the map can change while it runs.
 pub fn plugin_start(s: &mut Session, tool: &str, params: &Value) -> Result<PluginRun, String> {
     let op = s.authorize_tool(tool, params)?;
-    let continuation = s.tool_continuation(&op);
+    let continuation = s.tool_continuation(&op)?;
     let crate::policy::ToolOp { pin, params: resolved } = op.op();
     let spec = pin.spec();
     let plugin = pin.plugin().ok_or_else(|| format!("no plugin tool '{tool}'"))?;
@@ -539,7 +539,7 @@ impl ToolRun {
 /// [`plugin_start`].
 pub fn tool_start(s: &mut Session, tool: &str, params: &Value) -> Result<ToolRun, String> {
     let op = s.authorize_tool(tool, params)?;
-    let continuation = s.tool_continuation(&op);
+    let continuation = s.tool_continuation(&op)?;
     let crate::policy::ToolOp { pin, params: resolved } = op.op();
     let pin = pin.clone();
     let resolved = resolved.clone();
@@ -1092,7 +1092,7 @@ fn buffer_point(s: &mut Session, p: &Value) -> CmdResult {
     }
     let t0 = now_ms();
     let op = s.point_tool(&params)?;
-    let c = s.tool_continuation(&op);
+    let c = s.tool_continuation(&op)?;
     s.check_continuation(&c)?;
     let tool = op.op();
     let res = tool.pin.run(&PointInput(ds), &tool.params, &rustgis_analysis::control::Control::new(), &|| c.check());
@@ -1154,7 +1154,7 @@ pub(crate) fn execute(
             0,
         );
     }
-    let continuation = s.tool_continuation(&op);
+    let continuation = s.tool_continuation(&op)?;
     let inputs = map_inputs(s, Some(spec), params)?;
     let mut res = if let Some(plugin) = pin.plugin() {
         let (_, tool) = rustgis_plugins::split_id(spec.id).ok_or("invalid plugin tool id")?;

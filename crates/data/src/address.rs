@@ -330,7 +330,7 @@ pub fn public_web_address(address: &str) -> Public {
     if public == address { Public::Unchanged } else { Public::Changed { address: public, removed } }
 }
 
-/// Cleans address words in generated text and counts changed words. All spacing and all other
+/// Cleans addresses in generated text and counts changed addresses. All spacing and all other
 /// text stay byte-for-byte. Never apply this to user-authored text or dataset values.
 pub fn scrub_addresses(text: &str) -> (Cow<'_, str>, u32) {
     let mut changed = 0u32;
@@ -341,33 +341,38 @@ pub fn scrub_addresses(text: &str) -> (Cow<'_, str>, u32) {
         // Recognize supported prefixes before parsing: malformed delimiters must not turn a
         // recognized address into retained text. The preceding scheme characters establish the
         // same word boundary for a bare address, a quoted one and an address inside a wrapper.
-        let Some((begin, scheme_at)) = unspaced.match_indices(':').find_map(|(at, _)| {
-            let begin = unspaced
-                .get(..at)?
-                .char_indices()
-                .rev()
-                .find(|(_, c)| !c.is_ascii_alphanumeric() && !"+.-".contains(*c))
-                .map_or(0, |(i, c)| i + c.len_utf8());
-            let scheme = unspaced.get(begin..at)?;
-            ["http", "https", "s3"].iter().any(|s| scheme.eq_ignore_ascii_case(s)).then_some((begin, at))
-        }) else {
-            if changed > 0 {
-                out.push_str(word);
+        let mut schemes = unspaced
+            .match_indices(':')
+            .filter_map(|(at, _)| {
+                let begin = unspaced
+                    .get(..at)?
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| !c.is_ascii_alphanumeric() && !"+.-".contains(*c))
+                    .map_or(0, |(i, c)| i + c.len_utf8());
+                let scheme = unspaced.get(begin..at)?;
+                ["http", "https", "s3"].iter().any(|s| scheme.eq_ignore_ascii_case(s)).then_some((begin, at))
+            })
+            .peekable();
+        let mut copied = 0;
+        while let Some((begin, scheme_at)) = schemes.next() {
+            let boundary = schemes.peek().map_or(unspaced.len(), |(begin, _)| *begin);
+            let end = unspaced
+                .get(..boundary)
+                .unwrap_or("")
+                .trim_end_matches([':', ',', ';', '.', ')', ']', '>', '"', '\'', '»', '›', '”', '’'])
+                .len()
+                .max(scheme_at + 1);
+            let address = word.get(begin..end).unwrap_or("");
+            let public = public_web_address(address);
+            if matches!(public, Public::Unchanged) {
+                continue;
             }
-            start += word.len();
-            continue;
-        };
-        let end = unspaced.trim_end_matches([':', ',', ';', '.', ')', ']', '>', '"', '\'', '»', '›', '”', '’']).len().max(scheme_at + 1);
-        let address = word.get(begin..end).unwrap_or("");
-        let public = public_web_address(address);
-        if !matches!(public, Public::Unchanged) {
             if changed == 0 {
                 out.push_str(text.get(..start).unwrap_or(""));
             }
             changed = changed.saturating_add(1);
-        }
-        if changed > 0 {
-            out.push_str(word.get(..begin).unwrap_or(""));
+            out.push_str(word.get(copied..begin).unwrap_or(""));
             match public {
                 Public::Unchanged => out.push_str(address),
                 Public::Changed { address, .. } => out.push_str(&address),
@@ -376,7 +381,10 @@ pub fn scrub_addresses(text: &str) -> (Cow<'_, str>, u32) {
                     out.push(':');
                 }
             }
-            out.push_str(word.get(end..).unwrap_or(""));
+            copied = end;
+        }
+        if changed > 0 {
+            out.push_str(word.get(copied..).unwrap_or(""));
         }
         start += word.len();
     }
@@ -604,6 +612,30 @@ mod tests {
             public_web_address("https://u:RGSYNTH_malformed_20261103/part@h.invalid/a"),
             Public::Changed { address: "https://h.invalid/a".into(), removed: 1 }
         );
+    }
+
+    #[test]
+    fn generated_text_scrubs_every_adjacent_address() {
+        for (text, expected, count) in [
+            (
+                "read https://a.invalid/a?layer=roads,https://b.invalid/b?token=demo",
+                "read https://a.invalid/a?layer=roads,https://b.invalid/b",
+                1,
+            ),
+            ("([http://a.invalid/a,https://u:demo@b.invalid/b]),", "([http://a.invalid/a,https://b.invalid/b]),", 1),
+            ("https://a.invalid/a?token=demo;S3://bucket/b?password=demo", "https://a.invalid/a;S3://bucket/b", 2),
+            (
+                "\t(https://a.invalid/a?layer=roads,https://b.invalid/b?layer=plots),\n",
+                "\t(https://a.invalid/a?layer=roads,https://b.invalid/b?layer=plots),\n",
+                0,
+            ),
+        ] {
+            let (public, changed) = scrub_addresses(text);
+            assert_eq!((public.as_ref(), changed), (expected, count), "{text}");
+            if count == 0 {
+                assert!(matches!(public, Cow::Borrowed(_)), "clean adjacent addresses need no rewrite");
+            }
+        }
     }
 
     #[test]

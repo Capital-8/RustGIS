@@ -48,7 +48,7 @@ impl Report {
             (self.withheld, "credential-bearing slot(s) could not be read and were withheld"),
             (self.unchecked, "step(s) contain opaque parameters that may hold credentials and were kept unchecked"),
             (self.not_retained, "address(es) exceeded the bridge retention limit; their keys will not survive a round trip"),
-            (self.lost, "layer address(es) lost their keys when a peer sent back its project; add them again in the receiving session"),
+            (self.lost, "address(es) lost their keys when a peer sent back its project; add them again in the receiving session"),
         ] {
             if n > 0 {
                 out.push(format!("{n} {text}"));

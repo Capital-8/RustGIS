@@ -280,7 +280,7 @@ fetch the USGS stream gauges in Texas and add them to the map."
   the agent and its inputs. It also selects the agent's own full-access mode where available.
 - **Its work is kept.** Each task gets a folder in `Documents/RustGIS/Agent work`, and what the
   agent adds to the map comes from there. The assistant's reply names the folder.
-- **On the map, it has its thread's permission only.** It reaches the map through the MCP relay
+- **Its relay token carries its thread's permission.** It reaches the map through the MCP relay
   with a token of its own, which RustGIS revokes when the thread ends. **Stop** in its window, or
   **×** in the list, revokes its token immediately and terminates its live process tree on a
   background thread. A reaped leader's old process ID is never signalled.

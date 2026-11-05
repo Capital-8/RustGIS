@@ -928,6 +928,12 @@ impl Project {
         Ok((text, report))
     }
 
+    /// The recovery text alone, without its counted loss report.
+    /// Recovery stores should use [`Self::recovery_text_with_report`] to retain its notices.
+    pub fn recovery_text(self) -> Result<String, String> {
+        self.recovery_text_with_report().map(|(text, _)| text)
+    }
+
     /// The project as an autosaved recovery copy keeps it: its text without passwords, keys, tokens
     /// or signatures in layer addresses, from a copy of the project (autosave writes it off the
     /// interface thread). Unlike [`Self::saved_text`], local file paths stay as the open project
@@ -935,14 +941,14 @@ impl Project {
     /// not from the project's folder. Nor is it remembered as a file this process wrote, so
     /// frequent copies can't push the user's own saves out of the snapshots that restore secrets.
     /// Runtime import reservations are omitted while completed work remains recoverable.
-    /// Text too large to open again is refused.
-    pub fn recovery_text(mut self) -> Result<String, String> {
+    /// Text too large to open again is refused. Returns the text and its counted output notices.
+    pub fn recovery_text_with_report(mut self) -> Result<(String, crate::durable::Report), String> {
         self.omit_pending_imports();
-        let (text, _) = crate::durable::output_owned(self, project_text)?;
+        let (text, report) = crate::durable::output_owned(self, project_text)?;
         if text.len() as u64 > MAX_BYTES {
             return Err("the project is too large to keep a recovery copy".into());
         }
-        Ok(text)
+        Ok((text, report))
     }
 
     /// Writes checked durable text atomically and returns counted losses from the guarded output.

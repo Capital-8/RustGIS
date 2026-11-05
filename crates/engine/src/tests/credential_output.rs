@@ -130,6 +130,46 @@ fn durable_clean_and_opaque_content_keep_their_meaning() {
     let params = json!({"nested": {"token": SECRET}});
     let (clean, report) = crate::roles::command("plugin.unknown", &params, 0);
     assert!(clean.is_none() && report.unchecked == 1);
+    for command in ["layer.addUrl", "plugin.unknown"] {
+        for (token, unchecked) in [
+            (json!({"value": SECRET}), true),
+            (json!([SECRET]), true),
+            (json!({}), false),
+            (json!([]), false),
+            (json!(false), false),
+            (Value::Null, false),
+        ] {
+            let params = json!({"token": token});
+            let mut project = Project::default();
+            project.tasks.push(Task {
+                name: "Opaque credential value".into(),
+                description: String::new(),
+                steps: vec![TaskStep {
+                    title: String::new(),
+                    instructions: String::new(),
+                    command: command.into(),
+                    params: params.clone(),
+                }],
+            });
+            let before = serde_json::to_value(&project).unwrap();
+            let (text, report) = project.saved_text(None).unwrap();
+            let written: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(written["tasks"][0]["steps"][0]["params"], params, "{command}: opaque values keep their meaning");
+            assert_eq!(serde_json::to_value(&project).unwrap(), before, "{command}: output preserves the live project");
+            assert_eq!(report.unchecked, u32::from(unchecked), "{command}: {params}");
+            assert_eq!(report.steps, 0);
+            assert_eq!(report.withheld, 0);
+            let expected = if unchecked {
+                vec!["1 step(s) contain opaque parameters that may hold credentials and were kept unchecked".to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(report.notices(), expected, "{command}: {params}");
+            if unchecked {
+                assert_eq!(crate::log_params(&params).into_log_value(), json!({"token": ""}), "logs withhold the whole value");
+            }
+        }
+    }
     let clean = Project::default();
     let expected = serde_json::to_string(&clean).unwrap();
     let (text, report) = durable::output_owned(clean, |p| serde_json::to_string(p).map_err(|e| e.to_string())).unwrap();
@@ -312,4 +352,77 @@ fn peers_bypass_saved_restore_and_retention_requires_the_current_exact_slot() {
         }
         assert!(s.trusted_tasks.is_empty() && s.trusted_models.is_empty() && s.trusted_notebooks.is_empty());
     }
+}
+
+#[test]
+fn peer_video_credential_losses_are_counted() {
+    let public = "https://h.invalid/video.mp4";
+    let private = format!("{public}?token={SECRET}");
+    for (peer, source, replacement, lost) in [
+        (Peer::Embedder, public, public, 0),
+        (Peer::Embedder, private.as_str(), public, 1),
+        (Peer::Bridge, private.as_str(), public, 0),
+        (Peer::Bridge, private.as_str(), "https://h.invalid/other.mp4", 1),
+    ] {
+        let mut project = Project::default();
+        project.presentations.push(Presentation {
+            name: "Video".into(),
+            pages: vec![Page {
+                title: "Video".into(),
+                kind: PageKind::Video { source: source.into(), poster: None, caption: String::new() },
+                notes: String::new(),
+                seconds: 5.0,
+            }],
+            ..Default::default()
+        });
+        let mut s = Session::new(project);
+        let (text, _) = s.peer_text(peer).unwrap();
+        assert!(!text.contains(SECRET));
+        let report = s.open_peer_text(peer, &text.replace(public, replacement)).unwrap();
+        assert_eq!(report.lost(), lost, "{peer:?}: {source} -> {replacement}");
+        if lost == 0 {
+            assert!(report.notices().is_empty(), "clean or retained video sources lose no credentials");
+        } else {
+            let notices = report.notices();
+            assert_eq!(notices.len(), 1);
+            assert!(notices[0].starts_with("1 ") && notices[0].contains("lost their keys"));
+            assert!(!serde_json::to_string(&s.project).unwrap().contains(SECRET));
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn short_basic_passwords_are_scrubbed_only_from_output_while_active() {
+    if isolate_account_test("tests::credential_output::short_basic_passwords_are_scrubbed_only_from_output_while_active") {
+        return;
+    }
+    use crate::render::rustgis_tiles::logins;
+
+    let owner = Session::new(Project::default());
+    let mut other = Session::new(Project::default());
+    let value = logins::basic("synthetic-user", "a");
+    let origin = "https://short-basic.invalid";
+    let binding = logins::activate(
+        origin,
+        &format!("{}/short-basic", owner.web_logins.session_id()),
+        logins::Method::Header("Authorization".into()),
+        &value,
+        false,
+    )
+    .unwrap();
+    let payload = value.strip_prefix("Basic ").unwrap();
+    assert_eq!(logins::scrub(&format!("echo {value} {payload} a")), "echo [redacted] [redacted] [redacted]");
+    other.notify("alpha", false);
+    assert_eq!(other.notices.last().unwrap().text, "[redacted]lph[redacted]", "active-secret matching covers other sessions' output");
+    other.notify("loop done", false);
+    assert_eq!(other.notices.last().unwrap().text, "loop done", "unmatched output stays intact");
+    let url = format!("{origin}/data");
+    let bound = logins::bind(&binding, &url).unwrap();
+    let request = logins::apply(&bound).unwrap().unwrap();
+    assert_eq!(request.url, url, "output redaction never changes the request URL");
+    assert_eq!(request.header.unwrap().1, value, "the raw credential remains the request input");
+    assert!(logins::deactivate(&binding));
+    other.notify("alpha", false);
+    assert_eq!(other.notices.last().unwrap().text, "alpha", "revocation does not retain the short-password pattern");
 }

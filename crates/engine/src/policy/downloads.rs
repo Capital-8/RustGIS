@@ -72,8 +72,23 @@ impl Session {
     }
     /// Owns the originating continuation in the opaque request and bounds all retained unclaimed requests.
     fn enqueue_url_for(&mut self, p: &Value, import: bool) -> CmdResult {
-        let c = Arc::new(self.continuation()?);
+        let mut c = self.continuation()?;
         self.check_continuation(&c)?;
+        // Only the built-in data reader proves this bounded set. Services, imports and
+        // plugin-initiated discovery retain the full active storage identity.
+        if !import
+            && matches!(&c.node.op, super::plan::Op::Command(spec) if spec.id == "layer.addUrl")
+            && let Some(urls) = crate::cmd::layer::fixed_download_urls(p)
+        {
+            let selected = urls
+                .iter()
+                .map(|url| crate::render::rustgis_tiles::s3::account_identity_for(crate::render::rustgis_tiles::logins::inner(url)))
+                .collect::<Result<Vec<_>, _>>()?;
+            // A concurrent account change cannot become fresh authority during narrowing.
+            self.check_continuation(&c)?;
+            c.s3 = Some(selected);
+        }
+        let c = Arc::new(c);
         self.retire_abandoned_requests();
         let mut params = std::borrow::Cow::Borrowed(p);
         if self.web_logins.is_anonymous() {
@@ -121,6 +136,9 @@ impl Session {
         }
         let q = self.policy.work.queued.get(&request.key).ok_or("this URL request was already claimed or dropped")?;
         let c = q.c.upgrade().ok_or("this URL request was dropped")?;
+        if !Arc::ptr_eq(&request.authority, &c) {
+            return Err("this URL request belongs to another session".into());
+        }
         self.check_delivery(&c)?;
         let import = q.import;
         self.policy.work.queued.remove(&request.key);

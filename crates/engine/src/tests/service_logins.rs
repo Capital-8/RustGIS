@@ -212,6 +212,7 @@ fn an_oversized_ogc_items_binding_is_refused_before_native_fetch() {
     use crate::render::rustgis_tiles::cache;
     let server = LoginFile::new(br#"{"type":"FeatureCollection","features":[]}"#.to_vec());
     let public = LoginFile::new(b"public".to_vec());
+    assert_ne!(server.base, public.base, "the fixtures need different origins");
     let mut s = session(None);
     let id = new(&mut s, json!({"kind":"ogcapi","address":format!("{}/collections",server.base),"auth":"header","keyName":"X-Key"}));
     s.run("connection.login", &json!({"id":id,"apiKey":"fixture-login-757","allowInsecure":true})).unwrap();
@@ -235,8 +236,38 @@ fn an_oversized_ogc_items_binding_is_refused_before_native_fetch() {
     assert!(server.requests.lock().unwrap().is_empty(), "an oversized binding must never fetch anonymously");
     assert!(cache::download_blocking(items("valid")).is_ok());
     assert!(server.requests.lock().unwrap()[0].to_ascii_lowercase().contains("\r\nx-key: fixture-login-757\r\n"));
-    assert!(!rustgis_data::login_address::is_wrapper(items("foreign")));
-    assert_eq!(cache::download_blocking(items("foreign")).unwrap(), b"public");
+    let foreign = items("foreign");
+    assert!(!rustgis_data::login_address::is_wrapper(foreign));
+    assert_eq!(foreign, format!("{}/public?limit=10", public.base));
+    let downloaded = cache::download_blocking(foreign).unwrap_or_else(|_| {
+        // Only request structure is diagnostic: never print headers, targets or error text.
+        let summarize = |request: &String| {
+            let mut words = request.split_whitespace();
+            let method = match words.next() {
+                Some("GET") => "GET",
+                Some("CONNECT") => "CONNECT",
+                Some(_) => "other",
+                None => "missing",
+            };
+            let target = words.next().unwrap_or("");
+            let form = match target {
+                "" => "missing",
+                t if t.starts_with('/') => "origin",
+                t if t.starts_with("http://") || t.starts_with("https://") => "absolute",
+                _ if method == "CONNECT" => "authority",
+                _ => "other",
+            };
+            json!({
+                "bytes": request.len(), "fullHeader": request.contains("\r\n\r\n"),
+                "method": method, "targetForm": form, "publicPrefix": target.starts_with("/public"),
+                "xKeyPresent": request.to_ascii_lowercase().contains("\r\nx-key:"),
+            })
+        };
+        let protected = server.requests.lock().unwrap().iter().map(&summarize).collect::<Vec<_>>();
+        let anonymous = public.requests.lock().unwrap().iter().map(&summarize).collect::<Vec<_>>();
+        panic!("foreign fixture download failed; protected={protected:?}; public={anonymous:?}");
+    });
+    assert_eq!(downloaded, b"public");
     assert!(!public.requests.lock().unwrap()[0].to_ascii_lowercase().contains("\r\nx-key:"));
 }
 

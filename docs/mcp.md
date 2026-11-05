@@ -374,6 +374,10 @@ protocol.
 
 ### Local-agent approvals
 
+These rules govern requests authenticated with the run's token. Local agent programs run with
+your operating-system account and their own tool permissions; a program allowed to read the main
+relay token can use its native-client access described above.
+
 Local agents launched by the assistant use `Relay::grant_reviewed(auto)`, not an unrestricted
 run grant. With automatic approval off, gated tool calls wait in a RustGIS-side queue scoped to
 that grant and exact message, including all tool calls in a batch. `--yes` and the general relay
