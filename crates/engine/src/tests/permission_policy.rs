@@ -260,13 +260,16 @@ fn permission_policy_deferred_url_claim_keeps_owner_and_generation() {
     }
     let (scope, live) = assistant(3);
     let (foreign, _) = assistant(4);
-    let call = Call::command("layer.addUrl", json!({"url":"https://example.invalid/data.geojson"}));
+    let url = "https://example.invalid/data.geojson?token=RGSYNTH_pending";
+    let call = Call::command("layer.addUrl", json!({"url":url}));
     let p = pending(&s, &scope, &call);
-    s.run_permitted(scope.clone(), p.allow(), &call).unwrap();
+    let reported = s.run_permitted(scope.clone(), p.allow(), &call).unwrap();
     let mark = s.notice_mark();
     assert!(s.with_scope(foreign.clone(), |s| s.take_url_requests()).unwrap().is_empty());
     assert!(s.notices_since(mark).is_empty(), "a foreign drain cannot retire the owner's queued request");
     let q = s.take_url_requests().pop().unwrap();
+    assert_eq!(q.params()["url"], url, "opaque transport parameters retain the exact private address");
+    assert!(!reported.to_string().contains("RGSYNTH_pending"), "the public pending response must omit credentials");
     let id = s.download_started_for(&q).unwrap();
     assert!(s.download_started_for(&q).is_err());
     let still = s.download_still(id).unwrap();

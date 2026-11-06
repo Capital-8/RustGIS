@@ -1417,8 +1417,8 @@ impl Session {
             self.follow_style_view();
         }
         if id.starts_with(rustgis_plugins::PREFIX) {
-            self.merge = merge;
             let op = self.authorize(id, params)?;
+            self.merge = merge;
             return self.invoke(op, policy::Txn::Own);
         }
         let Some(&spec) = self.registry.get(id) else { return Err(format!("unknown command '{id}'")) };
@@ -1459,8 +1459,8 @@ impl Session {
             self.notify(e.clone(), true);
             return Err(e);
         }
-        self.merge = merge;
         let op = self.authorize(id, params)?;
+        self.merge = merge;
         let res = self.invoke(op, policy::Txn::Own);
         if id == "layer.addDownload"
             && res.is_ok()

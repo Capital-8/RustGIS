@@ -682,7 +682,7 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
                 super::time::set(s, &json!({"date": at}))?;
                 // Its address at the step the slider went to.
                 if let Some(t) = added.and_then(|i| s.map().tiles.get(i)) {
-                    r["url"] = json!(t.url);
+                    r["url"] = json!(crate::sources::redact(&t.url));
                 }
             }
             // A slider already on keeps its steps: the service may have no map for some of them.

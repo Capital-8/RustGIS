@@ -3617,16 +3617,19 @@ pub(crate) fn add_cog(s: &mut Session, p: &Value, url: &str, probed: bool) -> Cm
     // A plugin's command in the app doesn't wait (it runs on the frame), as in the browser.
     let probed = probed && !s.leave_downloads;
     // A dated address is framed on the file of the date it shows; why its file couldn't be read.
-    let (url, probed, mut why) = match r.get("url").and_then(Value::as_str) {
-        Some(dated) => {
-            // Its header read now (natively) as an undated address's is before it is added.
-            #[cfg(not(target_arch = "wasm32"))]
-            let probe = if s.leave_downloads { Ok(false) } else { crate::render::rustgis_tiles::cog::probe_blocking(dated) };
-            #[cfg(target_arch = "wasm32")]
-            let probe: Result<bool, String> = Ok(false);
-            (dated.to_string(), probe == Ok(true), probe.err())
-        }
-        None => (url.to_string(), probed, None),
+    let (url, probed, mut why) = if r.get("dated").and_then(Value::as_bool) == Some(true) {
+        // The public answer is redacted; metadata uses the installed tile's exact address.
+        let index =
+            r.get("index").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok()).ok_or("added GeoTIFF has no tile index")?;
+        let dated = s.map().tiles.get(index).ok_or("added GeoTIFF tile is missing")?.url.clone();
+        // Its header read now (natively) as an undated address's is before it is added.
+        #[cfg(not(target_arch = "wasm32"))]
+        let probe = if s.leave_downloads { Ok(false) } else { crate::render::rustgis_tiles::cog::probe_blocking(&dated) };
+        #[cfg(target_arch = "wasm32")]
+        let probe: Result<bool, String> = Ok(false);
+        (dated, probe == Ok(true), probe.err())
+    } else {
+        (url.to_string(), probed, None)
     };
     #[cfg(not(target_arch = "wasm32"))]
     let info = if probed {
@@ -3680,7 +3683,7 @@ pub(crate) fn add_cog(s: &mut Session, p: &Value, url: &str, probed: bool) -> Cm
                 crate::sources::redact(&url),
                 crate::sources::redact_text(&e)
             ),
-            None => format!("{url} couldn't be read yet, so the map wasn't moved to it"),
+            None => format!("{} couldn't be read yet, so the map wasn't moved to it", crate::sources::redact(&url)),
         });
     }
     r["inPlace"] = json!(true);

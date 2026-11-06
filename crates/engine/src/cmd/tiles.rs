@@ -336,7 +336,7 @@ pub(crate) fn add_with_metadata_wait(s: &mut Session, p: &Value, metadata_wait: 
     let at = if top { 0 } else { m.tiles.iter().position(|o| !o.overlay && o.over.is_none()).unwrap_or(m.tiles.len()) };
     let mut out = json!({"name": t.name, "kind": t.kind.code(), "index": at});
     if t.time_url.is_some() {
-        out["url"] = json!(t.url);
+        out["url"] = json!(crate::sources::redact(&t.url));
         out["dated"] = json!(true);
     }
     // A file added as data (a catalog's archive, kept where the user put it, excepted) frames the

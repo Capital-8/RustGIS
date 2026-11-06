@@ -335,6 +335,8 @@ mod tests {
     fn geolibre_zarr_start_failure_removes_reservation_through_app_frame() {
         for late_failure in [false, true] {
             let mut app = RustGisApp::with_sample();
+            let (target, id) = deferred_zarr(&mut app);
+            // Fill capacity after admission so the queued import reaches the reader's start check.
             // Existing native reader tickets keep sixteen held slots valid without any sends.
             if !late_failure {
                 for _ in 0..16 {
@@ -358,7 +360,6 @@ mod tests {
                 assert!(app.session.download_is_pending(unrelated), "an unclaimed failure must leave other downloads alone");
                 app.session.download_failed(unrelated);
             }
-            let (target, id) = deferred_zarr(&mut app);
             assert!(app.session.map().groups.iter().any(|g| g.children.contains(&id)));
             if late_failure {
                 // Claim/start in the origin map, then let the actual admitted reader fail on a
@@ -432,15 +433,35 @@ mod tests {
             } else {
                 None
             };
+            let (target, id) = deferred_zarr(&mut app);
             let mut claims = Vec::new();
             if case == "capacity" {
-                for n in 0..64 {
-                    app.session.request_url(&json!({"url":format!("https://example.invalid/held-{n}.csv")})).unwrap();
-                    let request = app.session.take_url_requests().pop().unwrap();
-                    claims.push(app.session.download_started_for(&request).unwrap());
+                use rustgis_engine::policy;
+                struct Live;
+                impl policy::Revocation for Live {
+                    fn allows(&self, _: policy::Effects) -> bool {
+                        true
+                    }
                 }
+                // Grow unrelated work after admission. Its owner drains only its own requests,
+                // leaving the import queued for the actual app frame's start and cleanup path.
+                app.session.active_layer = None;
+                assert!(app.session.selected_layers().is_empty());
+                let scope = policy::Scope::agent(policy::AgentAccess::Allow, true, "held-capacity", None, Arc::new(Live));
+                claims = app
+                    .session
+                    .with_scope(scope, |s| -> Result<Vec<u64>, String> {
+                        let mut claims = Vec::new();
+                        for n in 0..64 {
+                            s.request_url(&json!({"url":format!("https://example.invalid/held-{n}.csv")}))?;
+                            let request = s.take_url_requests().pop().ok_or("held request was not queued")?;
+                            claims.push(s.download_started_for(&request)?);
+                        }
+                        Ok(claims)
+                    })
+                    .unwrap()
+                    .unwrap();
             }
-            let (target, id) = deferred_zarr(&mut app);
             let token = app.session.map().layer(id).unwrap().dataset.source.clone().unwrap();
             assert!(app.session.map().groups.iter().any(|g| g.children.contains(&id)));
             // This ordinary edit leaves a real undo snapshot containing the reservation.

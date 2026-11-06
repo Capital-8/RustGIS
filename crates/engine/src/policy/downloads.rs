@@ -184,6 +184,11 @@ impl Session {
     pub(crate) fn retire_abandoned_requests(&mut self) {
         self.policy.work.queued.retain(|_, q| q.c.strong_count() > 0);
     }
+    /// Counts live unclaimed requests, including opaque handles already taken by an adapter.
+    /// Dropped handles do not occupy a slot, matching abandoned-request retirement.
+    pub(crate) fn queued_url_count(&self) -> usize {
+        self.policy.work.queued.values().filter(|q| q.c.strong_count() > 0).count()
+    }
     /// Deduplicates exact requests within one owner and retains their initiating node.
     pub(super) fn enqueue_url(&mut self, p: &Value) -> CmdResult {
         self.enqueue_url_for(p, false)
@@ -267,7 +272,7 @@ impl Session {
             asked_now.push((number, asked));
         }
         self.request_only = true;
-        Ok(json!({"pending":true,"url":p.get("url")}))
+        Ok(json!({"pending":true,"url":p.get("url").and_then(Value::as_str).map(crate::sources::redact)}))
     }
     /// Taking an opaque request sends nothing and retains other callers' queued requests.
     /// Authority is checked again when the owner or native host claims it.

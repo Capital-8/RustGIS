@@ -129,8 +129,11 @@ pub fn info(archive: &str) -> Result<Arc<Info>, String> {
 /// Keeps a completion only if no clear happened since its read started; check and insert share
 /// the same lock as the clear, so an old completion cannot repopulate the new cache.
 fn remember_info(archive: &str, result: &Result<Arc<Info>, String>, epoch: u64) {
+    if crate::cache::check_still(&crate::cache::current_still()).is_err() {
+        return;
+    }
     let mut all = infos().lock().unwrap_or_else(|e| e.into_inner());
-    if EPOCH.load(Ordering::SeqCst) != epoch || crate::cache::check_still(&crate::cache::current_still()).is_err() {
+    if EPOCH.load(Ordering::SeqCst) != epoch {
         return;
     }
     if all.len() >= 64 {
@@ -164,6 +167,13 @@ fn cached_info(archive: &str) -> Option<Result<Arc<Info>, String>> {
     })
 }
 
+/// The metadata workers' shared pending reads and completion signal.
+#[cfg(not(target_arch = "wasm32"))]
+fn metadata_reads() -> &'static (Mutex<HashMap<String, Instant>>, std::sync::Condvar) {
+    static LOADING: OnceLock<(Mutex<HashMap<String, Instant>>, std::sync::Condvar)> = OnceLock::new();
+    LOADING.get_or_init(|| (Mutex::new(HashMap::new()), std::sync::Condvar::new()))
+}
+
 /// Metadata without file I/O on the caller: local reads run in at most eight workers. A caller
 /// may wait up to `timeout`; otherwise `None` means pending. Completion wakes the map. Uploads
 /// are already in memory. At capacity a read remains pending until a later poll can start it.
@@ -182,9 +192,7 @@ pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>,
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use std::sync::Condvar;
-        static LOADING: OnceLock<(Mutex<HashMap<String, Instant>>, Condvar)> = OnceLock::new();
-        let (pending, ready) = LOADING.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()));
+        let (pending, ready) = metadata_reads();
         let mut all = pending.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(result) = cached_info(archive) {
             return result.map(Some);
@@ -219,7 +227,9 @@ pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>,
             let (reads, _) = ready.wait_timeout_while(all, wait, |all| all.contains_key(archive)).unwrap_or_else(|e| e.into_inner());
             all = reads;
         }
+        drop(all);
         crate::cache::check_still(&crate::cache::current_still())?;
+        let all = pending.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(result) = cached_info(archive) {
             return result.map(Some);
         }
@@ -285,6 +295,49 @@ pub(crate) fn read_local(url: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reentrant authority check may clear metadata; the old epoch must still reject its result.
+    #[test]
+    fn metadata_completion_checks_still_outside_the_cache_lock() {
+        let _turn = crate::cache::turn();
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = available.clone();
+        let still: crate::cache::Still = Arc::new(move || {
+            let free = infos().try_lock().is_ok();
+            seen.store(free, Ordering::SeqCst);
+            if free {
+                forget();
+            }
+            true
+        });
+        let epoch = EPOCH.load(Ordering::SeqCst);
+        let address = "/reentrant-cache-completion.mbtiles";
+        crate::cache::with_still(still, || remember_info(address, &Err("old completion".into()), epoch));
+        assert!(available.load(Ordering::SeqCst), "Still ran with the metadata cache locked");
+        assert!(cached_info(address).is_none(), "a clear during the predicate invalidates the earlier completion");
+    }
+
+    /// Both preflight and post-wait authority checks permit metadata reentry without a lock cycle.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn metadata_ready_checks_still_outside_the_pending_lock() {
+        let _turn = crate::cache::turn();
+        let origin = std::thread::current().id();
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (free, count) = (available.clone(), checks.clone());
+        let still: crate::cache::Still = Arc::new(move || {
+            if std::thread::current().id() != origin {
+                return false;
+            }
+            count.fetch_add(1, Ordering::SeqCst);
+            free.fetch_and(metadata_reads().0.try_lock().is_ok(), Ordering::SeqCst);
+            true
+        });
+        let _ = crate::cache::with_still(still, || info_ready("/reentrant-pending-read.mbtiles", Duration::ZERO));
+        assert!(checks.load(Ordering::SeqCst) >= 2, "the post-wait check must execute");
+        assert!(available.load(Ordering::SeqCst), "Still ran with pending metadata reads locked");
+    }
 
     /// The metadata worker inherits its initiating transport context instead of reading at root.
     #[cfg(not(target_arch = "wasm32"))]

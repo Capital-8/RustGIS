@@ -13576,6 +13576,12 @@ fn wms_layers_with_time() {
     let mut s = Session::new(Project::default());
     let added = s.run("service.add", &json!({"url": url, "layer": "population", "text": WMS, "time": "slider"})).unwrap();
     assert!(added["url"].as_str().is_some_and(|u| u.ends_with("&TIME=2025")), "{added}");
+    let mut keyed = Session::new(Project::default());
+    let capabilities = WMS.replace("https://maps.example.com/wms?", "https://maps.example.com/wms?token=RGSYNTH_service&amp;");
+    let public = keyed.run("service.add", &json!({"url":url,"layer":"population","text":capabilities,"time":"slider"})).unwrap();
+    let live = &keyed.map().tiles[public["index"].as_u64().unwrap() as usize];
+    assert!(live.url.contains("RGSYNTH_service") && live.url.ends_with("TIME=2025"));
+    assert!(!public["url"].as_str().unwrap().contains("RGSYNTH_service"), "moving to the default time cannot expose the live address");
     let year = |y: i32| rustgis_data::time::parse_text(&format!("{y}-01-01")).unwrap();
     let slider = s.map().time.clone().unwrap();
     assert_eq!((slider.steps(), slider.current), (vec![year(1990), year(2000), year(2025)], year(2025)));
@@ -16280,11 +16286,22 @@ fn a_plugins_dated_cog_is_added_without_waiting() {
     let base = format!("http://{}", server.local_addr().unwrap());
     let mut s = Session::new(Project::default());
     let start = std::time::Instant::now();
-    let r =
-        s.run_leaving_downloads("layer.addUrl", &json!({"url": format!("{base}/{{date:YYYY}}.tif"), "start": 2020, "end": 2021})).unwrap();
+    let r = s
+        .run_leaving_downloads(
+            "layer.addUrl",
+            &json!({"url": format!("{base}/{{date:YYYY}}.tif?token=RGSYNTH_dated_cog"), "start": 2020, "end": 2021}),
+        )
+        .unwrap();
     assert!(start.elapsed() < std::time::Duration::from_secs(10), "waited {:?}", start.elapsed());
     assert_eq!(r["inPlace"], true, "{r}");
     assert!(r["warning"].as_str().is_some_and(|w| w.contains("wasn't moved")), "{r}");
+    let tile = &s.map().tiles[r["index"].as_u64().unwrap() as usize];
+    assert!(
+        tile.url.contains(".tif?token=RGSYNTH_dated_cog") && !tile.url.contains("{date"),
+        "the live tile keeps the effective private address"
+    );
+    let clean = ["warning", "url"].map(|key| r[key].as_str().is_some_and(|text| !text.contains("RGSYNTH_dated_cog")));
+    assert_eq!(clean, [true, true], "both public warning and URL must omit credentials");
     drop(server);
 }
 
@@ -20961,6 +20978,27 @@ fn merged_undo_steps_undo_as_one() {
     let before = s.undo_depth();
     s.run("layout.update", &json!({"element": title.id, "x": 41.0})).unwrap();
     assert_eq!(s.undo_depth(), before + 1);
+
+    // Failed admission, including the plugin branch, also consumes the next-command merge key.
+    let mut refused_merges = Vec::new();
+    for (index, id) in ["map.addTiles", "plugin:missing-merge-test"].into_iter().enumerate() {
+        let x = 50.0 + index as f64 * 10.0;
+        nudge(&mut s, "refused", x);
+        s.merge_undo("refused");
+        let denied = s
+            .with_scope(crate::policy::Scope::peer(), |s| s.run(id, &json!({"url":"https://merge-refusal.invalid/{z}/{x}/{y}.png"})))
+            .unwrap();
+        assert!(denied.is_err(), "the command must be refused before its handler runs");
+        let before = s.undo_depth();
+        s.run("layout.update", &json!({"element":title.id,"x":x+1.0})).unwrap();
+        let separate = s.undo_depth() == before + 1;
+        s.run("edit.undo", &Value::Null).unwrap();
+        refused_merges.push((id, separate, at(&s).0 == x));
+    }
+    assert!(
+        refused_merges.iter().all(|(_, separate, restored)| *separate && *restored),
+        "failed admission reused its merge key: {refused_merges:?}"
+    );
 }
 
 #[test]
@@ -24542,6 +24580,10 @@ fn time_slider_fills_dated_tile_addresses_and_exports_its_steps() {
         )
         .unwrap();
     assert_eq!(r["url"], "https://example.com/2023-08-01/{z}/{x}/{y}.png");
+    let mut keyed_session = timed_events();
+    let keyed = keyed_session.run("map.addTiles", &json!({"url":"https://example.com/{date:YYYY-MM-DD}/{z}/{x}/{y}.png?token=RGSYNTH_dated_tiles","start":"2023-08-01","end":"2023-08-31"})).unwrap();
+    assert!(!keyed["url"].as_str().unwrap().contains("RGSYNTH_dated_tiles"));
+    assert!(keyed_session.map().tiles[keyed["index"].as_u64().unwrap() as usize].url.contains("RGSYNTH_dated_tiles"));
     let i = s.run("time.info", &Value::Null).unwrap();
     assert_eq!((i["unit"].as_str(), i["steps"].as_u64()), (Some("day"), Some(31)), "{i}");
     // Only tile kinds that fill dates take a dated address.
