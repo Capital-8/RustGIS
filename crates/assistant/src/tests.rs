@@ -4328,3 +4328,21 @@ fn geolibre_download_callbacks_require_import_approval() {
         assert!(tools::gate(&s, &call).is_some(), "{key}");
     }
 }
+
+/// A peer project invalidates queued work and replies while keeping the readable conversation.
+#[test]
+fn peer_replacement_cancels_approvals_and_stale_replies() {
+    let mut s = sample();
+    let mut agent = Agent::new(cfg("openai"), &s);
+    assert!(matches!(agent.ask("export the map", &s), Step::Send(_)));
+    let pending =
+        call("peer-old", "run_command", json!({"command":"share.exportMap", "params":{"path":"RGSYNTH_never_written_20261103.png"}}));
+    assert_eq!(agent.receive(agent.generation(), ok(pending), &mut s), Step::Confirm);
+    let generation = agent.generation();
+    let transcript = agent.transcript.len();
+    agent.project_replaced();
+    assert!(agent.generation() != generation && !agent.busy() && agent.pending(&s).is_none());
+    assert!(agent.transcript.len() >= transcript);
+    let _ = agent.receive(generation, ok(say("stale")), &mut s);
+    assert!(!agent.busy() && agent.pending(&s).is_none());
+}

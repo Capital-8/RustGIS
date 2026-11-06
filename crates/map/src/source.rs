@@ -1157,6 +1157,86 @@ pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
+impl SourceLayer {
+    /// Persisted source address and local driver paths; handles and embedded data are opaque.
+    pub(crate) fn output_slots(&self) -> Vec<(crate::LayerRole, &str, bool, bool)> {
+        let SourceLayer {
+            path,
+            file_name: _,
+            table: _,
+            shapefile_crs: _,
+            embedded,
+            handle: _,
+            window: _,
+            render_lod: _,
+            pending: _,
+            projection: _,
+            ready_cache: _,
+            byte_budget: _,
+            estimated_row_bytes: _,
+            full_read: _,
+            saved_selection: _,
+            window_fields: _,
+            opening: _,
+            error: _,
+            login: _,
+            limit: _,
+            reads: _,
+            gdal,
+            duckdb,
+            postgis,
+            mysql,
+            sqlserver,
+        } = self;
+        use crate::{LayerRole as R, paths};
+        let mut out = Vec::new();
+        if let Some(p) = path {
+            out.push((
+                R::Streamed,
+                p.as_str(),
+                true,
+                embedded.is_none()
+                    && gdal.is_none()
+                    && duckdb.is_none()
+                    && postgis.is_none()
+                    && mysql.is_none()
+                    && sqlserver.is_none()
+                    && paths::is_local(p),
+            ));
+        }
+        if let Some(g) = gdal {
+            out.push((R::GdalPath, g.path.as_str(), false, paths::is_local(&g.path)));
+        } else if let Some(d) = duckdb
+            && let Some(p) = &d.database
+        {
+            out.push((R::DuckDbDatabase, p.as_str(), false, paths::is_local(p)));
+        }
+        if let Some(pg) = postgis {
+            out.push((R::PostgisDatabase, pg.database.as_str(), true, false));
+        }
+        if let Some(my) = mysql {
+            out.push((R::MysqlDatabase, my.database.as_str(), true, false));
+        }
+        if let Some(ms) = sqlserver {
+            out.push((R::SqlServerDatabase, ms.database.as_str(), true, false));
+        }
+        out
+    }
+
+    /// Resolves a prepared field without examining its written contents.
+    pub(crate) fn output_slot_mut(&mut self, role: crate::LayerRole) -> Option<&mut String> {
+        match role {
+            crate::LayerRole::Streamed => self.path.as_mut(),
+            crate::LayerRole::GdalPath => Some(&mut self.gdal.as_mut()?.path),
+            crate::LayerRole::DuckDbDatabase => self.duckdb.as_mut()?.database.as_mut(),
+            crate::LayerRole::PostgisDatabase => Some(&mut self.postgis.as_mut()?.database),
+            crate::LayerRole::MysqlDatabase => Some(&mut self.mysql.as_mut()?.database),
+            crate::LayerRole::SqlServerDatabase => Some(&mut self.sqlserver.as_mut()?.database),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Reopening this same layer must invalidate populated decisions even without `reset`.

@@ -9,16 +9,16 @@ use super::{C, CmdResult, MAX_GROUP_BYTES, Session, capabilities, ps, service_js
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("service.import", "Import Service", "Home › Add", import).params(
+        C::new("service.import", "Import Service", "Home › Add", import).roles(&[]).params(
             r#"{"url": "an OGC API landing page or collections address", "type"?, "name"?: "group name (default My OGC Layer)", "text"?, "documents"?: "as service.layers", "responses"?: [{"url": "features URL", "text": "downloaded GeoJSON"}], "connection"?: "as service.add", "anonymous"?: bool (internal: preserve plugin-selected service provenance)} ("group" and "layer" are rejected: use service.refresh)"#,
         ),
-        C::new("service.refresh", "Refresh", "Layers", refresh).params(
+        C::new("service.refresh", "Refresh", "Layers", refresh).roles(&[]).params(
             r#"{"group"?: id, "layer"?: "one child layer id or name", "text"?, "documents"?, "responses"?: "as service.import", "connection"?: "as service.add (default: the one its layers record)", "anonymous"?: bool (internal: do not borrow a saved login)}"#,
         ),
-        C::new("service.groupPlan", "Service Import Requests", "Layers", plan).view().params(
+        C::new("service.groupPlan", "Service Import Requests", "Layers", plan).roles(&[]).view().params(
             r#"{"url"?, "type"?, "name"?, "group"?: id, "layer"?: "one child layer", "sourceOnly"?: "return the connection without fetching", "text"?, "documents"?, "connection"?: "as service.add", "anonymous"?: bool (internal: preserve plugin-selected service provenance)} → request, layers, and next while discovery is incomplete"#,
         ),
-        C::new("service.group", "Service Group", "Layers", set_group).params(
+        C::new("service.group", "Service Group", "Layers", set_group).roles(&[]).params(
             r#"{"group"?: id, "layer"?: "a child identifying its group", "name"?: text, "expanded"?: bool, "visible"?: "set all children", "remove"?: "remove the group and its children"}"#,
         ),
     ]
@@ -126,6 +126,7 @@ fn listing(s: &mut Session, p: &Value) -> CmdResult {
     let mut identities = std::collections::HashSet::new();
     let mut offered = Vec::new();
     for (layer, source) in found.service.layers.into_iter().zip(found.sources) {
+        let source = source.address;
         if !matches!(layer.offer, Offer::Features { .. }) {
             continue;
         }

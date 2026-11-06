@@ -322,19 +322,21 @@ const MAX_DEPTH: usize = 16;
 /// `pmtiles:…@`) replaced by its plain address. Commands return the bound addresses the app needs
 /// to use a connection's login; the model and MCP clients get only the public ones.
 fn public_text(text: String) -> String {
-    if text.contains(rustgis_engine::data::login_address::PREFIX) {
-        rustgis_engine::render::rustgis_tiles::logins::scrub(&text)
-    } else {
-        text
-    }
+    rustgis_engine::render::rustgis_tiles::logins::scrub(&text)
 }
 
+/// Publishes a completed result, reporting withheld subtrees before enforcing the response budget.
 fn public_result(s: &mut Session, value: Value, tokens: usize) -> String {
-    let mut withheld = 0usize;
+    let mut withheld = Withheld::default();
     let mut value = public_addresses(value, 0, &mut withheld);
-    if withheld > 0 {
+    if withheld.depth > 0 || withheld.keys > 0 {
         let mark = s.notice_mark();
-        s.notify(format!("Tool result: {withheld} subtrees at nesting depth {MAX_DEPTH} were withheld."), false);
+        if withheld.depth > 0 {
+            s.notify(format!("Tool result: {} subtrees at nesting depth {MAX_DEPTH} were withheld.", withheld.depth), false);
+        }
+        if withheld.keys > 0 {
+            s.notify(format!("Tool result: {} object(s) were withheld because redacted field names coincide.", withheld.keys), false);
+        }
         if let Some(notices) = value.get_mut("notices").and_then(Value::as_array_mut) {
             notices.extend(s.notices_since(mark).iter().map(|n| json!(n.text)));
         } else {
@@ -344,16 +346,33 @@ fn public_result(s: &mut Session, value: Value, tokens: usize) -> String {
     bounded_json(&value, tokens)
 }
 
-/// `v` with its strings made public ([`public_text`]), to a depth of [`MAX_DEPTH`].
-fn public_addresses(v: Value, depth: usize, withheld: &mut usize) -> Value {
+/// Counts output withheld for depth limits or field names that collide after redaction.
+#[derive(Default)]
+struct Withheld {
+    depth: usize,
+    keys: usize,
+}
+
+/// Projects keys and values through active-login redaction; ambiguous objects and deep subtrees
+/// are withheld and counted without changing the completed command's success.
+fn public_addresses(v: Value, depth: usize, withheld: &mut Withheld) -> Value {
     match v {
         Value::String(s) => Value::String(public_text(s)),
         Value::Array(a) if depth < MAX_DEPTH => Value::Array(a.into_iter().map(|x| public_addresses(x, depth + 1, withheld)).collect()),
         Value::Object(o) if depth < MAX_DEPTH => {
-            Value::Object(o.into_iter().map(|(k, x)| (k, public_addresses(x, depth + 1, withheld))).collect())
+            let mut public = serde_json::Map::new();
+            for (key, value) in o {
+                let key = public_text(key);
+                if public.contains_key(&key) {
+                    withheld.keys = withheld.keys.saturating_add(1);
+                    return json!("[redacted field names coincide]");
+                }
+                public.insert(key, value);
+            }
+            Value::Object(public.into_iter().map(|(key, value)| (key, public_addresses(value, depth + 1, withheld))).collect())
         }
         Value::Array(_) | Value::Object(_) => {
-            *withheld = withheld.saturating_add(1);
+            withheld.depth = withheld.depth.saturating_add(1);
             json!("[too deep]")
         }
         other => other,
@@ -434,20 +453,10 @@ fn str_arg(a: &Value, k: &str) -> Option<String> {
 /// The `params` a command or tool runs with: an object, or JSON text of one (some models send
 /// that). Anything else is an error: running with defaults instead could act on the wrong layer.
 fn params_arg(a: &Value) -> Result<Value, String> {
-    match a.get("params") {
-        None | Some(Value::Null) => Ok(json!({})),
-        Some(v @ Value::Object(_)) => Ok(v.clone()),
-        Some(Value::String(t)) if t.trim().is_empty() => Ok(json!({})),
-        Some(Value::String(t)) => match serde_json::from_str::<Value>(t) {
-            Ok(v @ Value::Object(_)) => Ok(v),
-            Ok(_) => Err("params must be a JSON object".into()),
-            Err(e) => Err(format!("params is not valid JSON: {e}")),
-        },
-        Some(_) => Err("params must be a JSON object".into()),
-    }
+    rustgis_engine::params_envelope(a.get("params"))
 }
 
-/// An object parameter, which some models send as JSON text (leniently, for display and approval).
+/// An object parameter, which some models send as JSON text (leniently, for display only).
 fn obj_arg(a: &Value, k: &str) -> Value {
     match a.get(k) {
         Some(Value::String(t)) if !t.trim().is_empty() => serde_json::from_str(t).unwrap_or(Value::Null),
@@ -898,7 +907,7 @@ mod tests {
         let binding = logins::activate(origin, "assistant", logins::Method::Header("X-Key".into()), "assistant-secret", false).unwrap();
         let archive = logins::bind(&binding, &format!("{origin}/a.pmtiles")).unwrap();
         let result = json!({"layers": [{"next": {"request": {"url": format!("pmtiles:x@{archive}")}}}], "count": 2});
-        let v = public_addresses(result, 0, &mut 0);
+        let v = public_addresses(result, 0, &mut Withheld::default());
         assert_eq!(v["layers"][0]["next"]["request"]["url"], format!("pmtiles:x@{origin}/a.pmtiles"));
         assert_eq!(v["count"], 2);
         assert!(logins::deactivate(&binding));
@@ -929,5 +938,53 @@ mod tests {
         let out: Value = serde_json::from_str(&public_result(&mut s, result.clone(), DEFAULT_OUTPUT_TOKENS)).unwrap();
         assert_eq!(out, result);
         assert!(s.notices_since(0).is_empty());
+    }
+
+    #[test]
+    fn successful_results_scrub_active_raw_service_keys_without_a_wrapper() {
+        let mut s = Session::new(rustgis_engine::Project::default());
+        let id = s
+            .run(
+                "connection.new",
+                &json!({"kind":"wms","address":"https://echo-r15.example.invalid/wms","auth":"header","keyName":"X-Key"}),
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        s.run("connection.login", &json!({"id":id,"apiKey":"fake001"})).unwrap();
+        let result = json!({"success":true,"echo":"server said fake001","clean":"ordinary café text"});
+        let out: Value = serde_json::from_str(&public_result(&mut s, result, DEFAULT_OUTPUT_TOKENS)).unwrap();
+        assert_eq!(out["success"], true);
+        assert_eq!(out["echo"], "server said [redacted]");
+        assert_eq!(out["clean"], "ordinary café text");
+        assert!(s.notices_since(0).is_empty());
+        // A generated row uses imported field names as object keys. Keep the stored data,
+        // but never send a field repeating an active key to the model in plain text.
+        let source = json!({"type":"FeatureCollection","features":[{
+            "type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},
+            "properties":{"fake001":"retained value","clean":"ordinary café text"}
+        }]});
+        s.run("layer.addDataText", &json!({"fileName":"echo-fields.geojson","text":source.to_string()})).unwrap();
+        let name = s.map().layers.last().unwrap().name.clone();
+        let call = ToolCall { id: "echo-fields".into(), name: "read_features".into(), args: json!({"layer":name,"limit":1}) };
+        let mark = s.notice_mark();
+        let text = run_with_budget(&mut s, &call, DEFAULT_OUTPUT_TOKENS).unwrap();
+        assert!(!text.contains("fake001"), "generated object keys must be scrubbed too: {text}");
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["rows"][0]["[redacted]"], "retained value");
+        assert_eq!(out["rows"][0]["clean"], "ordinary café text");
+        assert!(s.map().layers.last().unwrap().dataset.fields.iter().any(|f| f.name == "fake001"), "stored data stays unchanged");
+        assert!(s.notices_since(mark).is_empty());
+        // Two keys that become equal must not silently overwrite one value with the other.
+        let mark = s.notice_mark();
+        let collision = json!({"success":true,"result":{"fake001":"first value","[redacted]":"second value"}});
+        let text = public_result(&mut s, collision, DEFAULT_OUTPUT_TOKENS);
+        assert!(!text.contains("fake001"));
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["success"], true);
+        assert!(out["result"].is_string(), "ambiguous redacted objects are explicitly withheld");
+        assert_eq!(s.notices_since(mark).len(), 1);
+        assert!(s.notices_since(mark)[0].text.contains("field names"));
     }
 }

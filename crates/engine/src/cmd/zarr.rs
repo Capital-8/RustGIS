@@ -18,16 +18,16 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("raster.zarrInfo", "Zarr Variables", "Home › Add › Add Data › Zarr", info)
+        C::new("raster.zarrInfo", "Zarr Variables", "Home › Add › Add Data › Zarr", info).roles(&[])
             .view()
             .params(r#"{"path": "a Zarr store's folder" | "url": "https://… a store with consolidated metadata"}"#),
-        C::new("zarr.series", "Time Series at a Point", "View › Time Series", series).view().params(
+        C::new("zarr.series", "Time Series at a Point", "View › Time Series", series).roles(&[]).view().params(
             r#"{"lon", "lat", "layer"? (a Zarr layer: its store, variable and steps; default the active layer) | "path": folder | "url": "https://…", "variable"?, "index"?: {"level": 0} (the other dimensions' steps), "start"?, "end"?: dates (default: the layer's period, else the whole axis), "crs"?: for a projected store that doesn't say} → dates, values (null for no data) and labels along the variable's time dimension at the cell holding the point (desktop)"#,
         ),
-        C::new("zarr.reduce", "Summarise Zarr Over Time", "View › Time Series", reduce).params(
+        C::new("zarr.reduce", "Summarise Zarr Over Time", "View › Time Series", reduce).roles(&[]).params(
             r#"{"layer"? (a Zarr layer: its store, variable and steps; default the active layer) | "path": folder | "url": "https://…", "variable"?, "index"?, "stat": "mean"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove", "above"?: number (countAbove's threshold), "start"?, "end"?: dates (default: the layer's period, else the whole axis), "months"?: [1–12] (a season across years: [12, 1, 2]), "minValid"?: 0–1 (a cell with a smaller share of values is left empty; default 0), "name"?: text, "crs"?} → a raster layer of the statistic (desktop)"#,
         ),
-        C::new("layer.addZarr", "Add Zarr Variable", "Home › Add › Add Data", add).params(
+        C::new("layer.addZarr", "Add Zarr Variable", "Home › Add › Add Data", add).roles(&[]).params(
             r#"{"path": folder | "url": "https://…", "variable"?: "its path in the store (default: the first)", "index"?: {"time": 3, "level": 0} (other dimensions' steps, default 0), "crs"?: "EPSG:… for a store that doesn't say", "name"?: text, "time"?: bool (follow the time slider: the layer shows the step the slider is at, and turns the slider on over the variable's dates when it is off; desktop), "start"?, "end"?: dates (with time: the period to take, for an axis longer than the slider's 20,000 steps), "ran"?: (internal: a slice the app has read), "summary"?: bool (internal: with ran, a summary over time rather than a slice)}"#,
         ),
     ]

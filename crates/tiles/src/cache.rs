@@ -2056,7 +2056,7 @@ mod tests {
         let history = rustgis_data::diagnostics::History::default();
         let _scope = history.enter();
         let base = serve(vec![
-            "HTTP/1.1 403 Forbidden\r\nWWW-Authenticate: Basic realm=\"private-realm\"\r\nRetry-After: 30\r\ncf-ray: 8a1-BOG\r\nX-Amzn-RequestId: amzn-1155\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 403 Forbidden\r\nWWW-Authenticate: Basic realm=\"private-realm\"\r\nRetry-After: 30\r\ncf-ray: 8a1-BOG\r\nX-Amzn-RequestId: amzn-1155\r\nX-Amz-Cf-Id: trace-1155\r\nX-Amzn-Waf-Action: block\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 .into(),
         ]);
         let url = format!("{base}/refused");
@@ -2064,7 +2064,9 @@ mod tests {
         let records = network_records(&history, &url);
         assert_eq!(records.len(), 1);
         let details = &records[0].details;
-        for kept in ["retry-after: 30", "cf-ray: 8a1-BOG", "x-amzn-requestid: amzn-1155"] {
+        for kept in
+            ["retry-after: 30", "cf-ray: 8a1-BOG", "x-amzn-requestid: amzn-1155", "x-amz-cf-id: trace-1155", "x-amzn-waf-action: block"]
+        {
             assert!(details.contains(kept), "{kept} in {details:?}");
         }
         assert!(!details.contains("private-realm"), "{details:?}");
