@@ -198,7 +198,7 @@ impl Engine {
         let result = self.with_session(py, |session| {
             let (text, report) = session.peer_text(rustgis_engine::Peer::Bridge)?;
             let addresses = report.layer_addresses();
-            let notices = report.notices().into_iter().skip(usize::from(addresses > 0)).collect();
+            let notices = report.notices_without_layer_addresses();
             Ok::<_, String>((text, addresses, notices))
         });
         self.flush(py);

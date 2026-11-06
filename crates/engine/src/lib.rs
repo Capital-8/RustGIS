@@ -1242,15 +1242,32 @@ impl Session {
     /// delivery, so producing bytes alone never records a successful run.
     pub fn take_gp_files(&mut self) -> Vec<(u64, String, Vec<u8>)> {
         let mut live = Vec::new();
+        let mut refused: Vec<(String, Vec<String>)> = Vec::new();
         for mut file in std::mem::take(&mut self.file_outputs) {
-            if let Err(e) = self.check_continuation(&file.continuation) {
-                self.notify(e, true);
+            if let Err(e) = self.check_export_delivery(&file.continuation) {
+                // Redact before clipping: a partial credential must never become display text.
+                let clean = Self::redacted(&file.file_name);
+                let mut name: String = clean.as_str().chars().take(80).collect();
+                if clean.as_str().chars().nth(80).is_some() {
+                    name.push('…');
+                }
+                let name = format!("{name:?}");
+                if let Some((_, names)) = refused.iter_mut().find(|(reason, _)| reason == &e) {
+                    names.push(name);
+                } else {
+                    refused.push((e, vec![name]));
+                }
                 continue;
             }
             if let Some(bytes) = file.bytes.take() {
                 live.push((file.id, file.file_name.clone(), bytes));
             }
             self.file_outputs.push(file);
+        }
+        for (reason, names) in refused {
+            let count = names.len();
+            let names = names.join(", ");
+            self.notify(format!("{count} pending file export(s) could not be completed ({names}): {reason}"), true);
         }
         live
     }

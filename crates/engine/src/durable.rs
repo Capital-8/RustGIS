@@ -62,6 +62,14 @@ impl Report {
         out
     }
 
+    /// Other loss notices for a consumer that presents the layer-address count separately.
+    /// Suppresses that kind explicitly, independent of the ordering of notices.
+    pub fn notices_without_layer_addresses(&self) -> Vec<String> {
+        let mut report = self.clone();
+        report.addresses = 0;
+        report.notices()
+    }
+
     /// Adds the independently prepared losses of a nested typed document.
     pub(crate) fn merge(&mut self, other: &Self) {
         self.addresses = self.addresses.saturating_add(other.addresses);

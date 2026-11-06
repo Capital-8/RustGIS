@@ -1025,9 +1025,9 @@ pub fn identify(s: &Session, lon: f64, lat: f64) -> Option<Value> {
 /// Binds the primary raster and optional actual like raster without copying pixel data.
 fn stretch_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
     let s = input;
-    let mut inputs = super::Inputs::primary(s, p)?;
+    let mut inputs = super::Inputs::single_layer(s, p)?;
     if let Some(name) = like_name(p)? {
-        inputs.layers.extend(super::Inputs::named(s.map(), [name])?.layers);
+        inputs.extend(super::Inputs::named(s.map(), [name])?);
     }
     Ok(inputs)
 }

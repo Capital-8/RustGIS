@@ -35,6 +35,17 @@ fn permission_review_authentication_changes_are_reserved() {
 }
 
 #[test]
+fn permission_review_connected_folder_availability_requires_files() {
+    let mut s = world();
+    s.project.folders.push("not-opened-review-folder".into());
+    let call = Call::command("project.connections", Value::Null);
+    assert!(matches!(s.review(&agent(AgentAccess::Refuse), &call), Outcome::Refused(_)));
+    assert!(matches!(s.review(&agent(AgentAccess::Review), &call), Outcome::NeedsApproval(_)));
+    assert!(matches!(s.review(&agent(AgentAccess::Allow), &call), Outcome::Allowed));
+    assert!(matches!(s.review(&Scope::assistant(1461, Arc::new(Live)), &call), Outcome::NeedsApproval(_)));
+}
+
+#[test]
 fn permission_review_memory_only_commands_need_no_external_access() {
     let mut s = world();
     let mut errors = Vec::new();
@@ -341,4 +352,21 @@ fn permission_review_tile_metadata_helpers_require_source_access() {
         }
     }
     assert!(wrong.is_empty(), "metadata readers must declare their actual source reach: {wrong:?}");
+}
+
+/// Rejects an over-limit script before its first edit instead of silently running a prefix.
+#[test]
+fn permission_review_script_line_limit_refuses_before_any_edit() {
+    let mut s = world();
+    let before = serde_json::to_value(&s.project).unwrap();
+    let prefix = format!(
+        "layer.rename {{\"layer\":\"Cities\",\"name\":\"Renamed\"}}\n{}",
+        "# kept\n".repeat(crate::cmd::workflows::MAX_SCRIPT_LINES - 1)
+    );
+    let oversized = format!("{prefix}map.basemap {{\"name\":\"blank\"}}");
+    let result = s.run("script.run", &json!({"script":oversized}));
+    assert!(result.is_err(), "a script over the line limit must be refused, not partially run");
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+    s.run("script.run", &json!({"script":prefix})).unwrap();
+    assert!(s.map().layer_by_name("Renamed").is_some(), "the exact boundary remains supported");
 }

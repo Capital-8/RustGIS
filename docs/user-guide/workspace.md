@@ -35,7 +35,10 @@ back the next time it starts; with autosave off, they are lost, so save before y
 Saving removes recognized credentials from supported layer and video addresses and from
 recognized task, model, notebook and history parameters. Notices count detected removals and
 content that could not be checked. Unrecognized credentials can remain in addresses without a
-notice. The open session keeps its credentials, but a saved workflow or protected source may
+notice. Diagnostic logging uses a broader sensitive-name list: a parameter named `auth` or
+`jwt` may be hidden in a diagnostic message while remaining in a saved address. Inspect
+shared addresses when a service uses names outside the recognized saved-credential rules.
+The open session keeps its credentials, but a saved workflow or protected source may
 need them again when reopened. User notes, feature data and opaque content are preserved.
 Review addresses and preserved content before sharing a file; see
 [Sharing projects and generated items](https://github.com/opengeos/RustGIS/blob/main/SECURITY.md#sharing-projects-and-generated-items)

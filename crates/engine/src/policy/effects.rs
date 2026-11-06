@@ -82,7 +82,7 @@ pub(super) fn declared(spec: &CommandSpec, params: &Value) -> Effects {
     effects
 }
 /// Adds only source reach of the actual current execution targets, without opening them.
-pub(super) fn command(s: &crate::cmd::InputContext<'_>, spec: &CommandSpec, params: &Value) -> Effects {
+pub(super) fn command(s: &crate::cmd::InputContext<'_>, spec: &CommandSpec, params: &Value, layer: Option<&rustgis_map::Layer>) -> Effects {
     let mut effects = declared(spec, params);
     effects = effects.union(match spec.id {
         "map.zoomToTiles" => crate::cmd::tiles::metadata_reach(s, params),
@@ -106,22 +106,9 @@ pub(super) fn command(s: &crate::cmd::InputContext<'_>, spec: &CommandSpec, para
         }
     }
     if spec.id == "layer.loadAll"
-        && let Ok(id) = s.layer_id(params)
-        && let Some(layer) = s.map().layer(id)
-        && let Some(source) = &layer.source
+        && let Some(source) = layer.and_then(|layer| layer.source.as_ref())
     {
-        if source.path.is_some() || source.gdal.is_some() || source.duckdb.is_some() {
-            effects = effects.with(Effect::Files);
-        }
-        if source.path.as_deref().is_some_and(rustgis_data::source::is_remote_name)
-            || source.postgis.is_some()
-            || source.mysql.is_some()
-            || source.sqlserver.is_some()
-            || source.gdal.is_some()
-            || source.duckdb.is_some()
-        {
-            effects = effects.with(Effect::Network);
-        }
+        effects = effects.union(source_reach(source));
     }
     if crate::cmd::time::follows_sources(spec.id) {
         for (_, _, source) in crate::cmd::time::following_sources(s) {
@@ -130,6 +117,23 @@ pub(super) fn command(s: &crate::cmd::InputContext<'_>, spec: &CommandSpec, para
                 effects = effects.with(Effect::Network);
             }
         }
+    }
+    effects
+}
+/// Pure reach of a source the executor will read, without opening it.
+pub(super) fn source_reach(source: &rustgis_map::source::SourceLayer) -> Effects {
+    let mut effects = Effects::NONE;
+    if source.path.is_some() || source.gdal.is_some() || source.duckdb.is_some() {
+        effects = effects.with(Effect::Files);
+    }
+    if source.path.as_deref().is_some_and(rustgis_data::source::is_remote_name)
+        || source.postgis.is_some()
+        || source.mysql.is_some()
+        || source.sqlserver.is_some()
+        || source.gdal.is_some()
+        || source.duckdb.is_some()
+    {
+        effects = effects.with(Effect::Network);
     }
     effects
 }

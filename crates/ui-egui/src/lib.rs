@@ -4495,6 +4495,13 @@ impl RustGisApp {
         }
     }
 
+    /// Reports query losses once when discovery finishes, including a refused next document.
+    fn notice_service_query_loss(&mut self, count: u32) {
+        if count > 0 {
+            self.session.notify(i18n::fmt(rustgis_engine::data::ogc::QUERY_WITHHELD_NOTICE, &[("n", &count.to_string())]), false);
+        }
+    }
+
     /// Tells how a service layer added outside the add-service dialog (or in it) went: in the
     /// dialog's own line, or as a notice for the Connections tree.
     fn report_step(&mut self, dialog: bool, r: Result<String, String>) {
@@ -4552,6 +4559,7 @@ impl RustGisApp {
                                     resolve.slot = fetch_into(&resolve.doc);
                                 }
                                 Err(e) => {
+                                    self.notice_service_query_loss(resolve.withheld_addresses);
                                     self.report_step(dialog, Err(e));
                                     continue;
                                 }
@@ -4567,12 +4575,7 @@ impl RustGisApp {
                     };
                     resolve.crossed_origin |= rustgis_engine::render::rustgis_tiles::logins::origin(&resolve.doc)
                         != rustgis_engine::render::rustgis_tiles::logins::origin(&template);
-                    if resolve.withheld_addresses > 0 {
-                        self.session.notify(
-                            i18n::fmt(rustgis_engine::data::ogc::QUERY_WITHHELD_NOTICE, &[("n", &resolve.withheld_addresses.to_string())]),
-                            false,
-                        );
-                    }
+                    self.notice_service_query_loss(resolve.withheld_addresses);
                     let mut p = resolve.params;
                     p["tiles"] = json!(template);
                     let title = p["name"].as_str().unwrap_or("").to_string();
@@ -5776,13 +5779,20 @@ mod download_service_tests {
     /// layer is added successfully. Input is already downloaded into the usual completion slot.
     #[test]
     fn tile_resolver_completion_reports_query_settings_it_withheld() {
-        for (query, count) in [("collections=roads", 0), ("token=RGSYNTH_ui_20261103&collections=roads", 1)] {
+        let mut missing_notices = Vec::new();
+        for (query, destination, expected, count) in [
+            ("collections=roads", "", "?collections=roads", 0),
+            ("token=RGSYNTH_ui_20261103&collections=roads", "", "?collections=roads", 1),
+            ("collections=roads", "?collections=z", "?collections=z", 1),
+            ("collections=roads", "?collections=roads", "?collections=roads", 0),
+        ] {
             let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
             let list = format!("https://h.invalid/svc/tiles?{query}");
             let capabilities = json!({"title":"roads", "links":[{"rel":"tilesets-map", "href":list}]}).to_string();
-            let body =
-                br#"{"links":[{"rel":"item", "type":"image/png", "href":"https://elsewhere.invalid/{tileMatrix}/{tileRow}/{tileCol}"}]}"#
-                    .to_vec();
+            let body = json!({"links":[{"rel":"item", "type":"image/png",
+                "href":format!("https://elsewhere.invalid/{{tileMatrix}}/{{tileRow}}/{{tileCol}}{destination}")}]})
+            .to_string()
+            .into_bytes();
             let resolve = super::TilesResolve {
                 params: json!({"url":"https://h.invalid/svc", "type":"ogcapi", "layer":"map", "text":capabilities}),
                 list: list.clone(),
@@ -5797,11 +5807,52 @@ mod download_service_tests {
             app.ui.service_steps.push(super::ServiceStep::Tiles { resolve, dialog: true, origin: None, opened: app.session.opened });
             app.poll_service_steps();
             assert!(app.ui.service_steps.is_empty());
-            let notices = app.session.notices.iter().filter(|n| n.text.contains("address(es) the service listed")).count();
-            assert_eq!(notices, count);
+            let notices: Vec<_> = app.session.notices.iter().filter(|n| n.text.contains("address(es) the service listed")).collect();
+            if notices.len() != count {
+                missing_notices.push(format!("{query} -> {destination}: expected {count} notices, got {}", notices.len()));
+            }
+            if let Some(notice) = notices.first() {
+                assert!(notice.text.starts_with("1 address(es)"), "{notices:?}");
+            }
+            assert_eq!(app.session.map().tiles.len(), 1);
+            assert_eq!(app.session.map().tiles[0].url, format!("https://elsewhere.invalid/{{z}}/{{y}}/{{x}}{expected}"));
             assert!(app.session.map().tiles.iter().all(|t| !t.url.contains("RGSYNTH_")));
             assert!(app.dialogs.error.is_none(), "{:?}", app.dialogs.error);
         }
+        // Refusing the advertised next document still reports the loss already counted.
+        // This is the existing receiver slot: no fetch starts, and polling it again says nothing.
+        for (query, count) in [("collections=roads", 0), ("token=RGSYNTH_ui_refused&collections=roads", 1)] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let list = format!("https://h.invalid/svc/tiles?{query}");
+            let body = json!({"tilesets":[{"tileMatrixSetId":"WebMercatorQuad",
+                "links":[{"rel":"self", "href":"http://127.0.0.1/tiles"}]}]})
+            .to_string()
+            .into_bytes();
+            let resolve = super::TilesResolve {
+                params: json!({"url":"https://h.invalid/svc", "type":"ogcapi", "layer":"map"}),
+                list: list.clone(),
+                doc: list,
+                crossed_origin: false,
+                read: 0,
+                withheld_addresses: 0,
+                vector: false,
+                fallback: "https://h.invalid/svc/tiles/{z}/{y}/{x}".into(),
+                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(body)))),
+            };
+            app.ui.service_steps.push(super::ServiceStep::Tiles { resolve, dialog: false, origin: None, opened: app.session.opened });
+            app.poll_service_steps();
+            assert!(app.ui.service_steps.is_empty() && app.session.map().tiles.is_empty());
+            let notices: Vec<_> = app.session.notices.iter().filter(|n| n.text.contains("address(es) the service listed")).collect();
+            if notices.len() != count {
+                missing_notices.push(format!("refused next for {query}: expected {count} notices, got {}", notices.len()));
+            }
+            assert_eq!(app.session.notices.iter().filter(|n| n.error).count(), 1);
+            assert!(app.session.notices.iter().any(|n| n.error && n.text.contains("local network")));
+            let before = app.session.notices.len();
+            app.poll_service_steps();
+            assert_eq!(app.session.notices.len(), before, "no repeated refusal or loss notice");
+        }
+        assert!(missing_notices.is_empty(), "{missing_notices:?}");
     }
 
     /// Real UI discovery never restores a login after a foreign hop, while a public saved

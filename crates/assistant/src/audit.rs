@@ -229,7 +229,8 @@ fn mentions_secret(text: &str) -> bool {
 /// a call's are, line by line, so one line that doesn't parse leaves the others redacted. A line
 /// whose parameters aren't JSON keeps only its command id.
 fn redact_script(script: &str) -> String {
-    script
+    let omitted = script.lines().skip(rustgis_engine::cmd::workflows::MAX_SCRIPT_LINES).count();
+    let output = script
         .lines()
         .take(rustgis_engine::cmd::workflows::MAX_SCRIPT_LINES)
         .map(|line| match rustgis_engine::script_line(line) {
@@ -244,7 +245,8 @@ fn redact_script(script: &str) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if omitted > 0 { format!("# [{omitted} further script line(s) not recorded]\n{output}") } else { output }
 }
 
 /// `v` without what would give someone else the user's access: values under keys that name a
@@ -451,5 +453,16 @@ mod tests {
         assert!(recent.exists() && dir.path().join("notes.txt").exists());
         assert!(dir.path().join("0000000000.jsonl").exists(), "only day files are pruned");
         assert!(is_day_file("2026-10-18.jsonl") && !is_day_file("2026-13-01.jsonl") && !is_day_file("2026-10-18.json"));
+    }
+
+    /// The bounded audit copy labels omitted lines before the display's byte clipping.
+    #[test]
+    fn audit_script_line_limit_counts_unrecorded_lines() {
+        let limit = rustgis_engine::cmd::workflows::MAX_SCRIPT_LINES;
+        let clean = "# safe\n".repeat(limit);
+        assert!(!redact_script(&clean).contains("not recorded"));
+        let output = redact_script(&(clean + "layer.rename {\"layer\":\"RGSYNTH_omitted_line\"}"));
+        assert!(output.starts_with("# [1 further script line(s) not recorded]\n"));
+        assert!(!output.contains("RGSYNTH_omitted_line"));
     }
 }

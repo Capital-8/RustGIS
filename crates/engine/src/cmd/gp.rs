@@ -1006,13 +1006,17 @@ fn streamed_inputs(
         if full.contains_key(&key) {
             continue;
         }
-        if let Some(l) =
-            map.layer_by_name(n).filter(|l| l.is_streamed() && (l.selection.is_empty() || spec.is_some_and(|t| t.id == "vectorToPmtiles")))
-        {
+        if let Some(l) = map.layer_by_name(n).filter(|l| reads_full_source(l, spec)) {
             full.insert(key, l.load_all().map_err(|e| format!("{}: {e}", l.name))?);
         }
     }
     Ok(full)
+}
+
+/// The executor's source-read choice, shared with pure permission planning.
+/// Selected in-memory windows need no whole read, except for the PMTiles exporter.
+pub(crate) fn reads_full_source(layer: &rustgis_map::Layer, spec: Option<&rustgis_analysis::ToolSpec>) -> bool {
+    layer.is_streamed() && (layer.selection.is_empty() || spec.is_some_and(|t| t.id == "vectorToPmtiles"))
 }
 
 /// The layers a tool's parameters name: the values of its layer parameters (all of them, for a
@@ -1376,7 +1380,7 @@ fn queue_file(s: &mut Session, file_name: String, bytes: Vec<u8>, record: GpReco
 fn file_delivered(s: &mut Session, p: &Value) -> CmdResult {
     let id = p.get("id").and_then(Value::as_u64).ok_or("id is required")?;
     let i = s.file_outputs.iter().position(|f| f.id == id).ok_or("no pending file with that id")?;
-    s.continuation_owner(&s.file_outputs[i].continuation)?;
+    s.gp_file_owner(&s.file_outputs[i].continuation)?;
     if s.file_outputs[i].bytes.is_some() {
         return Err("the file has not been handed to the download service".into());
     }
@@ -1749,6 +1753,30 @@ mod file_tests {
         assert_eq!(s.undo_depth(), depth);
     }
 
+    /// Browser file bytes are an owned snapshot; native delivery does not target the displayed map.
+    #[test]
+    fn native_file_delivery_survives_a_map_switch() {
+        for take_before_switch in [false, true] {
+            let mut s = task_session(json!([]));
+            let pending = s.run("gp.run", &json!({"tool":"vectorToPmtiles", "params":{"input":"Cities","minZoom":0,"maxZoom":0}})).unwrap();
+            let id = pending["download"].as_u64().unwrap();
+            let early = take_before_switch.then(|| s.take_gp_files());
+            s.run("map.new", &json!({"name":"Other"})).unwrap();
+            let displayed = s.map().instance_id();
+            let files = early.unwrap_or_else(|| s.take_gp_files());
+            assert_eq!(files.len(), 1, "the native snapshot survives either delivery boundary");
+            assert_eq!(files[0].0, id);
+            assert!(files[0].2.starts_with(b"PMTiles\x03"), "the real exporter produced the queued file");
+            assert!(s.project.gp_history.is_empty(), "bytes alone do not record success");
+            assert_eq!(s.acknowledge_gp_file(id, None).unwrap()["delivered"], true);
+            assert_eq!(s.map().instance_id(), displayed, "delivery does not activate its origin map");
+            assert_eq!(s.project.gp_history.len(), 1);
+            assert!(s.project.gp_history[0].ok);
+            assert!(s.take_gp_files().is_empty(), "bytes are handed over once");
+            assert!(s.acknowledge_gp_file(id, None).is_err(), "delivery is acknowledged once");
+        }
+    }
+
     /// Browser-style bytes and final delivery remain one-use and owned by their initiating agent.
     #[test]
     fn permission_policy_file_delivery_owner_and_replay() {
@@ -1779,8 +1807,32 @@ mod file_tests {
         assert_eq!(s.undo_actor(), Some(Some("file-owner")));
         assert!(s.acknowledge_gp_file(id, None).is_err());
         s.run_scoped(owner.clone(), &crate::policy::Call::command("edit.undo", Value::Null)).unwrap();
+        // Several exports can be revoked together before the UI takes their bytes.
+        let mut retired = Vec::new();
+        for name in ["first.pmtiles", "second.pmtiles"] {
+            let call = crate::policy::Call::tool("vectorToPmtiles", json!({"input":"Cities","minZoom":0,"maxZoom":0,"output":name}));
+            let pending = s.run_scoped(owner.clone(), &call).unwrap();
+            retired.push(pending["download"].as_u64().unwrap());
+        }
+        live.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mark = s.notice_mark();
+        assert!(s.take_gp_files().is_empty());
+        let errors: Vec<_> = s.notices_since(mark).iter().filter(|notice| notice.error).map(|notice| notice.text.as_str()).collect();
+        assert_eq!(
+            errors,
+            [
+                "2 pending file export(s) could not be completed (\"first.pmtiles\", \"second.pmtiles\"): this request's authority was revoked"
+            ]
+        );
+        assert!(s.project.gp_history.is_empty(), "revoked queued files cannot record success");
+        assert!(s.take_gp_files().is_empty());
+        for id in retired {
+            assert!(s.acknowledge_gp_file(id, None).is_err(), "a retired file cannot replay its acknowledgment");
+        }
+        assert_eq!(s.notices_since(mark).len(), 1, "retired file exports report their count once");
+        live.0.store(true, std::sync::atomic::Ordering::SeqCst);
         // A host callback may revoke authority after taking the bytes but before acknowledgment.
-        let pending = s.run_scoped(owner, &call).unwrap();
+        let pending = s.run_scoped(owner.clone(), &call).unwrap();
         let id = pending["download"].as_u64().unwrap();
         assert_eq!(s.take_gp_files().len(), 1);
         live.0.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1788,6 +1840,12 @@ mod file_tests {
         assert!(s.acknowledge_gp_file(id, None).unwrap_err().contains("revoked"));
         assert!(s.notices_since(notice_mark).is_empty(), "the UI must report failures before command dispatch");
         assert!(s.project.gp_history.is_empty(), "revoked delivery cannot record success");
+        live.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        let pending = s.run_scoped(owner, &call).unwrap();
+        s.run("map.new", &json!({"name":"Other"})).unwrap();
+        assert!(s.take_gp_files().is_empty(), "restricted delivery still requires its original active map");
+        assert!(s.acknowledge_gp_file(pending["download"].as_u64().unwrap(), None).is_err());
+        assert!(s.project.gp_history.is_empty(), "refused restricted delivery cannot record success");
     }
 
     #[test]

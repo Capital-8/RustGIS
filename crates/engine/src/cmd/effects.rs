@@ -208,36 +208,44 @@ fn change_extrusion(s: &mut Session, p: &Value, f: impl FnOnce(&mut Extrusion)) 
     Ok(Value::Null)
 }
 
-/// Binds the primary target and polygon mask selected by the actual mask validator.
+/// Binds the primary target and literal mask, retaining names resolved by earlier planned steps.
 fn mask_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
-    let s = input;
-    let mut inputs = super::Inputs::primary(s, p)?;
-    let id = s.layer_id(p)?;
-    if let Some(n) = mask_of(input, p, id)? {
-        inputs.layers.extend(super::Inputs::named(s.map(), [n.as_str()])?.layers);
+    let mut inputs = super::Inputs::single_layer(input, p)?;
+    if let Some(name) = mask_name(p)? {
+        // Preserve known live validation; future names are bound by the planner and checked
+        // against the actual polygon and target when the handler runs.
+        if input.map().layer_by_name(name).is_some() {
+            mask_layer(input.map(), name, input.layer_id(p).ok())?;
+        }
+        inputs.extend(super::Inputs::named(input.map(), [name])?);
     }
     Ok(inputs)
 }
 
-/// Validates a literal polygon mask, including the existing self-mask refusal.
+/// Parses the optional literal name exactly as the mask handler consumes it.
+fn mask_name(p: &Value) -> Result<Option<&str>, String> {
+    match p.get("mask") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(n)) if n.trim().is_empty() => Ok(None),
+        Some(Value::String(n)) => Ok(Some(n)),
+        Some(_) => Err("mask is a polygon layer's name, or null".into()),
+    }
+}
+
+/// Validates a live polygon mask, including the existing self-mask refusal.
+fn mask_layer<'a>(map: &'a rustgis_map::Map, name: &str, id: Option<u32>) -> Result<&'a rustgis_map::Layer, String> {
+    let mask = map
+        .layer_by_name(name)
+        .filter(|l| l.geometry_type() == GeometryType::Polygon)
+        .ok_or_else(|| format!("no polygon layer '{name}'"))?;
+    if Some(mask.id) == id {
+        return Err("a layer can't mask itself".into());
+    }
+    Ok(mask)
+}
+
+/// Resolves and validates the literal mask against the actual execution map.
 fn mask_of(input: &impl super::InputSource, p: &Value, id: u32) -> Result<Option<String>, String> {
     let context = input.input_context();
-    let s = &context;
-    let mask = match p.get("mask") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(n)) if n.trim().is_empty() => None,
-        Some(Value::String(n)) => {
-            let m = s
-                .map()
-                .layer_by_name(n)
-                .filter(|l| l.geometry_type() == GeometryType::Polygon)
-                .ok_or_else(|| format!("no polygon layer '{n}'"))?;
-            if m.id == id {
-                return Err("a layer can't mask itself".into());
-            }
-            Some(m.name.clone())
-        }
-        Some(_) => return Err("mask is a polygon layer's name, or null".into()),
-    };
-    Ok(mask)
+    mask_name(p)?.map(|name| mask_layer(context.map(), name, Some(id)).map(|mask| mask.name.clone())).transpose()
 }

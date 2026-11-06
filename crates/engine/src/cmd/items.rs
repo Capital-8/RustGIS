@@ -50,7 +50,7 @@ pub fn commands() -> Vec<C> {
                 "ramps": s.project.ramps.iter().map(|r| r.name().to_string()).collect::<Vec<_>>(),
                 "tasks": s.project.tasks.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
             }))
-        }).roles(&[]).effects(crate::policy::Effects::NONE)
+        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .view(),
         // Map and layer files.
         C::new("map.save", "Save Map File", "Publish › Save As", |s, p| save_item(s, "map", p)).inputs(map_save_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
@@ -250,9 +250,6 @@ pub fn commands() -> Vec<C> {
                 i += 1;
                 name = format!("{base} {i}");
             }
-            // History that came with an opened project is from a file too.
-            let from_file_history = b(p, "fromHistory").unwrap_or(false) && p.get("steps").is_none() && s.history_from_file > 0;
-            let _ = from_file_history;
             s.project.tasks.push(Task { name: name.clone(), description: ps(p, "description").unwrap_or("").chars().take(2000).collect(), steps: steps.into_iter().take(200).collect() });
             Ok(json!({"task": name}))
         }).roles(&[crate::ParamRole { key: "steps", role: crate::Role::TaskSteps }]).effects(crate::policy::Effects::NONE)
@@ -565,6 +562,7 @@ struct TemplateLosses {
     label_moves: usize,
     offline_areas: usize,
     archived_edits: usize,
+    source_references: usize,
 }
 
 /// The project without features or sources that would reload them; schemas and styles stay.
@@ -595,6 +593,18 @@ fn template(p: &Project) -> (Project, TemplateLosses) {
         .filter_map(|l| l.design.archive.as_ref())
         .fold(0usize, |count, archive| count.saturating_add(archive.len()));
     t.offline_areas.clear();
+    let source_references = t
+        .maps
+        .iter()
+        .flat_map(|m| &m.layers)
+        .fold(0usize, |count, l| {
+            count
+                .saturating_add(usize::from(l.dataset.source.is_some()))
+                .saturating_add(usize::from(l.source.is_some()))
+                .saturating_add(usize::from(l.postgis.is_some()))
+                .saturating_add(usize::from(l.gpkg.is_some()))
+        })
+        .saturating_add(t.tables.iter().filter(|table| table.source.is_some()).count());
     for m in &mut t.maps {
         for l in &mut m.layers {
             l.dataset.features.clear();
@@ -620,7 +630,7 @@ fn template(p: &Project) -> (Project, TemplateLosses) {
         t.features.clear();
         t.source = None;
     }
-    (t, TemplateLosses { label_moves: moves, offline_areas, archived_edits })
+    (t, TemplateLosses { label_moves: moves, offline_areas, archived_edits, source_references })
 }
 
 /// Packages only completed imports; runtime download reservations cannot be reopened.
@@ -1127,12 +1137,15 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
         }
         "template" => {
             s.project.ensure_imports_complete()?;
-            let (mut t, TemplateLosses { label_moves, offline_areas, archived_edits }) = template(&s.project);
+            let (mut t, TemplateLosses { label_moves, offline_areas, archived_edits, source_references }) = template(&s.project);
             if let Some(n) = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
                 t.name = n.chars().take(200).collect();
             }
             let name = t.name.clone();
             let bytes = durable_bytes(s, t)?;
+            if source_references > 0 {
+                s.notify(format!("{source_references} data source reference(s) left out of the template, which keeps no features"), false);
+            }
             if label_moves > 0 {
                 s.notify(format!("{label_moves} saved label move(s) left out of the template, which keeps no features"), false);
             }

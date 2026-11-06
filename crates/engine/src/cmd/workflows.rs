@@ -504,9 +504,6 @@ fn new_model(s: &mut Session, p: &Value) -> CmdResult {
         i += 1;
         name = format!("{base} {i}");
     }
-    // History that came with an opened project is from a file too.
-    let file_history = b(p, "fromHistory").unwrap_or(false) && p.get("steps").is_none() && s.history_from_file > 0;
-    let _ = file_history;
     let n = steps.len();
     s.project.models.push(Model { name: name.clone(), steps, graph });
     Ok(json!({"model": name, "steps": n}))
@@ -664,13 +661,11 @@ fn save_model(s: &mut Session, p: &Value) -> CmdResult {
     let model = Model { name: new_name.clone(), steps: crate::model::graph_to_steps(&g), graph: Some(g) };
     // A model that came in a file stays one when saved over (or renamed): its tools still may not
     // touch files. So does a graph saved as `imported`.
-    let was_untrusted = i.is_some() && !s.item_trusted("model", &name);
     match i.and_then(|i| s.project.models.get_mut(i)) {
         Some(m) => *m = model,
         None => s.project.models.push(model),
     }
     s.trusted_models.remove(&name.to_ascii_lowercase());
-    let _ = was_untrusted;
     Ok(json!({"model": new_name}))
 }
 
@@ -797,7 +792,8 @@ pub(crate) fn steps_of<T>(s: &mut Session, run: impl FnOnce(&mut Session) -> T) 
     r.unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
-/// The most lines a script is read to: Run reads no further, and the Script pane colours no further.
+/// Maximum script lines: execution refuses longer input before any command runs.
+/// The Script pane colors at most this many lines.
 pub const MAX_SCRIPT_LINES: usize = 10_000;
 
 /// Whether command `id` can't run in a script: scripts and notebooks (which would run scripts), and
@@ -811,7 +807,10 @@ pub fn refused_in_script(id: &str) -> bool {
 /// a script (scripts, notebooks, `ui.*`), is an error naming its line.
 pub fn script_commands(script: &str) -> Result<Vec<(usize, String, Value)>, String> {
     let mut out = Vec::new();
-    for (n, line) in script.lines().enumerate().take(MAX_SCRIPT_LINES) {
+    for (n, line) in script.lines().enumerate().take(MAX_SCRIPT_LINES + 1) {
+        if n == MAX_SCRIPT_LINES {
+            return Err(format!("the script has more than {MAX_SCRIPT_LINES} lines; split it before running"));
+        }
         if let Some(parsed) = crate::script_line(line) {
             let (id, params) = parsed.map_err(|e| format!("line {}: {e}", n + 1))?;
             out.push((n + 1, id, params));

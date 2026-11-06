@@ -1462,3 +1462,210 @@ fn permission_policy_zoom_to_tiles_reads_only_unknown_metadata() {
     assert!(matches!(s.review(&refuse, &call), Outcome::Allowed), "ordinary XYZ tiles have no metadata read");
     assert!(s.run_scoped(refuse, &call).unwrap_err().contains("doesn't say what it covers"));
 }
+
+/// Optional measurement rasters stay optional in both strict automation vehicles.
+#[test]
+fn permission_policy_layerless_measurement_matches_strict_execution() {
+    let mut s = world();
+    let (scope, _) = assistant(3501);
+    for kind in ["distance", "area"] {
+        let params = json!({"kind":kind,"points":[[0,0],[1,0],[1,1]]});
+        let direct = s.run("raster.measure", &params).unwrap();
+        let script = format!("raster.measure {params}");
+        let call = Call::command("script.run", json!({"script":script}));
+        let p = pending(&s, &scope, &call);
+        let result = s.run_permitted(scope.clone(), p.allow(), &call).unwrap();
+        assert_eq!(result["ran"][0]["result"], direct);
+        let name = format!("Measure {kind}");
+        s.run("task.new", &json!({"name":name,"steps":[{"title":"Measure","command":"raster.measure","params":params}]})).unwrap();
+        let call = Call::command("task.run", json!({"task":name}));
+        let p = pending(&s, &scope, &call);
+        s.run_permitted(scope.clone(), p.allow(), &call).unwrap();
+    }
+    s.run("layer.addDataBytes", &json!({"fileName":"scene.tif","data":two_class_b64()})).unwrap();
+    let params = json!({"kind":"distance","layer":"scene","points":[[0,0],[1,0]]});
+    let call = Call::command("script.run", json!({"script":format!("raster.measure {params}")}));
+    let p = pending(&s, &scope, &call);
+    s.run("layer.remove", &json!({"layer":"scene"})).unwrap();
+    let measurements = s.measurements.len();
+    assert!(s.run_permitted(scope.clone(), p.allow(), &call).is_err());
+    assert_eq!(s.measurements.len(), measurements, "an explicitly selected missing raster remains bound");
+    assert!(s.run("raster.measure", &json!({"kind":"volume","points":[[0,0],[1,0],[1,1]]})).is_err());
+}
+
+/// In-run renamed inputs retain external reach in the fast preflight and the strict card.
+#[test]
+fn permission_policy_renamed_streamed_inputs_keep_their_reach() {
+    use crate::policy::AgentAccess;
+    let mut outcomes = Vec::new();
+    for tool in [true, false] {
+        let mut s = world();
+        let id = s.map().layer_by_name("Cities").unwrap().id;
+        let mut source = rustgis_map::source::SourceLayer::default();
+        source.path = Some("https://example.invalid/renamed.fgb".into());
+        let layer = s.map_mut().layer_mut(id).unwrap();
+        layer.source = Some(source);
+        layer.selection.clear();
+        let read = if tool {
+            "gp.run {\"tool\":\"buffer\",\"params\":{\"input\":\"Renamed source\",\"distance\":10}}"
+        } else {
+            "layer.loadAll {\"layer\":\"Renamed source\"}"
+        };
+        let script = format!("layer.rename {{\"layer\":\"Cities\",\"name\":\"Renamed source\"}}\n{read}");
+        let (scope, _) = assistant(3502 + u64::from(tool));
+        let call = Call::script(&script);
+        let needs_approval = matches!(s.review(&scope, &call), Outcome::NeedsApproval(_));
+        let strict = Call::command("script.run", json!({"script":script}));
+        let p = pending(&s, &scope, &strict);
+        let operation = if tool { "buffer " } else { "layer.loadAll " };
+        let shown_as_external = p.review().steps.iter().any(|step| step.starts_with(operation));
+        outcomes.push((operation, needs_approval, shown_as_external));
+        // A late refusal must still restore the earlier rename; no source read is permitted.
+        let before = serde_json::to_value(&s.project).unwrap();
+        let refuse = Scope::agent(AgentAccess::Refuse, false, "rename-no-io", None, Arc::new(Live(AtomicBool::new(true))));
+        assert!(s.run_scoped(refuse, &call).is_err());
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+    }
+    assert!(outcomes.iter().all(|(_, asks, shown)| *asks && *shown), "{outcomes:?}");
+}
+
+/// Secondary optional inputs must retain future names for the planner's existing alias resolver.
+#[test]
+fn permission_policy_stretch_like_keeps_its_renamed_raster_target() {
+    let mut s = world();
+    for file in ["scene.tif", "template.tif"] {
+        s.run("layer.addDataBytes", &json!({"fileName":file,"data":two_class_b64()})).unwrap();
+    }
+    let (scope, _) = assistant(3504);
+    let call = Call::command(
+        "script.run",
+        json!({"script":
+            "layer.rename {\"layer\":\"scene\",\"name\":\"Renamed scene\"}\nlayer.rename {\"layer\":\"template\",\"name\":\"Renamed template\"}\nraster.stretch {\"layer\":\"Renamed scene\",\"like\":\"Renamed template\"}"
+        }),
+    );
+    let p = pending(&s, &scope, &call);
+    let detail = p.review().details.iter().find(|d| d.operation == "raster.stretch").unwrap();
+    assert!(detail.targets.iter().any(|t| t.ends_with(" / scene")), "{detail:?}");
+    assert!(detail.targets.iter().any(|t| t.ends_with(" / template")), "the actual secondary raster must appear: {detail:?}");
+    s.run_permitted(scope, p.allow(), &call).unwrap();
+    assert!(s.map().layer_by_name("Renamed scene").is_some());
+    assert!(s.map().layer_by_name("Renamed template").is_some());
+}
+
+/// The save executor already retires the old trust key before the shared post-handler hook.
+#[test]
+fn permission_policy_model_rename_does_not_leave_old_name_trust() {
+    let mut s = world();
+    let graph = json!({"nodes":[{"id":"i","kind":"input","layer":"Cities"},{"id":"b","kind":"tool","tool":"buffer","params":{"distance":10}}],
+        "edges":[{"from":"i","fromPort":"out","to":"b","toPort":"input"}]});
+    s.run("model.new", &json!({"name":"Original","graph":graph})).unwrap();
+    let original = s.item_content("model", "Original").unwrap();
+    assert!(s.item_trusted("model", "Original"));
+    s.run("model.save", &json!({"name":" Original ","rename":" Renamed ","graph":graph})).unwrap();
+    assert!(s.item_trusted("model", "Renamed"));
+    assert!(!s.trusted_models.contains_key("original"));
+    s.run("model.new", &json!({"name":"Original","graph":graph,"imported":true})).unwrap();
+    assert_eq!(s.item_content("model", "Original").unwrap(), original, "the recreated executable content is identical");
+    assert!(!s.item_trusted("model", "Original"));
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert!(s.item_trusted("model", "Renamed"));
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert!(s.item_trusted("model", "Original"));
+    assert!(s.project.models.iter().all(|m| m.name != "Renamed"));
+}
+
+/// An ignored field on a trusted editor cannot confer trust on another item's unchanged code.
+#[test]
+fn permission_policy_ignored_rename_does_not_promote_another_task() {
+    let mut s = world();
+    s.run("task.new", &json!({"name":"Authored","steps":[]})).unwrap();
+    s.run(
+        "task.new",
+        &json!({"name":"Foreign","imported":true,"steps":[
+            {"title":"Foreign source","command":"layer.addUrl","params":{"url":"https://example.invalid/foreign.csv"}}
+        ]}),
+    )
+    .unwrap();
+    let foreign = s.item_content("task", "Foreign").unwrap();
+    assert!(s.item_trusted("task", "Authored"));
+    assert!(!s.item_trusted("task", "Foreign"));
+    s.run("task.addStep", &json!({"task":"Authored","title":"Zoom","command":"map.zoomIn","rename":"Foreign"})).unwrap();
+    assert_eq!(s.item_content("task", "Foreign").unwrap(), foreign);
+    assert!(!s.item_trusted("task", "Foreign"), "an ignored field must not promote unchanged imported code");
+    assert!(s.item_trusted("task", "Authored"), "the actual user-edited task retains its content record");
+}
+
+/// Strict consent refuses a name collision instead of guessing which layer execution will select.
+#[test]
+fn permission_policy_rename_collision_refuses_only_strict_review() {
+    let s = world();
+    let params = json!({"layer":"Cities","name":" Countries "});
+    let call = Call::command("script.run", json!({"script":format!("layer.rename {params}")}));
+    let (scope, _) = assistant(3505);
+    let before = serde_json::to_value(&s.project).unwrap();
+    assert!(matches!(s.review(&scope, &call), Outcome::Refused(e) if e.contains("share another layer's name")));
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "refusal never executes the rename");
+
+    let call = Call::command(
+        "script.run",
+        json!({"script":
+            "layer.rename {\"layer\":\"Cities\",\"name\":\"Fresh\"}\nlayer.rename {\"layer\":\"Countries\",\"name\":\"Fresh\"}"
+        }),
+    );
+    assert!(matches!(s.review(&scope, &call), Outcome::Refused(e) if e.contains("share another layer's name")));
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "planned collisions are refused before either rename");
+
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let call = Call::command(
+        "script.run",
+        json!({"script":
+            "layer.rename {\"layer\":\"Cities\",\"name\":\"Fresh\"}\nlayer.rename {\"layer\":\"Fresh\",\"name\":\"Fresh\"}"
+        }),
+    );
+    let p = pending(&s, &scope, &call);
+    s.run_permitted(scope.clone(), p.allow(), &call).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().name, "Fresh", "a repeat rename of the same bound object remains allowed");
+
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    s.run("layer.rename", &params).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().name, "Countries", "ordinary User naming remains unchanged");
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let allow =
+        Scope::agent(crate::policy::AgentAccess::Allow, false, "rename-collision-allow", None, Arc::new(Live(AtomicBool::new(true))));
+    let call = Call::script(&format!("layer.rename {params}"));
+    assert!(matches!(s.review(&allow, &call), Outcome::Allowed));
+    s.run_scoped(allow, &call).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().name, "Countries", "the Allow ingress retains its existing convention");
+}
+
+/// Mask and elevation metadata retain names that only exist after an earlier planned rename.
+#[test]
+fn permission_policy_renamed_mask_and_elevation_keep_their_targets() {
+    let mut s = world();
+    s.run("layer.addDataBytes", &json!({"fileName":"scene.tif","data":two_class_b64()})).unwrap();
+    let cities = s.map().layer_by_name("Cities").unwrap().id;
+    let (scope, _) = assistant(3506);
+    for params in [json!({"layer":"Cities","mask":"Cities"}), json!({"layer":"Countries","mask":"Countries"})] {
+        let call = Call::command("script.run", json!({"script":format!("layer.mask {params}")}));
+        assert!(matches!(s.review(&scope, &call), Outcome::Refused(_)), "known nonpolygon and self masks remain refused");
+    }
+    assert!(s.run("edit.elevation", &json!({"mode":"surface","surface":"Cities"})).is_err());
+    let call = Call::command(
+        "script.run",
+        json!({"script":
+            "layer.rename {\"layer\":\"Countries\",\"name\":\"Renamed mask\"}\nlayer.rename {\"layer\":\"Cities\",\"name\":\"Renamed cities\"}\nlayer.rename {\"layer\":\"scene\",\"name\":\"Renamed surface\"}\nlayer.mask {\"layer\":\"Renamed cities\",\"mask\":\"Renamed mask\"}\nedit.elevation {\"mode\":\"surface\",\"surface\":\"Renamed surface\"}"
+        }),
+    );
+    let p = pending(&s, &scope, &call);
+    let mask = p.review().details.iter().find(|d| d.operation == "layer.mask").unwrap();
+    assert!(mask.targets.iter().any(|t| t.ends_with(" / Countries")), "{mask:?}");
+    assert!(mask.targets.iter().any(|t| t.ends_with(" / Cities")), "{mask:?}");
+    let elevation = p.review().details.iter().find(|d| d.operation == "edit.elevation").unwrap();
+    assert!(elevation.targets.iter().any(|t| t.ends_with(" / scene")), "{elevation:?}");
+    s.run_permitted(scope, p.allow(), &call).unwrap();
+    assert_eq!(s.map().layer(cities).unwrap().mask.as_deref(), Some("Renamed mask"));
+    assert!(matches!(&s.map().editing.settings.elevation, rustgis_map::design::Elevation::Surface(name) if name == "Renamed surface"));
+}

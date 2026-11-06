@@ -111,7 +111,8 @@ pub(crate) fn command(id: &str, params: &Value, depth: usize) -> (Option<Value>,
     (changed, report)
 }
 
-/// Tools use command roles too, including the data-valued `input`/`values` parameters.
+/// Tools use the common parameter rules, including data-valued `input`/`values`; command-specific
+/// metadata belongs to command registrations, not the separate tool registry.
 pub(crate) fn tool(id: &str, params: &Value, depth: usize) -> (Option<Value>, Report) {
     let mut report = Report::default();
     let builtin = rustgis_analysis::TOOLS.iter().any(|t| t.id == id);

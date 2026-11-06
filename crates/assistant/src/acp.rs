@@ -480,7 +480,12 @@ impl Session {
                 }
             },
             Ready::Refuse => {
-                events.extend(self.refuse_mode("RustGIS can't confirm that the agent asks before acting"));
+                let why = if self.modes.is_empty() {
+                    "the agent advertised no modes, so RustGIS can't confirm that it asks before acting"
+                } else {
+                    "RustGIS can't confirm that the agent asks before acting"
+                };
+                events.extend(self.refuse_mode(why));
                 Vec::new()
             }
         }

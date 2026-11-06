@@ -102,6 +102,7 @@ impl Exchange {
     /// Recorded only after output rollback. Every entry is session-local and replaced per push.
     fn record(p: &Project, generation: u64) -> (Self, u32) {
         let mut entries: Vec<Entry> = Vec::new();
+        let mut forms: HashMap<String, (usize, bool)> = HashMap::new();
         let mut recording = true;
         let mut held = 0usize;
         let mut omitted = 0u32;
@@ -116,10 +117,9 @@ impl Exchange {
             };
             // Even an account omitted by the cap cannot make an earlier recorded public form
             // unambiguous. After the first overflow, no later slot is recorded.
-            for e in entries.iter_mut().filter(|e| e.public == public) {
-                e.ambiguous |= e.full != slot.value;
+            if let Some((first, ambiguous)) = forms.get_mut(&public) {
+                *ambiguous |= entries.get(*first).is_none_or(|e| e.full != slot.value);
             }
-            let ambiguous = entries.iter().any(|e| e.public == public && e.ambiguous);
             let bytes = slot.value.len().saturating_add(public.len()).saturating_add(key_bytes(&slot.key));
             if !recording || entries.len() >= MAX_ENTRIES || held.saturating_add(bytes) > MAX_BYTES {
                 recording = false;
@@ -127,7 +127,11 @@ impl Exchange {
                 continue;
             }
             held += bytes;
-            entries.push(Entry { key: slot.key, public, full: slot.value.into(), ambiguous });
+            forms.entry(public.clone()).or_insert((entries.len(), false));
+            entries.push(Entry { key: slot.key, public, full: slot.value.into(), ambiguous: false });
+        }
+        for entry in &mut entries {
+            entry.ambiguous = forms.get(&entry.public).is_none_or(|(_, ambiguous)| *ambiguous);
         }
         (Self { generation, entries }, omitted)
     }
@@ -147,10 +151,10 @@ impl Exchange {
     fn retain(&self, live: &Project, incoming: &mut Project, raw: &HashSet<SlotKey>) {
         let current = census(live);
         let normalized = census(incoming);
-        let mut records: HashMap<&SlotKey, usize> = HashMap::new();
+        let mut records: HashMap<&SlotKey, (usize, &Entry)> = HashMap::new();
         let mut accounts: HashMap<&str, Option<&str>> = HashMap::new();
         for e in &self.entries {
-            *records.entry(&e.key).or_default() += 1;
+            records.entry(&e.key).or_insert((0, e)).0 += 1;
             let account = accounts.entry(&e.public).or_insert(Some(&e.full));
             if *account != Some(e.full.as_str()) {
                 *account = None;
@@ -159,13 +163,13 @@ impl Exchange {
         let edits: Vec<_> = slots(incoming)
             .into_iter()
             .filter_map(|slot| {
-                let e = self.entries.iter().find(|e| e.key == slot.key)?;
+                let (count, e) = records.get(&slot.key)?;
                 let unique = |census: &HashMap<SlotKey, (usize, &str)>, expected: &str| {
                     census.get(&slot.key).is_some_and(|(n, value)| *n == 1 && *value == expected)
                 };
                 (!e.ambiguous
                     && raw.contains(&slot.key)
-                    && records.get(&slot.key) == Some(&1)
+                    && *count == 1
                     && accounts.get(e.public.as_str()) == Some(&Some(e.full.as_str()))
                     && unique(&current, &e.full)
                     && unique(&normalized, &e.public))

@@ -202,9 +202,13 @@ impl Session {
     /// restricted delivery still binds the original live map and source identities.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn finish_export<T>(&mut self, c: &Continuation, f: impl FnOnce(&mut Session) -> T) -> Result<T, String> {
-        if !self.policy.scopes.is_empty() && !self.scope().same_caller(&c.scope) {
-            return Err("this run belongs to another caller".into());
-        }
+        self.check_export_delivery(c)?;
+        self.resume_checked(c, f)
+    }
+    /// Exported bytes own their snapshot; a native map switch cannot retarget their delivery.
+    /// Scoped delivery retains its original map, sources, accounts and live owner.
+    pub(crate) fn check_export_delivery(&self, c: &Continuation) -> Result<(), String> {
+        self.check_delivery_owner(c)?;
         if c.native_tool_owner() {
             self.check_continuation_accounts(c)?;
             for (key, source) in &c.sources {
@@ -212,10 +216,17 @@ impl Session {
                     return Err("the live source or account changed since this request started".into());
                 }
             }
+            Ok(())
         } else {
-            self.check_continuation(c)?;
+            self.check_continuation(c)
         }
-        self.resume_checked(c, f)
+    }
+    /// A JSON file acknowledgment must already be executing as the captured owner.
+    pub(crate) fn gp_file_owner(&self, c: &Continuation) -> Result<(), String> {
+        if !self.scope().same_caller(&c.scope) {
+            return Err("this run belongs to another caller".into());
+        }
+        self.check_export_delivery(c)
     }
     /// Distinguishes a direct native URL ingress from a handler already holding admission.
     pub(super) fn policy_has_no_operation(&self) -> bool {
@@ -643,7 +654,7 @@ impl Session {
             && let Some(run_id) = params.get("id").and_then(Value::as_u64)
             && let Some(r) = self.file_outputs.iter().find(|r| r.id == run_id)
         {
-            self.continuation_owner(&r.continuation)?;
+            self.gp_file_owner(&r.continuation)?;
             let spec = *self.registry.get(id).ok_or("no file completion command")?;
             return Ok(Authorized { op: CommandOp::Registered { spec, params: params.clone() }, node: r.continuation.node.clone() });
         }
@@ -871,10 +882,8 @@ impl Session {
     /// Applies delivery status under the stored owner, after a live/generation check.
     pub fn acknowledge_gp_file(&mut self, id: u64, error: Option<&str>) -> CmdResult {
         let c = self.file_outputs.iter().find(|r| r.id == id).ok_or("no pending file with that id")?.continuation.clone();
-        if !self.policy.scopes.is_empty() {
-            self.continuation_owner(&c)?;
-        }
-        self.resume(&c, |s| s.run("gp.fileDelivered", &json!({"id":id,"error":error})))?
+        self.check_export_delivery(&c)?;
+        self.resume_checked(&c, |s| s.run("gp.fileDelivered", &json!({"id":id,"error":error})))?
     }
     /// Retries the same pinned plugin command and exact parameters under its initiating scope.
     pub(crate) fn retry_continuation(&mut self, c: &Continuation, params: &Value) -> CmdResult {

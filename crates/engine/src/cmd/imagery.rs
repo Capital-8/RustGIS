@@ -73,7 +73,7 @@ pub fn commands() -> Vec<C> {
         C::new("raster.editPixels", "Pixel Editor", "Analyze › Imagery Tools", edit_pixels).inputs(raster_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"layer": raster, "polygon": [[lon, lat], …], "value"?: number (no-data when omitted), "band"?: 1-based (all when omitted)}"#),
         // Measurements are session results, not project changes: no undo step.
-        C::new("raster.measure", "Mensuration Tools", "Analyze › Mensuration", measure).inputs(raster_inputs).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
+        C::new("raster.measure", "Mensuration Tools", "Analyze › Mensuration", measure).inputs(measure_inputs).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
             r#"{"layer"?: elevation raster, "kind": "distance"|"area"|"height"|"volume", "points": [[lon, lat], …], "base"?: metres (volume)}"#,
         ),
         C::new("raster.measurements", "Results", "Analyze › Mensuration", |s, p| {
@@ -1727,6 +1727,10 @@ fn mesh(s: &mut Session, p: &Value) -> CmdResult {
 fn raster_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
     let s = input;
     super::Inputs::named(s.map(), [raster_name(p)?])
+}
+/// Measures distance and area without a raster, or binds the explicitly selected elevation raster.
+fn measure_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    super::Inputs::named(input.map(), ps(p, "layer"))
 }
 /// Binds both literal before/after rasters used by change detection.
 fn change_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {

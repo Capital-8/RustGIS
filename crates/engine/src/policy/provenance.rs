@@ -16,11 +16,13 @@ impl Session {
     }
     /// Snapshots only executable content; generated notebook output never confers trust.
     pub(crate) fn item_content(&self, kind: &str, name: &str) -> Option<Value> {
-        match kind{
-        "task"=>self.project.tasks.iter().find(|t|t.name.eq_ignore_ascii_case(name)).map(|t|json!(t.steps)),
-        "notebook"=>self.project.notebooks.iter().find(|n|n.name.eq_ignore_ascii_case(name)).map(|n|json!({"language":n.language(),"cells":n.cells.iter().map(|c|json!({"kind":c.kind,"source":c.source})).collect::<Vec<_>>()})),
-        _=>self.project.models.iter().find(|m|m.name.eq_ignore_ascii_case(name)).map(|m|json!({"steps":m.steps,"graph":m.graph})),
-    }
+        match kind {
+            "task" => self.project.tasks.iter().find(|t| t.name.eq_ignore_ascii_case(name)).map(|t| json!(t.steps)),
+            "notebook" => self.project.notebooks.iter().find(|n| n.name.eq_ignore_ascii_case(name)).map(|n| {
+                json!({"language":n.language(),"cells":n.cells.iter().map(|c|json!({"kind":c.kind,"source":c.source})).collect::<Vec<_>>()})
+            }),
+            _ => self.project.models.iter().find(|m| m.name.eq_ignore_ascii_case(name)).map(|m| json!({"steps":m.steps,"graph":m.graph})),
+        }
     }
     /// Uses each item executor's own selector, including active/default items.
     pub(crate) fn item_name(&self, kind: &str, p: &Value) -> Result<String, String> {
@@ -75,7 +77,7 @@ impl Session {
             let name = if id == "model.save" {
                 result.get("model").and_then(Value::as_str).map(str::to_owned)
             } else {
-                p.get("rename").and_then(Value::as_str).map(str::to_string).or_else(|| self.item_name(kind, p).ok())
+                self.item_name(kind, p).ok()
             };
             if let Some(name) = name {
                 self.trust_record(kind, &name);

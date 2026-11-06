@@ -423,7 +423,7 @@ pub fn commands() -> Vec<C> {
                     Elevation::Constant(z.clamp(-12_000.0, 100_000.0))
                 },
                 "surface" => {
-                    let n = ps(p, "surface").ok_or("surface (a raster layer) is required")?;
+                    let n = surface_name(p)?;
                     let l = surface_layer(s,n).ok_or_else(|| format!("no raster layer '{n}'"))?;
                     Elevation::Surface(l.name.clone())
                 }
@@ -1398,17 +1398,14 @@ fn surface_layer<'a>(input: &'a impl super::InputSource, name: &str) -> Option<&
     let s = &context;
     s.map().layer_by_name(name).filter(|l| l.is_raster())
 }
+/// The literal surface selector shared by the executor and dependency planning.
+fn surface_name(p: &Json) -> Result<&str, String> {
+    ps(p, "surface").ok_or("surface (a raster layer) is required".into())
+}
 /// Only surface mode consumes a layer; constant and none are parameter-only.
 fn elevation_inputs(input: &super::InputContext<'_>, p: &Json) -> Result<super::Inputs, String> {
-    let s = input;
-    Ok(super::Inputs::layers(
-        if ps(p, "mode") == Some("surface") {
-            surface_layer(input, ps(p, "surface").ok_or("surface (a raster layer) is required")?)
-        } else {
-            None
-        }
-        .map(|l| (s.map(), l)),
-    ))
+    let name = if ps(p, "mode") == Some("surface") { Some(surface_name(p)?) } else { None };
+    super::Inputs::named(input.map(), name)
 }
 /// Only new rows sample the stored elevation surface; ordinary attribute edits do not.
 pub(crate) fn new_feature_inputs(input: &super::InputContext<'_>, p: &Json) -> Result<super::Inputs, String> {

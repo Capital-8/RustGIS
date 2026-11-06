@@ -501,9 +501,9 @@ fn inherit_reviewed(from: &str, to: &str, relation: Relation, skip: &[&str], rev
             continue;
         }
         if keys.iter().any(|k| present.contains(k)) {
-            // Never overwrite a destination's pair, including a legacy sub-pair. If only some
-            // names overlap, the rest of this indivisible raw pair were withheld too.
-            out.withheld |= keys.iter().any(|k| !present.contains(k));
+            // Keep destination and earlier pairs unchanged. Only an identical raw pair is
+            // already represented; other skipped values must be reported.
+            out.withheld |= !query(&out.url).split('&').any(|kept| kept == pair);
             continue;
         }
         let safe = class == NameClass::Plain && keys.iter().all(|k| SAFE_OPTIONS.contains(&k.as_str()));
@@ -719,5 +719,20 @@ mod tests {
         );
         assert_eq!(duplicate.url, format!("{target}?token=destination"));
         assert!(duplicate.withheld);
+        // A different value of an existing option is withheld too, including an earlier
+        // source option, encoded names and indivisible legacy pairs. Exact duplicates are quiet.
+        for relation in [Relation::Constructed, Relation::Advertised] {
+            for (query, destination, expected, withheld) in [
+                ("subset=Lat(10,20)&subset=Long(30,40)", "", "?subset=Lat(10,20)", true),
+                ("%63ollections=roads", "?collections=z", "?collections=z", true),
+                ("collections=roads;datetime=2020", "?collections=z&datetime=2021", "?collections=z&datetime=2021", true),
+                ("collections=roads&collections=roads", "", "?collections=roads", false),
+                ("collections=roads", "?collections=roads", "?collections=roads", false),
+                ("collections=roads;datetime=2020", "?collections=roads;datetime=2020", "?collections=roads;datetime=2020", false),
+            ] {
+                let inherited = inherit_query(&format!("https://h.invalid/svc?{query}"), &format!("{target}{destination}"), relation, &[]);
+                assert_eq!(inherited, Inherited { url: format!("{target}{expected}"), withheld }, "{relation:?}: {query}");
+            }
+        }
     }
 }

@@ -618,7 +618,7 @@ impl<'a> Builder<'a> {
                 "a later map selector follows a rename whose namespace cannot be frozen; split the request or run it yourself".into()
             );
         }
-        let effects = super::effects::command(&self.context(), &spec, params);
+        let effects = super::effects::command(&self.context(), &spec, params, self.primary_layer(params));
         let mut n = self.adapter("command", effects, params.clone());
         n.op = Op::Command(spec);
         self.bind(&mut n, params, None)?;
@@ -639,8 +639,7 @@ impl<'a> Builder<'a> {
         }
         // Rename changes a spelling, not the approved object's identity. Later named steps
         // resolve the new spelling to the same id, without simulating the handler's edits.
-        if self.strict
-            && id == "layer.rename"
+        if id == "layer.rename"
             && let Some(name) = params.get("name").and_then(Value::as_str)
         {
             let target = n
@@ -651,6 +650,18 @@ impl<'a> Builder<'a> {
                 .or_else(|| self.context().active_layer.map(|id| self.layer_target(id, false)));
             if let Some(target) = target {
                 let spelling = name.trim().chars().take(200).collect::<String>();
+                if self.strict
+                    && (self.symbol(&spelling).is_some_and(|other| !Self::same_layer_target(&target, other))
+                        || self.context().map().layers.iter().any(|layer| {
+                            layer.name.eq_ignore_ascii_case(&spelling)
+                                && !Self::same_layer_target(
+                                    &target,
+                                    &Target::Layer { key: LayerKey::of(self.context().map(), layer), source: None },
+                                )
+                        }))
+                {
+                    return Err("a layer rename would share another layer's name; choose a unique name before asking for approval".into());
+                }
                 let target = match target {
                     Target::MadeLayer { .. } => Target::MadeLayer { map: self.context().map().instance_id(), name: spelling.clone() },
                     other => other,
@@ -698,28 +709,13 @@ impl<'a> Builder<'a> {
         if pin.resolved.source().is_some_and(|s| s != "geolibre" && s != rustgis_plugins::tools::SOURCE) {
             effects = effects.with(Effect::Unreviewed);
         }
-        // The same selector/selection predicate as inputs_of: selected in-memory windows
-        // need no extra source read, while a whole streamed input does.
+        // Source effects follow the same whole-read decision as the executor, resolving
+        // prior renames by their bound identity in fast preflight and strict review alike.
         for name in crate::cmd::gp::layer_names(Some(pin.spec()), &params) {
-            if let Some(l) = self
-                .context()
-                .map()
-                .layer_by_name(name)
-                .filter(|l| l.is_streamed() && (l.selection.is_empty() || pin.spec().id == "vectorToPmtiles"))
-                && let Some(source) = &l.source
+            if let Some(layer) = self.named_layer(name).filter(|layer| crate::cmd::gp::reads_full_source(layer, Some(pin.spec())))
+                && let Some(source) = &layer.source
             {
-                if source.path.is_some() || source.gdal.is_some() || source.duckdb.is_some() {
-                    effects = effects.with(Effect::Files);
-                }
-                if source.path.as_deref().is_some_and(rustgis_data::source::is_remote_name)
-                    || source.postgis.is_some()
-                    || source.mysql.is_some()
-                    || source.sqlserver.is_some()
-                    || source.gdal.is_some()
-                    || source.duckdb.is_some()
-                {
-                    effects = effects.with(Effect::Network);
-                }
+                effects = effects.union(super::effects::source_reach(source));
             }
         }
         let mut n = self.adapter("tool", effects, params.clone());
@@ -767,7 +763,7 @@ impl<'a> Builder<'a> {
                         _ => Vec::new(),
                     };
                     for name in names {
-                        if let Some(target) = self.symbols.get(&(self.context().map().instance_id(), name.to_lowercase())) {
+                        if let Some(target) = self.symbol(name) {
                             n.targets.push(self.bound_symbol(target, reads));
                         } else if matches!(p.kind, VectorLayers) && crate::cmd::gp::vector_file_input(spec, self.context().map(), name) {
                             n.places.push(json!({p.name:name}));
@@ -818,7 +814,7 @@ impl<'a> Builder<'a> {
                 n.display.places.extend(inputs.review_places);
                 let uses_default = inputs.uses_default;
                 for name in inputs.future_layers {
-                    if let Some(target) = self.symbols.get(&(self.context().map().instance_id(), name.to_lowercase())) {
+                    if let Some(target) = self.symbol(&name) {
                         // Owner callbacks keep the same map-qualified representation after an in-run rename.
                         n.targets.push(match self.bound_symbol(target, reads) {
                             Target::Layer { key, source } => {
@@ -1004,9 +1000,45 @@ impl<'a> Builder<'a> {
         n.display.places.dedup();
         Ok(())
     }
+    /// Compares proven layer identity without treating source metadata as identity.
+    fn same_layer_target(a: &Target, b: &Target) -> bool {
+        let key = |target: &Target| match target {
+            Target::Layer { key, .. } => Some(*key),
+            Target::LayerInMap { map, id, instance, .. } => Some(LayerKey { map: *map, id: *id, instance: *instance }),
+            _ => None,
+        };
+        match (key(a), key(b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => matches!((a, b), (Target::MadeLayer { map: a, name: an }, Target::MadeLayer { map: b, name: bn })
+                if a == b && an.eq_ignore_ascii_case(bn)),
+        }
+    }
+    /// One map-qualified planned spelling lookup for targets and effect inference.
+    fn symbol(&self, name: &str) -> Option<&Target> {
+        self.symbols.get(&(self.context().map().instance_id(), name.to_lowercase()))
+    }
+    /// Literal names retain the executor's map-layer precedence; known future outputs never
+    /// fall back to a same-named old layer as if they already had a source.
+    fn named_layer(&self, name: &str) -> Option<&rustgis_map::Layer> {
+        match self.symbol(name) {
+            Some(Target::Layer { key, .. }) => key.get(self.s),
+            Some(Target::LayerInMap { map, id, instance, .. }) => LayerKey { map: *map, id: *id, instance: *instance }.get(self.s),
+            Some(_) => None,
+            None => self.context().map().layer_by_name(name),
+        }
+    }
+    /// Uses the execution owner's name-before-id/default selector, with prior bound renames.
+    fn primary_layer(&self, params: &Value) -> Option<&rustgis_map::Layer> {
+        if let Some(name) = params.get("layer").and_then(Value::as_str)
+            && self.symbol(name).is_some()
+        {
+            return self.named_layer(name);
+        }
+        self.context().layer_id(params).ok().and_then(|id| self.context().map().layer(id))
+    }
     /// Uses Session's real name-before-id and numeric/default selector semantics.
     fn layer_target_value(&self, value: &Value, reads: bool) -> Result<Target, String> {
-        if let Some(t) = value.as_str().and_then(|name| self.symbols.get(&(self.context().map().instance_id(), name.to_lowercase()))) {
+        if let Some(t) = value.as_str().and_then(|name| self.symbol(name)) {
             return Ok(self.bound_symbol(t, reads));
         }
         match self.context().layer_id(&json!({"layer":value})) {
