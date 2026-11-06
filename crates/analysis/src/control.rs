@@ -123,7 +123,7 @@ thread_local! {
 }
 
 /// The control of the run on this thread, if any.
-pub(crate) fn current() -> Option<Arc<Control>> {
+pub fn current() -> Option<Arc<Control>> {
     CURRENT.with(|c| c.borrow().clone())
 }
 

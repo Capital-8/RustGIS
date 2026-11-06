@@ -107,18 +107,30 @@ impl Session {
         if self.depth > 0 || !self.policy.nodes.is_empty() || self.policy.cursor.is_some() {
             return Err("background reads can only start before handler dispatch".into());
         }
-        if !matches!(command, "layer.addData" | "layer.loadAll") {
-            return Err("only Add Data and Load All can prepare a background read".into());
+        if !matches!(command, "layer.addData" | "layer.loadAll" | "model.run") {
+            return Err("only Add Data, Load All and models can prepare background work".into());
         }
         let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
         if command == "layer.loadAll" {
             let id = self.layer_id(&Value::Object(params.clone()))?;
             params.insert("layer".into(), json!(id));
         }
-        let op = self.authorize(command, &Value::Object(params))?;
+        let mut op = self.authorize(command, &Value::Object(params))?;
         self.check_read_command(&op)?;
+        let model_copy = command == "model.run" && self.policy_user();
+        if model_copy {
+            // A model's native copy may read through several tools. Bind the original
+            // session's runtime stores, including web logins, before that copy exists.
+            let mut node = (*op.node).clone();
+            node.auth = Some(Arc::new(super::scope::RuntimeAccounts::capture(self)?));
+            op.node = Arc::new(node);
+        }
         let node = op.node.clone();
-        let owner = self.continuation_for(node.clone())?;
+        let mut owner = self.continuation_for(node.clone())?;
+        if model_copy {
+            owner.accounts = self.policy_accounts();
+            owner.s3 = Some(vec![crate::render::rustgis_tiles::s3::account_identity()?]);
+        }
         owner.check()?;
         let current = owner.clone();
         let still = Arc::new(move || current.check().is_ok());

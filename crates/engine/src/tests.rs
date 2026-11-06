@@ -11027,7 +11027,7 @@ fn duckdb_queries_and_databases() {
         assert!(e.contains("need DuckDB"), "{e}");
         return;
     }
-    // A result mixing geometry types: a layer per type.
+    // A result mixing geometry types: a layer per type, its points on top (#1488).
     let r = s.run("layer.addSql", &json!({"sql": query, "name": "Trip"})).unwrap();
     let names: Vec<String> = s.map().layers.iter().map(|l| l.name.clone()).collect();
     assert_eq!(names, vec!["Trip (points)", "Trip (lines)"], "{r}");
@@ -11112,6 +11112,95 @@ fn duckdb_queries_and_databases() {
     let r = s.run("layer.addSql", &json!({"sql": projected, "name": "Utm2", "crs": "EPSG:32633"})).unwrap();
     let e = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().extent();
     assert!((e.min_x - 15.0).abs() < 0.01 && (e.min_y - 37.95).abs() < 0.05, "{e:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A source split by geometry type is added polygons first, so its points end on top and none hides
+/// under its own polygons, whether DuckDB or GDAL split it (#1488). Neither program is needed: the
+/// parts are files already written, as they would have converted them.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn split_sources_keep_their_points_on_top() {
+    use crate::cmd::layer::{add_converted, duckdb_parts, gdal_parts};
+    use rustgis_data::source::{Family, duckdb, gdal};
+    let dir = std::env::temp_dir().join(format!("rustgis-split-order-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let geometry = |f: Family| match f {
+        Family::Points => r#"{"type": "Point", "coordinates": [10, 50]}"#,
+        Family::Lines => r#"{"type": "LineString", "coordinates": [[10, 50], [11, 51]]}"#,
+        Family::Polygons => r#"{"type": "Polygon", "coordinates": [[[10, 50], [11, 50], [11, 51], [10, 50]]]}"#,
+    };
+    // A file per part, in the order both programs give them: points first (`Family::ALL`).
+    let write = |stem: &str, f: Family| {
+        let path = dir.join(format!("{stem}-{}.geojson", f.label()));
+        let feature = format!(r#"{{"type": "Feature", "properties": {{}}, "geometry": {}}}"#, geometry(f));
+        std::fs::write(&path, format!(r#"{{"type": "FeatureCollection", "features": [{feature}]}}"#)).unwrap();
+        path
+    };
+    let names = |s: &Session| s.map().layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>();
+
+    // A DuckDB query.
+    let mut s = Session::new(Project::default());
+    let parts = Family::ALL.iter().map(|f| duckdb::Part { path: write("query", *f), family: *f, count: 1 }).collect();
+    let origin =
+        |family| rustgis_map::source::DuckdbOrigin { sql: Some("SELECT 1".into()), database: None, table: None, crs: None, family };
+    let parts = duckdb_parts(&mut s, "Trip", duckdb::Output { parts, skipped: 0 }, origin);
+    add_converted(&mut s, &json!({}), "the query", "DuckDB query", parts).unwrap();
+    assert_eq!(names(&s), ["Trip (points)", "Trip (lines)", "Trip (polygons)"]);
+
+    // A GDAL file with two mixed layers: each keeps its points on top, and the file's second layer
+    // goes above its first, as any layer added after another does.
+    let mut s = Session::new(Project::default());
+    let converted = ["a", "b"]
+        .into_iter()
+        .flat_map(|layer| Family::ALL.map(|f| (layer, f)))
+        .map(|(layer, f)| gdal::Converted {
+            path: write(layer, f),
+            name: format!("{layer} ({})", f.label()),
+            layer: layer.to_string(),
+            family: Some(f),
+            unprojected: false,
+        })
+        .collect();
+    let original = dir.join("file.gpx").display().to_string();
+    add_converted(&mut s, &json!({}), &original, &original, gdal_parts(converted, &original, None)).unwrap();
+    assert_eq!(names(&s), ["b (points)", "b (lines)", "b (polygons)", "a (points)", "a (lines)", "a (polygons)"]);
+
+    // A file the built-in readers split by type (a KML here, as GPX, OSM or DXF): the same order,
+    // and the first layer added (the polygons, away from the rest) still frames an empty map on
+    // its own extent, not on all the data's.
+    let kml = r#"<kml xmlns="http://www.opengis.net/kml/2.2"><Document>
+<Placemark><name>p</name><Point><coordinates>10.5,50.5</coordinates></Point></Placemark>
+<Placemark><name>l</name><LineString><coordinates>10,50 11,51</coordinates></LineString></Placemark>
+<Placemark><name>a</name><Polygon><outerBoundaryIs><LinearRing><coordinates>12,52 13,52 13,53 12,52</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>
+</Document></kml>"#;
+    let path = dir.join("trip.kml");
+    std::fs::write(&path, kml).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path.display().to_string()})).unwrap();
+    assert_eq!(names(&s), ["trip points", "trip lines", "trip polygons"]);
+    let c = s.map().center_lonlat();
+    assert!((c.x - 12.5).abs() < 0.1 && (c.y - 52.5).abs() < 0.2, "{c:?}");
+
+    // A KMZ's ground overlay goes under its layers, and the empty map is framed on the layers, not
+    // on the picture.
+    let mut red = tiny_skia::Pixmap::new(8, 8).unwrap();
+    red.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+    let doc = r#"<kml xmlns="http://www.opengis.net/kml/2.2"><Document>
+<GroundOverlay><name>Over</name><Icon><href>files/red.png</href></Icon><LatLonBox><north>41</north><south>40</south><east>11</east><west>10</west></LatLonBox></GroundOverlay>
+<Placemark><name>l</name><LineString><coordinates>30,30 31,31</coordinates></LineString></Placemark>
+</Document></kml>"#;
+    let kmz = rustgis_data::zip::write(&[("doc.kml".into(), doc.as_bytes().to_vec()), ("files/red.png".into(), red.encode_png().unwrap())])
+        .unwrap();
+    let path = dir.join("site.kmz");
+    std::fs::write(&path, kmz).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path.display().to_string()})).unwrap();
+    let all = names(&s);
+    assert_eq!(all.last().map(String::as_str), Some("Over"), "{all:?}");
+    assert_eq!(all.len(), 2, "{all:?}");
+    let c = s.map().center_lonlat();
+    assert!((c.x - 30.5).abs() < 0.1 && (c.y - 30.5).abs() < 0.2, "{c:?}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -29261,4 +29350,189 @@ fn background_reads_keep_their_owner_before_read_and_landing() {
     assert_eq!(s.with_scope(owner, |s| read_land(s, read)).unwrap().unwrap()["layer"], id);
     assert!(!s.map().layer(id).unwrap().is_streamed());
     assert!(s.read_ahead.is_none() && rustgis_data::source::remote::current_still().is_none());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_models_tools_run_ahead_are_taken_by_its_run() {
+    if isolate_account_test("tests::a_models_tools_run_ahead_are_taken_by_its_run") {
+        return;
+    }
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    let session = || {
+        let mut s = Session::new(Project::default());
+        let mut points = rustgis_data::Dataset::new("Points", rustgis_data::GeometryType::Point, Vec::new());
+        for (x, y) in [(8.0, 47.0), (9.0, 46.0), (10.0, 45.0)] {
+            points.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(x, y))), Vec::new());
+        }
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, points));
+        s
+    };
+    let graph = json!({"nodes": [
+        {"id": "points", "kind": "input", "layer": "Points"},
+        {"id": "near", "kind": "tool", "tool": "buffer", "params": {"distance": 1000}},
+        {"id": "far", "kind": "tool", "tool": "buffer", "params": {"distance": 2000}},
+        {"id": "output", "kind": "output", "name": "Rings"}
+    ], "edges": [
+        {"from": "points", "fromPort": "out", "to": "near", "toPort": "input"},
+        {"from": "near", "fromPort": "out", "to": "far", "toPort": "input"},
+        {"from": "far", "fromPort": "out", "to": "output", "toPort": "in"}
+    ]});
+    let p = json!({"graph": graph.clone()});
+    let rings = |s: &Session| {
+        s.map().layer_by_name("Rings").map(|l| format!("{:?}", l.dataset.features.iter().map(|f| &f.geometry).collect::<Vec<_>>()))
+    };
+    let mut here = session();
+    here.run("model.run", &p).unwrap();
+
+    // Both tools are taken: what the run adds, keeps in history and puts in Undo is the same.
+    let mut s = session();
+    let depth = s.undo_depth();
+    let read = read_ahead(&mut s, "model.run", &p).unwrap().run(&Control::stoppable()).unwrap();
+    let r = read_land(&mut s, read).unwrap();
+    assert_eq!(s.tools_taken, 2, "{r}");
+    assert!(s.read_ahead.is_none() && s.tools_ahead.is_none());
+    assert_eq!(rings(&s), rings(&here));
+    assert_eq!(s.map().layers.len(), here.map().layers.len());
+    assert_eq!(s.project.gp_history.len(), 2);
+    assert!(s.model_run.as_ref().unwrap().ok);
+    assert_eq!(s.undo_depth(), depth + 1);
+    assert!(s.undo());
+    assert_eq!(s.map().layers.len(), 1);
+
+    // A point added after the run ahead: the tools run here, on it too.
+    let add = |s: &mut Session| {
+        let p = Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(11.0, 44.0)));
+        s.map_mut().layers[0].dataset.push_next(p, Vec::new());
+    };
+    let mut s = session();
+    let read = read_ahead(&mut s, "model.run", &json!({"graph": graph})).unwrap().run(&Control::stoppable()).unwrap();
+    add(&mut s);
+    let mut here = session();
+    add(&mut here);
+    here.run("model.run", &p).unwrap();
+    read_land(&mut s, read).unwrap();
+    assert_eq!(s.tools_taken, 0);
+    assert!(s.tools_ahead.is_none());
+    assert_eq!(rings(&s), rings(&here));
+
+    // A run ahead that was cancelled is an error, and runs nothing.
+    let control = Control::stoppable();
+    control.cancel();
+    assert!(read_ahead(&mut session(), "model.run", &p).unwrap().run(&control).is_err());
+
+    // A model saved as steps takes them too, and so does one with a tool that fails.
+    let mut s = session();
+    s.run(
+        "model.new",
+        &json!({"name": "Steps", "steps": [
+            {"tool": "buffer", "params": {"input": "Points", "distance": 1000}},
+            {"tool": "buffer", "params": {"input": "%1", "distance": 2000}}
+        ]}),
+    )
+    .unwrap();
+    let p = json!({"name": "Steps"});
+    let read = read_ahead(&mut s, "model.run", &p).unwrap().run(&Control::stoppable()).unwrap();
+    read_land(&mut s, read).unwrap();
+    assert_eq!(s.tools_taken, 2);
+    s.run("model.new", &json!({"name": "Fails", "steps": [{"tool": "buffer", "params": {"input": "Points", "distance": "x"}}]})).unwrap();
+    let p = json!({"name": "Fails"});
+    let read = read_ahead(&mut s, "model.run", &p).unwrap().run(&Control::stoppable()).unwrap();
+    let e = read_land(&mut s, read).unwrap_err();
+    assert!(e.contains("step 1"), "{e}");
+    assert_eq!(s.tools_taken, 3, "the failure is taken too");
+
+    // A tool that writes a file stops the copy: it writes once, as the run here runs it and
+    // those after it.
+    let dir = std::env::temp_dir().join(format!("rustgis-model-ahead-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("points.pmtiles");
+    let mut s = session();
+    s.run(
+        "model.new",
+        &json!({"name": "Writes", "steps": [
+            {"tool": "buffer", "params": {"input": "Points", "distance": 1000}},
+            {"tool": "vectorToPmtiles", "params": {"input": "Points", "minZoom": 0, "maxZoom": 0, "output": file.display().to_string()}},
+            {"tool": "buffer", "params": {"input": "Points", "distance": 2000}}
+        ]}),
+    )
+    .unwrap();
+    let p = json!({"name": "Writes"});
+    let read = read_ahead(&mut s, "model.run", &p).unwrap().run(&Control::stoppable()).unwrap();
+    assert!(!file.exists(), "the copy wrote nothing");
+    read_land(&mut s, read).unwrap();
+    assert_eq!(s.tools_taken, 1);
+    assert!(file.exists());
+    assert_eq!(s.project.gp_history.len(), 3);
+
+    // A selection made meanwhile is an input changed: the tools run here, on it.
+    let mut s = session();
+    let read = read_ahead(&mut s, "model.run", &json!({"graph": graph})).unwrap().run(&Control::stoppable()).unwrap();
+    s.map_mut().layers[0].selection = vec![0];
+    read_land(&mut s, read).unwrap();
+    assert_eq!(s.tools_taken, 0);
+    assert_eq!(s.map().layer_by_name("Rings").unwrap().dataset.features.len(), 1);
+    // The copied session must not hide a change to the initiating session's login.
+    let p = json!({"graph":graph.clone()});
+    let mut s = session();
+    let connection = s
+        .run(
+            "connection.new",
+            &json!({
+                "kind":"wms", "address":"https://model-owner.example.invalid", "auth":"header", "keyName":"X-Key"
+            }),
+        )
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.run("connection.login", &json!({"id":connection,"apiKey":"RGSYNTH_model_owner_before"})).unwrap();
+    let ahead = read_ahead(&mut s, "model.run", &p).unwrap();
+    assert!(ahead.reads(), "the native model keeps upstream off-frame execution");
+    let read = ahead.run(&Control::stoppable()).unwrap();
+    s.run("connection.login", &json!({"id":connection,"apiKey":"RGSYNTH_model_owner_after"})).unwrap();
+    let before = serde_json::to_value(&s.project).unwrap();
+    let error = read_land(&mut s, read).unwrap_err();
+    assert!(error.contains("account"), "{error}");
+    assert_eq!(s.tools_taken, 0);
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+
+    // A scoped caller stays on its original session instead of becoming User in a copy.
+    use crate::policy::{AgentAccess, Effects, Revocation, Scope};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct Live(AtomicBool);
+    impl Revocation for Live {
+        /// Revokes only this fixture's initiating caller.
+        fn allows(&self, _: Effects) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let mut s = session();
+    let live = Arc::new(Live(AtomicBool::new(true)));
+    let denied = Scope::agent(AgentAccess::Allow, false, "model-denied", None, live.clone());
+    let error = s.with_scope(denied, |s| read_ahead(s, "model.run", &p)).unwrap().err().unwrap();
+    assert!(error.contains("reserved"), "{error}");
+    let scope = Scope::agent(AgentAccess::Full, false, "model-owner", None, live.clone());
+    let ahead = s.with_scope(scope.clone(), |s| read_ahead(s, "model.run", &p)).unwrap().unwrap();
+    assert!(!ahead.reads(), "scoped work is not run in a native User copy");
+    live.0.store(false, Ordering::SeqCst);
+    assert!(ahead.run(&Control::stoppable()).err().unwrap().contains("revoked"));
+    live.0.store(true, Ordering::SeqCst);
+    let read = s.with_scope(scope.clone(), |s| read_ahead(s, "model.run", &p)).unwrap().unwrap().run(&Control::stoppable()).unwrap();
+    live.0.store(false, Ordering::SeqCst);
+    assert!(read_land(&mut s, read).unwrap_err().contains("revoked"));
+    assert!(rings(&s).is_none());
+    live.0.store(true, Ordering::SeqCst);
+    let read = s.with_scope(scope.clone(), |s| read_ahead(s, "model.run", &p)).unwrap().unwrap().run(&Control::stoppable()).unwrap();
+    let foreign = Scope::agent(AgentAccess::Full, false, "another-model-owner", None, live.clone());
+    assert!(s.with_scope(foreign, |s| read_land(s, read)).unwrap().unwrap_err().contains("another caller"));
+    let read = s.with_scope(scope.clone(), |s| read_ahead(s, "model.run", &p)).unwrap().unwrap().run(&Control::stoppable()).unwrap();
+    s.with_scope(scope, |s| read_land(s, read)).unwrap().unwrap();
+    assert!(rings(&s).is_some());
+    assert_eq!(s.tools_taken, 0, "scoped execution ran its own admitted tools");
+    std::fs::remove_dir_all(&dir).ok();
 }

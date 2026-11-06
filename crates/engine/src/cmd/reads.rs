@@ -1,8 +1,8 @@
 //! Reads the desktop app makes on a thread of its own before a command adds what they read
 //! (#1291 step 3): Add Data's whole-file reads (a raster, a raster GDAL converts, a GeoJSON,
-//! delimited text or spreadsheet read whole) and Load All Features. [`read_ahead`] takes what
-//! the read needs of the session, [`ReadAhead::run`] reads on the thread, and [`read_land`] runs
-//! the admitted command under its initiating owner with that read in the session: the command takes
+//! delimited text or spreadsheet read whole), Load All Features and native models. [`read_ahead`]
+//! takes what the read needs of the session, [`ReadAhead::run`] reads on the thread, and [`read_land`]
+//! runs the admitted command under its initiating owner: the command takes
 //! it instead of reading again, so what it adds, says, logs and puts in Undo is the same as when
 //! it reads here. A script or the command line reads where the command runs.
 
@@ -90,7 +90,16 @@ pub(crate) fn prepare(s: &Session, op: Authorized<CommandOp>, owner: Continuatio
             let layer = s.map().layer(s.layer_id(params)?).ok_or("no such layer")?;
             ("Load All Features", super::layer::load_all_ahead(s, params), layer.source.clone())
         }
-        _ => return Err("only Add Data and Load All can prepare a background read".into()),
+        "model.run" => {
+            // A copied session has native authority. Scoped callers keep their admitted
+            // command and execute on the original session instead of widening into that copy.
+            #[cfg(not(target_arch = "wasm32"))]
+            let work = owner.native_tool_owner().then(|| super::workflows::model_ahead(s, params));
+            #[cfg(target_arch = "wasm32")]
+            let work = None;
+            ("Run Model", work, None)
+        }
+        _ => return Err("only Add Data, Load All and models can prepare background work".into()),
     };
     let name = work.as_ref().map_or(name, |work| work.name);
     Ok(ReadAhead { name, op, owner, source, work })
