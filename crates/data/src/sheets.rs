@@ -135,8 +135,10 @@ const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
 /// follows each chain of sectors through an allocation table without checking it: a chain that
 /// loops runs forever, growing memory as it goes, and a chain that starts or links past the table
 /// panics (still so in calamine 0.38). The tables are rebuilt here as calamine builds them (the
-/// FAT, the directory, the mini FAT), and every chain calamine can start must end without looping
-/// or leaving its table. Other files pass unchecked.
+/// FAT, the directory, the mini FAT), and every chain calamine follows (the directory, the mini
+/// FAT, the mini stream and the streams it reads) must end without looping or leaving its table.
+/// Other chains, and unused entries with junk in them, are never followed and aren't checked.
+/// Other files pass unchecked.
 fn check_compound(bytes: &[u8]) -> Result<()> {
     if !bytes.starts_with(COMPOUND) {
         return Ok(());
@@ -181,14 +183,13 @@ fn check_compound(bytes: &[u8]) -> Result<()> {
         return damaged("its allocation table is larger than the file");
     }
     let fat: Vec<u32> = fat_sectors.iter().flat_map(|id| words(sector(*id))).collect();
-    // A chain may reach the sectors the file holds and the empty one just after them: calamine
-    // reads a sector into a buffer of whole sectors and slices it from the sector's start to what
-    // it could read, which panics for a sector two or more past the data.
-    let fat_limit = fat.len().min(body.len().div_ceil(size) + 1);
-    check_chains(&fat, fat_limit)?;
+    // A chain may only reach sectors that start within the file: calamine reads a sector into a
+    // buffer and slices it from the sector's start to what it could read, which panics for one
+    // that starts past the data unless an earlier read happened to grow the buffer that far.
+    let fat_limit = fat.len().min(body.len() / size + 1);
     // The directory, one 128-byte entry per stream; its chain starts in the header.
     let dir_start = u32_at(48);
-    check_head(dir_start, fat_limit)?;
+    check_chain(dir_start, &fat, fat_limit)?;
     let dir: Vec<u8> = chain(dir_start, &fat).flat_map(sector).copied().collect();
     let (entries, _) = dir.as_chunks::<128>();
     // Each stream's length: four bytes with 512-byte sectors, eight with 4096-byte ones, which
@@ -207,16 +208,17 @@ fn check_compound(bytes: &[u8]) -> Result<()> {
     }
     // Small streams sit in the mini stream (the root entry's chain), laid out by the mini FAT.
     let mini_fat_len = u32_at(64);
-    let mini_limit = if mini_fat_len > 0 {
+    let (mini_limit, mini_fat) = if mini_fat_len > 0 {
         let mini_start = u32_at(60);
-        check_head(mini_start, fat_limit)?;
+        check_chain(mini_start, &fat, fat_limit)?;
         let mini_fat = words(
             &chain(mini_start, &fat).flat_map(sector).copied().take((mini_fat_len as usize).saturating_mul(size)).collect::<Vec<u8>>(),
         );
         // The mini stream: the root entry's chain, as far as its length (or the file) goes, in
-        // 64-byte mini sectors. A mini sector must start within it, for the same reason.
+        // 64-byte mini sectors. A mini sector must start within it, for the same reason (calamine
+        // reads one past it from the file, which may be at its end).
         let (root, root_len) = streams.first().map_or((END_OF_CHAIN, 0), |(_, s, l)| (*s, *l));
-        check_head(root, fat_limit)?;
+        check_chain(root, &fat, fat_limit)?;
         let mut mini_len = 0usize;
         for id in chain(root, &fat) {
             if mini_len >= root_len {
@@ -225,20 +227,21 @@ fn check_compound(bytes: &[u8]) -> Result<()> {
             mini_len += sector(id).len();
         }
         let mini_len = mini_len.min(root_len);
-        let mini_limit = mini_fat.len().min(mini_len / 64 + 1);
-        check_chains(&mini_fat, mini_limit)?;
-        mini_limit
+        (mini_fat.len().min(mini_len / 64 + 1), mini_fat)
     } else {
-        0
+        (0, Vec::new())
     };
     // calamine reads these streams, each the first entry by its name (without regard to case),
     // through the mini FAT when it is shorter than 4096 bytes. Other entries, unused ones with
-    // junk in them among them, are never read.
+    // junk in them among them, are never read. An empty stream's first sector is still read.
     for want in ["Workbook", "Book", "\u{5}SummaryInformation", "\u{5}DocumentSummaryInformation"] {
-        if let Some((_, start, len)) = streams.iter().find(|(name, ..)| name.eq_ignore_ascii_case(want))
-            && *len > 0
-        {
-            check_head(*start, if *len < 4096 { mini_limit } else { fat_limit })?;
+        if let Some((_, start, len)) = streams.iter().find(|(name, ..)| name.eq_ignore_ascii_case(want)) {
+            let (table, limit) = if *len < 4096 { (&mini_fat, mini_limit) } else { (&fat, fat_limit) };
+            if *len > 0 {
+                check_chain(*start, table, limit)?;
+            } else if *start != END_OF_CHAIN && *start as usize >= limit {
+                return damaged("a chain of sectors starts past its allocation table or the file");
+            }
         }
     }
     Ok(())
@@ -254,57 +257,33 @@ fn damaged<T>(what: &str) -> Result<T> {
     Err(DataError::Format(format!("spreadsheet: the .xls file is damaged ({what})")))
 }
 
-/// The sectors of the chain from `start`, in a table [`check_chains`] has passed.
+/// The sectors of the chain from `start`, which [`check_chain`] has passed.
 fn chain(start: u32, table: &[u32]) -> impl Iterator<Item = u32> + '_ {
     std::iter::successors(Some(start).filter(|s| *s != END_OF_CHAIN), move |at| {
         table.get(*at as usize).copied().filter(|l| *l != END_OF_CHAIN && (*l as usize) < table.len())
     })
 }
 
-/// A chain must start at an end of chain or below `limit` (inside its table and the data it lays
-/// out): calamine reads the first sector, then looks up its link without checking it.
-fn check_head(start: u32, limit: usize) -> Result<()> {
-    if start == END_OF_CHAIN || (start as usize) < limit { Ok(()) } else { damaged("a chain of sectors starts past its allocation table") }
-}
-
-/// Every link in an allocation table must lead, without looping, to an end of chain, through
-/// sectors below `limit` (the table's length, or what its data holds when less). Entries from
-/// `limit` on are for sectors that aren't there: no chain may reach them.
-fn check_chains(table: &[u32], limit: usize) -> Result<()> {
-    // 0: not seen, 1: on the chain being walked, 2: known to end well.
-    let mut state = vec![0u8; table.len()];
-    let mut path = Vec::new();
-    for start in 0..limit.min(table.len()) {
-        // A free or special sector isn't a link; a chain that reaches one fails below.
-        if table.get(start).is_some_and(|l| *l >= RESERVED_SECTORS && *l != END_OF_CHAIN) {
-            continue;
+/// The chain from `start` must lead, without looping, to an end of chain, through sectors below
+/// `limit` (the table's length, or what its data holds when less): calamine reads each sector,
+/// then looks up its link without checking it.
+fn check_chain(start: u32, table: &[u32], limit: usize) -> Result<()> {
+    let mut at = start;
+    let mut steps = 0usize;
+    while at != END_OF_CHAIN {
+        if at as usize >= limit {
+            return damaged(if steps == 0 {
+                "a chain of sectors starts past its allocation table or the file"
+            } else {
+                "a chain of sectors runs past its allocation table or the file"
+            });
         }
-        let mut at = start;
-        path.clear();
-        loop {
-            match state.get(at).copied() {
-                Some(2) => break,
-                Some(1) => return damaged("a chain of sectors loops"),
-                _ => {}
-            }
-            let link = table.get(at).copied().unwrap_or(END_OF_CHAIN);
-            if link == END_OF_CHAIN {
-                break;
-            }
-            if link as usize >= limit {
-                return damaged("a chain of sectors runs past its allocation table or the file");
-            }
-            if let Some(s) = state.get_mut(at) {
-                *s = 1;
-            }
-            path.push(at);
-            at = link as usize;
+        // A chain longer than the sectors there are must visit one twice.
+        steps += 1;
+        if steps > limit {
+            return damaged("a chain of sectors loops");
         }
-        for i in path.iter().chain(std::iter::once(&start)) {
-            if let Some(s) = state.get_mut(*i) {
-                *s = 2;
-            }
-        }
+        at = table.get(at as usize).copied().unwrap_or(END_OF_CHAIN);
     }
     Ok(())
 }
@@ -689,8 +668,19 @@ mod tests {
         damaged(&small_book(&[FAT, END, END, END], 0, 100, &[2, END]), "runs past");
         // A FAT link to a sector past the end of the file (it holds sectors 0 to 3).
         damaged(&small_book(&[FAT, 5, END, END], 0, 64, &[END]), "runs past");
-        // The sector just past the end reads as empty in calamine, and passes.
+        // Unused FAT entries left as zeros, as some writers do, aren't followed and pass.
+        let mut zeros = vec![FAT, END, END, END];
+        zeros.resize(128, 0);
+        assert!(check_compound(&small_book(&zeros, 0, 64, &[END])).is_ok());
+        // A mini sector starting right at the end of the mini stream reads as empty, and passes.
         assert!(check_compound(&small_book(&[FAT, END, END, END], 0, 100, &[1, END])).is_ok());
+        // An empty stream's first sector is read all the same.
+        damaged(&small_book(&[FAT, END, END, END], 200, 0, &[END]), "starts past");
+        // A chain to the sector after a file cut short mid-sector (calamine reads it only if an
+        // earlier read happened to reach that far).
+        let mut cut = small_book(&[FAT, 4, END, END], 0, 64, &[END]);
+        cut.truncate(cut.len() - 100);
+        damaged(&cut, "runs past");
         // A DIFAT chain whose next sector is past the end of the file.
         damaged(&ole2(9, 1, 0, 50, 1, &sectors(&[FAT, END], 0xFF)), "past the end");
     }
