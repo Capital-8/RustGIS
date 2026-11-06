@@ -48,7 +48,7 @@ pub fn commands() -> Vec<C> {
             }
             let (left_out, table) =
                 rustgis_data::io::write_path_to(&t.dataset, Path::new(path), Crs::LonLat, &gpkg).map_err(|e| e.to_string())?;
-            s.check_continuation(&owner)?;
+            s.check_continuation(&owner).map_err(|why| super::exports::completion_refused(Some(path), why))?;
             if left_out > 0 {
                 s.notify(format!("{path}: {left_out} features without drawable geometry were left out"), false);
             }
@@ -289,6 +289,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     let answer = json!({"path": path, "features": written, "leftOut": left_out, "crs": crs.label()});
     // The table written, said and put in the answer once the export lands, where the session
     // (layers reading a replaced table) is at hand.
+    let written_path = Some(path.to_string());
     let path = path.to_string();
     let then: Option<super::exports::Then> = table.map(|t| {
         Box::new(move |s: &mut Session, out: &mut Value| {
@@ -299,6 +300,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     Ok(Wrote {
         answer,
         notes: said,
+        written_path,
         then,
         #[cfg(not(target_arch = "wasm32"))]
         owner: None,

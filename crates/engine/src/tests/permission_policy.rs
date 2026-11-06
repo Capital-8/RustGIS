@@ -418,9 +418,39 @@ fn permission_policy_export_worker_keeps_its_initiating_owner() {
     let run = s.with_scope(scope, |s| export_start(s, "share.exportLayer", &params("completed.geojson"))).unwrap().unwrap();
     let started = run.started();
     let wrote = run.run(&Control::new());
+    assert!(wrote.is_ok(), "the worker committed its file: {:?}", wrote.as_ref().err());
     s.run("project.new", &Value::Null).unwrap();
-    assert!(export_land(&mut s, started, wrote).unwrap_err().contains("replaced project"));
+    let replacement = serde_json::to_value(&s.project).unwrap();
+    let mark = s.notice_mark();
+    let error = export_land(&mut s, started, wrote).unwrap_err();
+    assert!(error.contains("replaced project"));
+    assert!(error.contains(&path("completed.geojson").display().to_string()), "the completed file is reported: {error}");
+    let errors: Vec<_> = s.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.as_str()).collect();
+    assert_eq!(errors, [error.as_str()], "the completed file and delivery refusal are reported once");
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), replacement, "delivery leaves the replacement project alone");
     assert!(path("completed.geojson").exists(), "a completed write is not undone");
+    // Drawn exports can also carry a failed write as an owned result: only a committed file
+    // may be reported when delivery is refused, and neither case may run its finalizer.
+    for committed in [false, true] {
+        let output = if committed { path("completed.png") } else { path("missing").join("not-written.png") };
+        let run = export_start(&mut s, "share.exportMap", &json!({"path":output,"width":64,"height":48})).unwrap();
+        let started = run.started();
+        let wrote = run.run(&Control::new());
+        assert!(wrote.is_ok(), "drawing delivers its write outcome: {:?}", wrote.as_ref().err());
+        assert_eq!(output.exists(), committed);
+        s.run("project.new", &Value::Null).unwrap();
+        let replacement = serde_json::to_value(&s.project).unwrap();
+        let mark = s.notice_mark();
+        let error = export_land(&mut s, started, wrote).unwrap_err();
+        assert!(error.contains("replaced project"), "{error}");
+        assert_eq!(error.contains("Exported "), committed, "{error}");
+        if committed {
+            assert!(error.contains(&output.display().to_string()), "the committed drawing is reported: {error}");
+        }
+        let notices: Vec<_> = s.notices_since(mark).iter().map(|notice| (notice.error, notice.text.as_str())).collect();
+        assert_eq!(notices, [(true, error.as_str())], "only the refusal is delivered; its finalizer stays blocked");
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), replacement);
+    }
     s.run("project.sample", &Value::Null).unwrap();
     let run = export_start(&mut s, "share.exportLayer", &params("native.geojson")).unwrap();
     let started = run.started();
@@ -453,13 +483,13 @@ fn permission_policy_prepared_plugin_keeps_scope_and_pre_handler_boundary() {
     assert!(s.run_prepared(prepared).unwrap_err().contains("revoked"));
     assert!(!s.leave_downloads, "a refused prepared command restores the caller's download mode");
     assert_eq!(s.map().name, before);
-    assert!(
-        s.guarded("Transaction", true, |s| {
-            assert!(s.prepare_command(id, &params).err().unwrap().contains("before handler"));
-            Err("a later transaction failure".into())
-        })
-        .is_err()
-    );
+    let mut preparation_error = None;
+    let transaction = s.guarded("Transaction", true, |s| {
+        preparation_error = s.prepare_command(id, &params).err();
+        Err("a later transaction failure".into())
+    });
+    assert_eq!(transaction.unwrap_err(), "a later transaction failure");
+    assert!(preparation_error.as_deref().is_some_and(|e| e.contains("before handler")), "{preparation_error:?}");
     assert_eq!(s.map().name, before);
     rustgis_plugins::unload("eng-prepared-owner");
 }
@@ -946,10 +976,11 @@ fn permission_policy_notebook_self_edit_model_outputs_and_intersections() {
     assert!(s.map().layer_by_name("Policy zones").is_some());
     let mut cycle = graph.clone();
     cycle["edges"].as_array_mut().unwrap().push(json!({"from":"d","fromPort":"out","to":"b","toPort":"input"}));
-    assert!(
-        s.run("model.new", &json!({"name":"Cycle","graph":cycle})).is_err()
-            || matches!(s.review(&scope, &Call::command("model.run", json!({"name":"Cycle"}))), Outcome::Refused(_))
-    );
+    s.run("model.new", &json!({"name":"Cycle","graph":cycle})).unwrap();
+    assert!(matches!(
+        s.review(&scope, &Call::command("model.run", json!({"name":"Cycle"}))),
+        Outcome::Refused(reason) if reason.contains("loop")
+    ));
     s.run(
         "task.new",
         &json!({"name":"Imported external","imported":true,"steps":[{"title":"Step","command":"layer.addData","params":{"path":"never-read.gpkg"}}]}),

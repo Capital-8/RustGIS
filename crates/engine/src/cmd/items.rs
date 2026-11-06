@@ -560,9 +560,15 @@ fn carry_moves(old: &rustgis_map::symbology::Labeling, new: &mut rustgis_map::sy
     (foreign, lost)
 }
 
+/// Data removed from a feature-less project template.
+struct TemplateLosses {
+    label_moves: usize,
+    offline_areas: usize,
+    archived_edits: usize,
+}
+
 /// The project without features or sources that would reload them; schemas and styles stay.
-/// Returns the count of saved label moves removed with the features and offline snapshots.
-fn template(p: &Project) -> (Project, usize) {
+fn template(p: &Project) -> (Project, TemplateLosses) {
     let mut t = p.clone();
     t.gp_history.clear();
     // Saved label moves name features, and a template has none: the layers', the saved styles'
@@ -580,6 +586,14 @@ fn template(p: &Project) -> (Project, usize) {
             c.moved.clear();
         }
     }
+    let offline_areas = t.offline_areas.len();
+    let archived_edits = t
+        .maps
+        .iter()
+        .chain(t.offline_areas.iter().map(|a| &a.data))
+        .flat_map(|m| &m.layers)
+        .filter_map(|l| l.design.archive.as_ref())
+        .fold(0usize, |count, archive| count.saturating_add(archive.len()));
     t.offline_areas.clear();
     for m in &mut t.maps {
         for l in &mut m.layers {
@@ -606,7 +620,7 @@ fn template(p: &Project) -> (Project, usize) {
         t.features.clear();
         t.source = None;
     }
-    (t, moves)
+    (t, TemplateLosses { label_moves: moves, offline_areas, archived_edits })
 }
 
 /// Packages only completed imports; runtime download reservations cannot be reopened.
@@ -1113,14 +1127,22 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
         }
         "template" => {
             s.project.ensure_imports_complete()?;
-            let (mut t, moves) = template(&s.project);
-            if moves > 0 {
-                s.notify(format!("{moves} saved label move(s) left out of the template, which keeps no features"), false);
-            }
+            let (mut t, TemplateLosses { label_moves, offline_areas, archived_edits }) = template(&s.project);
             if let Some(n) = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
                 t.name = n.chars().take(200).collect();
             }
-            (t.name.clone(), durable_bytes(s, t)?)
+            let name = t.name.clone();
+            let bytes = durable_bytes(s, t)?;
+            if label_moves > 0 {
+                s.notify(format!("{label_moves} saved label move(s) left out of the template, which keeps no features"), false);
+            }
+            if offline_areas > 0 {
+                s.notify(format!("{offline_areas} offline area(s) left out of the template, which keeps no features"), false);
+            }
+            if archived_edits > 0 {
+                s.notify(format!("{archived_edits} archived edit record(s) left out of the template, which keeps no features"), false);
+            }
+            (name, bytes)
         }
         "projectPackage" => (s.project.name.clone(), package_project(s)?),
         "mapPackage" | "mobilePackage" => {

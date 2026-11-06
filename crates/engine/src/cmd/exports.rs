@@ -15,6 +15,8 @@ use crate::{CmdResult, Session};
 pub struct Wrote {
     pub(crate) answer: Value,
     pub(crate) notes: Vec<String>,
+    /// A physical write completed, even if authority to deliver its result is later refused.
+    pub(crate) written_path: Option<String>,
     /// What it does to the session once written, after its notes, and adds to its answer (a
     /// GeoPackage table replaced: the layers reading it read it again).
     pub(crate) then: Option<Then>,
@@ -61,8 +63,16 @@ pub(crate) fn write_here(s: &mut Session, p: &Value, command: &str) -> CmdResult
         let work = start(s, p)?;
         written_under(name, &control, work)
     })?;
-    s.check_continuation(&owner)?;
+    s.check_continuation(&owner).map_err(|why| completion_refused(wrote.written_path.as_deref(), why))?;
     said(s, wrote)
+}
+
+/// Keeps a completed file visible when its result cannot be delivered to the session.
+pub(crate) fn completion_refused(written_path: Option<&str>, why: String) -> String {
+    match written_path {
+        Some(path) => format!("Exported {path}; completion was refused: {why}"),
+        None => why,
+    }
 }
 
 /// `work` under `control`, as [`rustgis_analysis::run_under`] runs it, except that a file once
@@ -112,6 +122,7 @@ pub(crate) fn drawn(
             Some((l.instance_id(), l.name.clone(), src.error.clone()?, src.clone()))
         })
         .collect();
+    let written_path = written.is_ok().then(|| path.clone());
     let answer = written.as_ref().map_or(Value::Null, Value::clone);
     let then: Then = Box::new(move |s: &mut Session, _: &mut Value| {
         use rustgis_data::diagnostics::Severity;
@@ -149,6 +160,7 @@ pub(crate) fn drawn(
     Ok(Wrote {
         answer,
         notes: Vec::new(),
+        written_path,
         then: Some(then),
         #[cfg(not(target_arch = "wasm32"))]
         owner: None,
@@ -243,7 +255,9 @@ pub fn export_land(s: &mut Session, started: Started, done: Result<Wrote, String
                 return Err("this export result belongs to another run".into());
             }
         }
-        s.finish_export(&owner, |s| done.and_then(|wrote| said(s, wrote)))?
+        let written_path = done.as_ref().ok().and_then(|wrote| wrote.written_path.clone());
+        s.finish_export(&owner, |s| done.and_then(|wrote| said(s, wrote)))
+            .map_err(|why| completion_refused(written_path.as_deref(), why))?
     })();
     // Its failure said once, under the command, as `Session::run` says one.
     if let Err(e) = &landed {
@@ -276,6 +290,7 @@ mod tests {
             Ok(Wrote {
                 answer: serde_json::json!({"path": "x"}),
                 notes: vec!["Exported x".into()],
+                written_path: Some("x".into()),
                 then: None,
                 #[cfg(not(target_arch = "wasm32"))]
                 owner: None,

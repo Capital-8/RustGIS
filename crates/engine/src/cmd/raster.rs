@@ -995,6 +995,7 @@ fn write_geotiff(r: &Raster, bi: usize, cog: bool, path: &str) -> Result<super::
     Ok(super::exports::Wrote {
         answer: v,
         notes: vec![format!("Exported {path}{note}")],
+        written_path: Some(path.to_string()),
         then: None,
         #[cfg(not(target_arch = "wasm32"))]
         owner: None,

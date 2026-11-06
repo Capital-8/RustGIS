@@ -25168,7 +25168,27 @@ fn project_template_carries_no_data() {
     table.source = Some(path.display().to_string());
     s.project.add_table(table);
     assert!(!s.project.offline_areas.is_empty());
+    let offline = s.project.offline_areas.len();
+    let archived: usize = s
+        .project
+        .maps
+        .iter()
+        .chain(s.project.offline_areas.iter().map(|area| &area.data))
+        .flat_map(|map| &map.layers)
+        .filter_map(|layer| layer.design.archive.as_ref())
+        .map(Vec::len)
+        .sum();
+    assert!(archived > 0, "the fixture has archived edits to omit");
+    let before = serde_json::to_value(&s.project).unwrap();
+    let mark = s.notice_mark();
     let (_, bytes) = crate::cmd::items::item_bytes(&mut s, "template", &Value::Null).unwrap();
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "template export preserves the live project");
+    for (kind, count) in [("offline area(s)", offline), ("archived edit record(s)", archived)] {
+        let expected = format!("{count} {kind} left out of the template, which keeps no features");
+        let notices: Vec<_> =
+            s.notices_since(mark).iter().filter(|notice| notice.text.contains(kind)).map(|notice| notice.text.as_str()).collect();
+        assert_eq!(notices, [expected.as_str()], "one exact omission count for {kind}");
+    }
     let text = String::from_utf8(bytes).unwrap();
     assert!(!text.contains(path.to_str().unwrap()), "the streamed layer's file is in the template");
     let t: Project = serde_json::from_str(&text).unwrap();
@@ -25182,6 +25202,10 @@ fn project_template_carries_no_data() {
     let mut opened = Session::new(Project::default());
     opened.run("project.fromTemplate", &json!({"text": text, "name": "Setup"})).unwrap();
     assert!(opened.project.maps.iter().flat_map(|m| &m.layers).all(|l| l.dataset.features.is_empty()));
+    let mut clean = Session::new(Project::default());
+    let mark = clean.notice_mark();
+    crate::cmd::items::item_bytes(&mut clean, "template", &Value::Null).unwrap();
+    assert!(clean.notices_since(mark).is_empty(), "a clean template has no omissions: {:?}", clean.notices_since(mark));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
