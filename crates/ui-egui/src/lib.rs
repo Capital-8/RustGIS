@@ -438,12 +438,13 @@ pub struct TilesResolve {
 /// A service layer waiting on a document before it is added. `dialog` tells whether the add came
 /// from the add-service dialog (its result shows there) or from the Connections tree (a notice);
 /// `origin` is the connection a tree add is for, named in Recent once the layer is added.
+/// `opened` binds every follow-up and final addition to the project that started discovery.
 pub enum ServiceStep {
     /// An OGC API layer whose advertised tile template is being read.
-    Tiles { resolve: TilesResolve, dialog: bool, origin: Option<String> },
+    Tiles { resolve: TilesResolve, dialog: bool, origin: Option<String>, opened: u64 },
     /// A WCS coverage whose description is being read before it is asked for: `service.coverage`'s
     /// parameters and the description on its way.
-    Coverage { params: Value, slot: Slot<Result<Vec<u8>, String>>, dialog: bool, origin: Option<String> },
+    Coverage { params: Value, slot: Slot<Result<Vec<u8>, String>>, dialog: bool, origin: Option<String>, opened: u64 },
 }
 
 /// Fetches an address into a slot, off the frame.
@@ -4463,6 +4464,18 @@ impl RustGisApp {
         }
     }
 
+    /// Retires an old service read before its response can start work in another project.
+    /// The existing closed-project message is informational and emitted once per retired item.
+    fn service_read_current(&mut self, opened: u64, address: &str) -> bool {
+        if opened == self.session.opened {
+            return true;
+        }
+        let url = serviceui::address_in_message(address);
+        let why = i18n::fmt("{url}: its project was closed while it was read, so it wasn't added", &[("url", &url)]);
+        self.session.notify(why, false);
+        false
+    }
+
     /// Moves the service layers waiting on a document along: an OGC API layer's tile template
     /// (read from its tileset list, then the tileset when the list doesn't carry it; the layer is
     /// added with the template read, or the usual path) and a WCS coverage's description (the
@@ -4471,9 +4484,12 @@ impl RustGisApp {
         use rustgis_engine::data::ogc::{TilesStep, resolve_tiles};
         for step in std::mem::take(&mut self.ui.service_steps) {
             match step {
-                ServiceStep::Tiles { mut resolve, dialog, origin } => {
+                ServiceStep::Tiles { mut resolve, dialog, origin, opened } => {
+                    if !self.service_read_current(opened, &resolve.doc) {
+                        continue;
+                    }
                     let Some(r) = resolve.slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
-                        self.ui.service_steps.push(ServiceStep::Tiles { resolve, dialog, origin });
+                        self.ui.service_steps.push(ServiceStep::Tiles { resolve, dialog, origin, opened });
                         continue;
                     };
                     let next = r.ok().and_then(|body| resolve_tiles(&resolve.list, &resolve.doc, &body, resolve.vector));
@@ -4498,7 +4514,7 @@ impl RustGisApp {
                                     continue;
                                 }
                             }
-                            self.ui.service_steps.push(ServiceStep::Tiles { resolve, dialog, origin });
+                            self.ui.service_steps.push(ServiceStep::Tiles { resolve, dialog, origin, opened });
                             continue;
                         }
                         Some(TilesStep::Template(t)) => t,
@@ -4531,9 +4547,12 @@ impl RustGisApp {
                     self.report_step(dialog, r);
                     self.map.invalidate();
                 }
-                ServiceStep::Coverage { mut params, slot, dialog, origin } => {
+                ServiceStep::Coverage { mut params, slot, dialog, origin, opened } => {
+                    if !self.service_read_current(opened, params.get("url").and_then(Value::as_str).unwrap_or("")) {
+                        continue;
+                    }
                     let Some(r) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
-                        self.ui.service_steps.push(ServiceStep::Coverage { params, slot, dialog, origin });
+                        self.ui.service_steps.push(ServiceStep::Coverage { params, slot, dialog, origin, opened });
                         continue;
                     };
                     let title = params["name"].as_str().unwrap_or("").to_string();
@@ -5625,7 +5644,7 @@ mod download_service_tests {
                 fallback: "https://h.invalid/svc/tiles/{z}/{y}/{x}".into(),
                 slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(body)))),
             };
-            app.ui.service_steps.push(super::ServiceStep::Tiles { resolve, dialog: true, origin: None });
+            app.ui.service_steps.push(super::ServiceStep::Tiles { resolve, dialog: true, origin: None, opened: app.session.opened });
             app.poll_service_steps();
             assert!(app.ui.service_steps.is_empty());
             let notices = app.session.notices.iter().filter(|n| n.text.contains("address(es) the service listed")).count();
@@ -5920,6 +5939,9 @@ mod peer_output_tests {
     /// Drives the actual receiving wrapper, including the UI state a direct Session call misses.
     #[test]
     fn peer_project_uses_import_authority_and_resets_old_ui_work() {
+        use rustgis_engine::render::rustgis_tiles::cache;
+        use std::sync::{Arc, Mutex};
+        let _turn = crate::fetching::turn();
         let mut app = RustGisApp::with_sample();
         app.session.project.maps[0].layers[0].dataset.source = Some("https://h.invalid/?token=RGSYNTH_4".into());
         let (text, _) = app.session.project.saved_text(None).unwrap();
@@ -5932,6 +5954,84 @@ mod peer_output_tests {
         assert!(app.session.project.tasks.is_empty());
         assert!(app.ui.web_file.is_none() && app.assistant.queued.is_none());
         assert!(!serde_json::to_string(&app.session.project).unwrap().contains("RGSYNTH_4"));
+
+        // Both replacement paths retire ready answers and reads still waiting for their document.
+        for peer in [false, true] {
+            for ready in [false, true] {
+                let sent = Arc::new(Mutex::new(Vec::new()));
+                let held = Arc::new(Mutex::new(Vec::<(String, cache::Done)>::new()));
+                let (seen, callbacks) = (sent.clone(), held.clone());
+                cache::set_fetcher(move |url, done| {
+                    let plain = cache::split_download_limit(&url).0.to_string();
+                    seen.lock().unwrap().push(plain.clone());
+                    callbacks.lock().unwrap().push((plain, done));
+                });
+                let mut app = RustGisApp::with_sample();
+                let (text, _) = app.session.project.saved_text(None).unwrap();
+                let api = "https://review29-service.invalid/collections";
+                let caps = json!({"collections":[
+                    {"id":"next","links":[{"rel":"tilesets-map","href":format!("{api}/next/tiles")}]},
+                    {"id":"ready","links":[{"rel":"tilesets-map","href":format!("{api}/ready/tiles")}]}
+                ]})
+                .to_string();
+                let listing = app.session.run("service.layers", &json!({"url":api,"type":"ogcapi","text":caps})).unwrap();
+                let source = crate::serviceui::ServiceSource { url: api.into(), kind: "ogcapi", text: caps, documents: Vec::new() };
+                for layer in listing["layers"].as_array().unwrap() {
+                    crate::serviceui::add_layer_from(&mut app, &source, layer, "", None, ready, None, None).unwrap();
+                }
+                let caps = r#"<wcs:Capabilities version="2.0.1" xmlns:wcs="http://www.opengis.net/wcs/2.0" xmlns:ows="http://www.opengis.net/ows/2.0">
+                <wcs:Contents><wcs:CoverageSummary><wcs:CoverageId>soc</wcs:CoverageId><ows:Title>Old coverage</ows:Title>
+                <ows:WGS84BoundingBox><ows:LowerCorner>5 49.2</ows:LowerCorner><ows:UpperCorner>5.8 50</ows:UpperCorner></ows:WGS84BoundingBox>
+                </wcs:CoverageSummary></wcs:Contents></wcs:Capabilities>"#;
+                let url = "https://review29-service.invalid/wcs";
+                let listing = app.session.run("service.layers", &json!({"url":url,"type":"wcs","text":caps})).unwrap();
+                let source = crate::serviceui::ServiceSource { url: url.into(), kind: "wcs", text: caps.into(), documents: Vec::new() };
+                crate::serviceui::add_layer_from(&mut app, &source, &listing["layers"][0], "", None, ready, None, None).unwrap();
+                assert_eq!(app.ui.service_steps.len(), 3);
+                assert_eq!(sent.lock().unwrap().len(), 3);
+                let finish = || {
+                    for (url, done) in std::mem::take(&mut *held.lock().unwrap()) {
+                        let body = if url.contains("/next/tiles") {
+                            json!({"tilesets":[{"tileMatrixSetURI":"WebMercatorQuad","links":[{"rel":"self","href":"https://review29-service.invalid/next-document"}]}]}).to_string()
+                        } else if url.contains("/ready/tiles") {
+                            json!({"links":[{"rel":"item","type":"image/png","href":"https://review29-service.invalid/tiles/{tileMatrix}/{tileRow}/{tileCol}.png"}]}).to_string()
+                        } else {
+                            r#"<CoverageDescriptions><CoverageDescription><Envelope srsName="http://www.opengis.net/def/crs/EPSG/0/4326" axisLabels="Lat Long"><lowerCorner>49.2 5</lowerCorner><upperCorner>50 5.8</upperCorner></Envelope></CoverageDescription></CoverageDescriptions>"#.into()
+                        };
+                        done(Ok(body.into_bytes()));
+                    }
+                };
+                if ready {
+                    finish();
+                }
+                if peer {
+                    app.open_peer_text(&text).unwrap();
+                } else {
+                    app.session.run("project.openText", &json!({"text":text})).unwrap();
+                }
+                let (layers, tiles) = (app.session.map().layers.len(), app.session.map().tiles.len());
+                app.dialogs.info = Some("Current project info".into());
+                app.dialogs.error = Some("Current project error".into());
+                let mark = app.session.notice_mark();
+                app.poll_service_steps();
+                let drained = app.ui.service_steps.is_empty();
+                if !ready {
+                    finish();
+                }
+                app.poll_service_steps();
+                // Drain any forbidden follow-up too, so a failing test leaves no in-flight fetch.
+                for (_, done) in std::mem::take(&mut *held.lock().unwrap()) {
+                    done(Err("stale service request".into()));
+                }
+                assert!(drained && app.ui.service_steps.is_empty(), "old steps must retire before inspecting their slots");
+                assert_eq!(sent.lock().unwrap().len(), 3, "no old next-document or coverage request may start");
+                assert_eq!((app.session.map().layers.len(), app.session.map().tiles.len()), (layers, tiles));
+                assert!(app.ui.downloads.is_empty() && app.ui.cog_probes.is_empty());
+                assert_eq!(app.dialogs.info.as_deref(), Some("Current project info"));
+                assert_eq!(app.dialogs.error.as_deref(), Some("Current project error"));
+                assert_eq!(app.session.notices_since(mark).iter().filter(|n| n.text.contains("project was closed")).count(), 3);
+            }
+        }
     }
 }
 

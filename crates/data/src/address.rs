@@ -327,7 +327,7 @@ pub fn public_web_address(address: &str) -> Public {
         u16::try_from(removed).unwrap_or(u16::MAX).saturating_add(u16::from(at.is_some())).saturating_add(u16::from(rest.contains('#')));
     let mut public = candidate;
     redact_query(&mut public);
-    if public == address { Public::Unchanged } else { Public::Changed { address: public, removed } }
+    if public == text { Public::Unchanged } else { Public::Changed { address: public, removed } }
 }
 
 /// Cleans addresses in generated text and counts changed addresses. All spacing and all other
@@ -573,7 +573,11 @@ mod tests {
         for address in [r"https://h.invalid\a?token=RGSYNTH_boundary", r"https://h.invalid/a\b?token=RGSYNTH_boundary"] {
             assert_eq!(public_web_address(address), Public::Withheld);
         }
-        for template in ["https://{switch:a,b}.host/{z}/{x}/{y}@2x.png?map=m", "https://{s}.host/{zoom}/{x}/{y}@2x.png"] {
+        for template in [
+            "https://{switch:a,b}.host/{z}/{x}/{y}@2x.png?map=m",
+            "https://{s}.host/{zoom}/{x}/{y}@2x.png",
+            " \thttps://h.invalid/a?f=json \n",
+        ] {
             assert_eq!(public_web_address(template), Public::Unchanged);
         }
         assert_eq!(

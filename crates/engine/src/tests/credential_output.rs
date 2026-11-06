@@ -113,7 +113,7 @@ fn durable_writers_clean_all_owned_roles_and_preserve_the_live_project() {
     assert!(code.to_string().contains(DATA), "replayable data properties must remain");
 }
 
-/// Empty query pairs survive clean saves; an actual token still gives one counted loss.
+/// Empty query pairs and clean padding survive saves; an actual token gives one counted loss.
 #[test]
 fn durable_empty_query_pairs_preserve_clean_urls_and_report_real_loss() {
     for (query, kept, losses) in [
@@ -121,6 +121,7 @@ fn durable_empty_query_pairs_preserve_clean_urls_and_report_real_loss() {
         ("&", "&", 0),
         ("layer=1&&f=json", "layer=1&&f=json", 0),
         ("layer=1&", "layer=1&", 0),
+        ("layer=1 \t", "layer=1 \t", 0),
         ("layer=1&&token=RGSYNTH_empty_query&", "layer=1", 1),
     ] {
         let url = format!("https://h.invalid/tiles/{{z}}/{{x}}/{{y}}.png?{query}");

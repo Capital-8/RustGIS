@@ -139,7 +139,7 @@ pub(crate) fn add_layer_from(
         }
         let describe = request_from(app, connection, &src.url, &describe)?;
         let slot = crate::fetch_into(&describe);
-        app.ui.service_steps.push(crate::ServiceStep::Coverage { params: p, slot, dialog, origin });
+        app.ui.service_steps.push(crate::ServiceStep::Coverage { params: p, slot, dialog, origin, opened: app.session.opened });
         return Ok(i18n::fmt("Describing {name}", &[("name", &title)]));
     }
     let mut p = json!({"url": src.url, "layer": name, "text": src.text, "documents": src.documents, "source_url": l.get("source_url")});
@@ -173,7 +173,7 @@ pub(crate) fn add_layer_from(
                 fallback,
                 slot,
             };
-            app.ui.service_steps.push(crate::ServiceStep::Tiles { resolve, dialog, origin });
+            app.ui.service_steps.push(crate::ServiceStep::Tiles { resolve, dialog, origin, opened: app.session.opened });
             Ok(i18n::fmt("Reading the tileset of {name}", &[("name", &title)]))
         }
         None => crate::connectiontree::run_named(app, "service.add", p, origin.as_deref()).map(|_| added(&title)),

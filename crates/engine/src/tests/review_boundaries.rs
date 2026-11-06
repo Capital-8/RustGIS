@@ -61,17 +61,19 @@ fn permission_review_memory_only_commands_need_no_external_access() {
 
 #[test]
 fn permission_review_postgis_write_declares_network_reach() {
-    struct NoNetwork;
-    impl Revocation for NoNetwork {
+    struct Without(Effect);
+    impl Revocation for Without {
         fn allows(&self, effects: Effects) -> bool {
-            !effects.contains(Effect::Network)
+            !effects.contains(self.0)
         }
     }
     let s = world();
-    let scope = Scope::assistant(1462, Arc::new(NoNetwork));
     let call = Call::command("pg.saveEdits", json!({"layer":"Cities"}));
-    assert!(matches!(s.review(&scope, &call), Outcome::Refused(_)), "a database write must check live network authority before any I/O");
-    assert!(matches!(s.review(&scope, &Call::command("pg.pendingEdits", json!({"layer":"Cities"}))), Outcome::Allowed));
+    for effect in [Effect::Network, Effect::Files] {
+        let scope = Scope::assistant(1462, Arc::new(Without(effect)));
+        assert!(matches!(s.review(&scope, &call), Outcome::Refused(_)), "a database write must check connection authority before any I/O");
+        assert!(matches!(s.review(&scope, &Call::command("pg.pendingEdits", json!({"layer":"Cities"}))), Outcome::Allowed));
+    }
 }
 
 #[test]
