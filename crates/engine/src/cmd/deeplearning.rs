@@ -486,8 +486,11 @@ fn training_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::
     let s = input;
     super::Inputs::named(s.map(), [super::imagery::raster_name(p)?, super::imagery::training_name(p)?])
 }
-/// Binds the raster and actual named/last model choice, without copying trained weights.
+/// Follows classification's training-or-saved-model branch without copying trained weights.
 fn classify_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    if p.get("training").is_some() {
+        return training_inputs(input, p);
+    }
     let s = input;
     let mut inputs = super::Inputs::named(s.map(), [super::imagery::raster_name(p)?])?;
     let i = model_index(input, p)?;

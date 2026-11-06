@@ -1155,8 +1155,11 @@ impl Session {
     /// Takes a download off those under way: `false` when it isn't one of them (another project
     /// was opened meanwhile).
     fn landed(&mut self, id: u64) -> bool {
+        let pending = self.download_is_pending(id);
         if let Err(e) = self.download_continues(id) {
-            self.notify(e, true);
+            if pending {
+                self.notify(e, true);
+            }
             return false;
         }
         let Some(i) = self.downloading.iter().position(|d| *d == id) else { return false };

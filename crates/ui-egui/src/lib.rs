@@ -1695,6 +1695,16 @@ impl RustGisApp {
         }
     }
 
+    /// Reports acknowledgment failures even when the engine refuses before command dispatch.
+    fn acknowledge_gp_file(&mut self, id: u64, error: Option<&str>) -> Result<Value, String> {
+        let mark = self.session.notice_mark();
+        let completed = self.session.acknowledge_gp_file(id, error);
+        if let Err(error) = &completed {
+            self.command_failed("gp.fileDelivered", error, mark);
+        }
+        completed
+    }
+
     /// Delivers exports from all command entry points, including scripts and the assistant.
     /// The engine records success only after the service submits the file to the host.
     fn deliver_gp_files(&mut self, mut requested: Result<Value, String>) -> Result<Value, String> {
@@ -1703,18 +1713,14 @@ impl RustGisApp {
                 Some(download) => download(&name, bytes),
                 None => Err(tl!("this build has no download service").into()),
             };
-            let mut params = json!({"id": id});
-            if let Err(error) = &delivered {
-                params["error"] = json!(error);
-            }
-            let completed = self.session.acknowledge_gp_file(id, params.get("error").and_then(Value::as_str));
+            // gp.fileDelivered reports delivery failures from its history record. The app also
+            // reports acknowledgment failures before dispatch, without repeating engine notices.
+            let completed = self.acknowledge_gp_file(id, delivered.as_ref().err().map(String::as_str));
             let result = delivered.and(completed);
             self.gp.last = Some(match &result {
                 Ok(_) => (true, self.session.project.gp_history.last().map(|h| h.messages.clone()).unwrap_or_default()),
                 Err(error) => (false, vec![error.clone()]),
             });
-            // gp.fileDelivered reports delivery failures from the history record and its
-            // own acknowledgment errors through Session::run; neither needs a second notice.
             requested = complete_gp_file(requested, id, &result);
         }
         requested
@@ -5465,6 +5471,19 @@ mod record_tests {
         let other = add("200 OK", crate::serviceui::downloading("Rivers"));
         assert_eq!(other.dialogs.info, Some(crate::serviceui::downloading("Rivers")));
         assert_eq!(other.dialogs.error, None);
+        // Closing the originating project drops a late answer normally, with one informational notice.
+        let mut late = RustGisApp::with_sample();
+        let id = late.session.download_started();
+        late.run("project.new", json!({})).unwrap();
+        let mark = late.session.notice_mark();
+        late.add_landed(
+            crate::serviceui::Landed { id, url: "https://example.com/roads.geojson".into(), params: json!({"name":"Roads"}), origin: None },
+            b"{}".to_vec(),
+        );
+        let notices = late.session.notices_since(mark);
+        assert_eq!(notices.len(), 1, "a normal late drop must not also report a continuation error");
+        assert!(!notices[0].error && notices[0].text.contains("project was closed"));
+        assert!(late.session.map().layer_by_name("Roads").is_none());
     }
 
     #[test]
@@ -5885,6 +5904,12 @@ mod download_service_tests {
         let mut app = RustGisApp::with_sample();
         assert_eq!(app.run("gp.fileDelivered", json!({"id": u64::MAX})), Err("no pending file with that id".into()));
         assert_eq!(app.session.notices.iter().filter(|n| n.error && n.text == "no pending file with that id").count(), 1);
+        let mark = app.session.notice_mark();
+        let error = app.acknowledge_gp_file(u64::MAX, None).unwrap_err();
+        assert_eq!(error, "no pending file with that id");
+        // A surrounding command uses the same reporter; the helper's notice must not be repeated.
+        app.command_failed("gp.fileDelivered", &error, mark);
+        assert_eq!(app.session.notices_since(mark).iter().filter(|n| n.error && n.text == error).count(), 1);
     }
 }
 

@@ -212,7 +212,7 @@ pub fn commands() -> Vec<C> {
         .params(r#"{"notebook"?, "cell": index}"#),
         C::new("notebook.run", "Run Cells", "Notebook", run)
             .roles(&[])
-            .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+            .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Automation).with(crate::policy::Effect::Files))
             .when(need_notebook)
             .params(r#"{"notebook"?, "cell"?: index (default: every command cell, stopping at an error)}"#),
         C::new("notebook.save", "Save Notebook", "Notebook", |s, p| {

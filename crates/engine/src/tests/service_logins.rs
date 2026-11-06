@@ -44,6 +44,7 @@ struct LoginFile {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl LoginFile {
+    /// Reads bounded complete headers on a blocking accepted socket on every native platform.
     fn new(body: Vec<u8>) -> Self {
         use std::io::{Read, Write};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +64,7 @@ impl LoginFile {
                     }
                     Err(_) => break,
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                 let mut request = Vec::new();
                 let mut chunk = [0u8; 4096];

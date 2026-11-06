@@ -289,6 +289,7 @@ impl Session {
         if tries >= MAX_RETRIES {
             return Err(format!("{id}: gave up after fetching {MAX_RETRIES} times"));
         }
+        let continuation = self.continuation()?;
         // One waiting run per command: the latest call's, which replaces an earlier one.
         if let Some(i) = self.plugin_retries.iter().position(|r| r.id == id) {
             self.plugin_retries.remove(i);
@@ -302,13 +303,7 @@ impl Session {
         // the addresses.
         let fetching: Vec<&str> = urls.iter().map(|k| k.split_once(' ').map_or(k.as_str(), |(_, u)| u)).collect();
         let answer = json!({"pending": true, "fetching": fetching});
-        self.plugin_retries.push(Retry {
-            id: id.to_string(),
-            params: params.clone(),
-            urls,
-            tries: tries + 1,
-            continuation: self.continuation()?,
-        });
+        self.plugin_retries.push(Retry { id: id.to_string(), params: params.clone(), urls, tries: tries + 1, continuation });
         Ok(answer)
     }
 

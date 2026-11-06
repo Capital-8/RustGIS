@@ -12240,10 +12240,14 @@ fn downloads_land_in_their_own_project() {
     assert!(s.run("layer.addDownload", &json!({"id": id, "url": "https://x.org/a.geojson"})).is_err(), "used once");
     let late = s.download_started();
     s.run("project.new", &json!({})).unwrap();
+    let notice_mark = s.notice_mark();
     assert!(!s.download_landed(late, b"{}".to_vec()), "another project is open now");
+    assert!(s.notices_since(notice_mark).is_empty(), "a normal dropped download leaves its informational notice to the UI");
     let failed = s.download_started();
     s.download_failed(failed);
+    let notice_mark = s.notice_mark();
     assert!(!s.download_landed(failed, b"{}".to_vec()));
+    assert!(s.notices_since(notice_mark).is_empty(), "an already failed request is not a new delivery error");
     // A link's first file zooms the map to it, whatever the map held.
     let mut w = world();
     let id = w.download_started();

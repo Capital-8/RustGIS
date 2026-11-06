@@ -57,7 +57,11 @@ impl Session {
             "model.save" => "model",
             _ => return None,
         };
-        let name = self.item_name(kind, p).ok().or_else(|| p.get("name").and_then(Value::as_str).map(str::to_string))?;
+        let name = if id == "model.save" {
+            crate::cmd::workflows::model_save_names(p).ok()?.0
+        } else {
+            self.item_name(kind, p).ok().or_else(|| p.get("name").and_then(Value::as_str).map(str::to_string))?
+        };
         let trusted = self.item_trusted(kind, &name)
             || (id == "model.save" && !self.project.models.iter().any(|m| m.name.eq_ignore_ascii_case(&name)));
         Some((kind, name, trusted))
@@ -68,7 +72,11 @@ impl Session {
             return;
         }
         if let Some((kind, _, true)) = editor {
-            let name = p.get("rename").and_then(Value::as_str).map(str::to_string).or_else(|| self.item_name(kind, p).ok());
+            let name = if id == "model.save" {
+                result.get("model").and_then(Value::as_str).map(str::to_owned)
+            } else {
+                p.get("rename").and_then(Value::as_str).map(str::to_string).or_else(|| self.item_name(kind, p).ok())
+            };
             if let Some(name) = name {
                 self.trust_record(kind, &name);
             }

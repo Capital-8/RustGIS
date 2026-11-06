@@ -156,7 +156,7 @@ pub fn commands() -> Vec<C> {
         C::new("share.jobs", "Jobs", "Publish › Share As", |s, _| {
             let items: Vec<Value> = s.project.shared.iter().rev().map(|i| serde_json::to_value(i).unwrap_or(Value::Null)).collect();
             Ok(json!({"items": items, "stores": s.project.data_stores}))
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
         C::new("share.saveWebMap", "Save Web Map", "Publish › Manage", |s, p| update_item(s, p, "webMap", ps(p, "map"))).inputs(update_web_map_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).when(need_items).params(MANAGE),
         C::new("share.replaceWebLayer", "Replace Web Layer", "Publish › Manage", |s, p| update_item(s, p, "webLayer", ps(p, "layer"))).inputs(update_layer_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))

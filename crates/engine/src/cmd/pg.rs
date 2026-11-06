@@ -33,7 +33,7 @@ const MAX_LISTED: usize = 5_000;
 /// Keeps database writes reserved and declares their network reach for live permission checks.
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("pg.connect", "Connect PostGIS", "Home › Add › Add Data", connect).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files)).view().params(
+        C::new("pg.connect", "Connect PostGIS", "Home › Add › Add Data", connect).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).view().params(
             r#"{"connection"?: "host=… port=… dbname=… user=…, or a postgresql:// address (instead of the parts below)", "host"?: string, "port"?: number, "database"?: string, "user"?: string, "password"?: "kept for this session only, never saved", "sslmode"?: "disable"|"prefer"|"require"|"verify-ca"|"verify-full"}"#,
         ),
         C::new("pg.disconnect", "Disconnect PostGIS", "Home › Add › Add Data", disconnect).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().when(need_connection),

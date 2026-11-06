@@ -1599,22 +1599,23 @@ mod file_tests {
     /// Browser-style bytes and final delivery remain one-use and owned by their initiating agent.
     #[test]
     fn permission_policy_file_delivery_owner_and_replay() {
-        struct Live;
+        struct Live(std::sync::atomic::AtomicBool);
         impl crate::policy::Revocation for Live {
             fn allows(&self, _: crate::policy::Effects) -> bool {
-                true
+                self.0.load(std::sync::atomic::Ordering::SeqCst)
             }
         }
         let mut s = task_session(json!([]));
-        let owner = crate::policy::Scope::agent(
+        let live = std::sync::Arc::new(Live(std::sync::atomic::AtomicBool::new(true)));
+        let owner =
+            crate::policy::Scope::agent(crate::policy::AgentAccess::Allow, false, "file-owner", Some("file-owner".into()), live.clone());
+        let foreign = crate::policy::Scope::agent(
             crate::policy::AgentAccess::Allow,
             false,
-            "file-owner",
-            Some("file-owner".into()),
-            std::sync::Arc::new(Live),
+            "file-foreign",
+            None,
+            std::sync::Arc::new(Live(std::sync::atomic::AtomicBool::new(true))),
         );
-        let foreign =
-            crate::policy::Scope::agent(crate::policy::AgentAccess::Allow, false, "file-foreign", None, std::sync::Arc::new(Live));
         let call = crate::policy::Call::tool("vectorToPmtiles", json!({"input":"Cities","minZoom":0,"maxZoom":0}));
         let pending = s.run_scoped(owner.clone(), &call).unwrap();
         let id = pending["download"].as_u64().unwrap();
@@ -1624,7 +1625,16 @@ mod file_tests {
         assert_eq!(s.acknowledge_gp_file(id, None).unwrap()["delivered"], true);
         assert_eq!(s.undo_actor(), Some(Some("file-owner")));
         assert!(s.acknowledge_gp_file(id, None).is_err());
-        s.run_scoped(owner, &crate::policy::Call::command("edit.undo", Value::Null)).unwrap();
+        s.run_scoped(owner.clone(), &crate::policy::Call::command("edit.undo", Value::Null)).unwrap();
+        // A host callback may revoke authority after taking the bytes but before acknowledgment.
+        let pending = s.run_scoped(owner, &call).unwrap();
+        let id = pending["download"].as_u64().unwrap();
+        assert_eq!(s.take_gp_files().len(), 1);
+        live.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        let notice_mark = s.notice_mark();
+        assert!(s.acknowledge_gp_file(id, None).unwrap_err().contains("revoked"));
+        assert!(s.notices_since(notice_mark).is_empty(), "the UI must report failures before command dispatch");
+        assert!(s.project.gp_history.is_empty(), "revoked delivery cannot record success");
     }
 
     #[test]

@@ -1203,10 +1203,11 @@ routes, areas, observations…) to draw into. Add Folder connects a folder to th
 also lists the project's layouts, styles and tasks. A task's steps each run a command; New Task
 From History turns the geoprocessing history into a task you can replay.
 
-Saved projects, templates, map and layer files, and packages remove credentials from supported
-addresses and recognized executable parameters. The open project keeps its credentials. Removal
+Saved projects, templates, map and layer files, and packages remove recognized credentials from
+supported addresses and recognized executable parameters. The open project keeps its credentials. Removal
 notices describe what a shared workflow or video will need again; an unchecked-content notice
-means opaque content was kept and needs your review.
+means opaque content was kept and needs your review. Unrecognized credentials can remain in
+addresses without a notice, so review addresses and preserved content before sharing.
 
 RustGIS remembers up to 32 distinct saved snapshots for explicit project reopening, with at most
 1 MiB of restoration data per snapshot and 8 MiB in total. A snapshot must match, and only its

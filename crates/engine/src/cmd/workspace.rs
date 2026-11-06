@@ -78,13 +78,13 @@ pub fn commands() -> Vec<C> {
             let t = thumbnail(s, p)?;
             s.project.thumbnail = t;
             Ok(json!({"thumbnail": s.project.thumbnail.is_some()}))
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        }).inputs(thumbnail_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .params(r#"{"create"?: bool (from the map view), "image"?: base64 PNG/JPEG, "path"?: image file, "clear"?: bool}"#),
         C::new("map.thumbnail", "Map Thumbnail", "Publish › Thumbnail", |s, p| {
             let t = thumbnail(s, p)?;
             s.map_mut().thumbnail = t;
             Ok(json!({"thumbnail": s.map().thumbnail.is_some()}))
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        }).inputs(thumbnail_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .params(r#"{"create"?: bool, "image"?: base64 PNG/JPEG, "path"?: image file, "clear"?: bool}"#),
         // Workflow Manager.
         C::new("job.new", "Workflow Manager", "View › Windows", |s, p| {
@@ -167,7 +167,7 @@ pub fn commands() -> Vec<C> {
             let bytes = animation_zip(s, p)?;
             rustgis_data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
             Ok(json!({"path": path, "bytes": bytes.len()}))
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        }).inputs(map_render_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .view()
         .params(r#"{"path": "*.zip", "fps"?: 1..30, "width"?, "height"?: px}"#),
         // Profiles.
@@ -233,9 +233,9 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layer"? (every visible feature layer when omitted)}"#),
         C::new("info.diagnostics", "Diagnostic Monitor", "Help › Performance", |s, _| Ok(diagnostics(s))).roles(&[]).effects(crate::policy::Effects::NONE).view(),
         // Offline areas.
-        C::new("offline.download", "Download Map", "Data › Offline", offline_download).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        C::new("offline.download", "Download Map", "Data › Offline", offline_download).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"name"?: string, "extent"?: [minLon, minLat, maxLon, maxLat] (the map view when omitted)}"#),
-        C::new("offline.sync", "Sync", "Data › Offline", offline_sync).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(r#"{"name": offline area}"#),
+        C::new("offline.sync", "Sync", "Data › Offline", offline_sync).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"name": offline area}"#),
         C::new("offline.remove", "Remove", "Data › Offline", |s, p| {
             let n = ps(p, "name").ok_or("name is required")?;
             let before = s.project.offline_areas.len();
@@ -256,7 +256,7 @@ pub fn commands() -> Vec<C> {
                 }
             }
             Ok(Value::Null)
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": offline area}"#),
         C::new("offline.open", "Open Offline Map", "Data › Offline", |s, p| {
             let n = ps(p, "name").ok_or("name is required")?;
@@ -283,13 +283,13 @@ pub fn commands() -> Vec<C> {
             let e = s.project.offline_areas.iter().find(|a| a.name.eq_ignore_ascii_case(n)).map(|a| a.extent).unwrap_or(Extent::EMPTY);
             s.zoom_to(&e);
             Ok(Value::Null)
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": offline area}"#),
         // Feature cache.
         C::new("cache.fill", "Fill Cache", "Data › Feature Cache", |s, _| {
             let n = fill_cache(s);
             Ok(json!({"cached": n}))
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
         C::new("cache.empty", "Empty Cache", "Data › Feature Cache", |s, _| {
             let mut n = 0;
@@ -318,7 +318,7 @@ pub fn commands() -> Vec<C> {
                 fill_cache(s);
             }
             Ok(json!({"autoCache": s.auto_cache}))
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view()
         .params(r#"{"on"?: bool}"#),
     ]
@@ -360,11 +360,27 @@ pub fn view_extent_of(m: &rustgis_map::Map, (w, h): (f64, f64)) -> Extent {
     ll
 }
 
+/// Connects active-map rendering to the common layer and raw tile route bindings.
+fn map_render_inputs(input: &super::InputContext<'_>, _: &Value) -> Result<super::Inputs, String> {
+    Ok(super::tiles::render_inputs(input.map()))
+}
+
+/// Clearing wins; otherwise only an explicit create request asks the map renderer.
+fn creates_thumbnail(p: &Value) -> bool {
+    !b(p, "clear").unwrap_or(false) && b(p, "create").unwrap_or(false)
+}
+
+/// Adds renderer bindings only on the branch that creates a thumbnail from the map.
+fn thumbnail_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    if creates_thumbnail(p) { map_render_inputs(input, p) } else { Ok(super::Inputs::layers(std::iter::empty())) }
+}
+
+/// Clears, renders, or accepts a supplied picture in the same precedence as its selector.
 fn thumbnail(s: &mut Session, p: &Value) -> Result<Option<String>, String> {
     if b(p, "clear").unwrap_or(false) {
         return Ok(None);
     }
-    if b(p, "create").unwrap_or(false) {
+    if creates_thumbnail(p) {
         let png = super::share::map_png(s, Some(240.0), Some(160.0), Some(96.0))?;
         return Ok(Some(base64::engine::general_purpose::STANDARD.encode(png)));
     }

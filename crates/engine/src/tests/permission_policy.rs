@@ -24,6 +24,43 @@ fn pending(s: &Session, scope: &Scope, call: &Call) -> Pending {
     }
 }
 
+/// Training chooses its raster and polygons before a model exists; approval must use that branch.
+#[test]
+fn permission_policy_training_classification_binds_its_actual_inputs() {
+    let mut s = world();
+    s.run("layer.addDataBytes", &json!({"fileName":"scene.tif","data":two_class_b64()})).unwrap();
+    assert!(s.project.dl_models.is_empty());
+    let (scope, _) = assistant(14610);
+    let call = Call::script(&format!(
+        "dl.classify {}\nmap.addTiles {}",
+        json!({"layer":"scene","training":"Countries","classField":"name","model":"New classification","epochs":1}),
+        json!({"url":"https://classification-review.invalid/{z}/{x}/{y}.png"})
+    ));
+    let approved = pending(&s, &scope, &call);
+    s.run("layer.remove", &json!({"layer":"Countries"})).unwrap();
+    let error = s.run_permitted(scope, approved.allow(), &call).unwrap_err();
+    assert!(!error.is_empty());
+    assert!(s.project.dl_models.is_empty(), "a changed training input is refused before fitting");
+}
+
+/// The save executor's trimmed names cannot turn an imported model into user-authored content.
+#[test]
+fn permission_policy_model_save_uses_the_executors_normalized_names() {
+    let mut s = world();
+    let graph = json!({"nodes":[
+        {"id":"input","kind":"input","layer":"Cities"},
+        {"id":"buffer","kind":"tool","tool":"buffer","params":{"distance":10}}
+    ],"edges":[{"from":"input","fromPort":"out","to":"buffer","toPort":"input"}]});
+    s.run("model.new", &json!({"name":"Imported","graph":graph,"imported":true})).unwrap();
+    assert!(!s.item_trusted("model", "Imported"));
+    let result = s.run("model.save", &json!({"name":" Imported ","graph":graph,"rename":"Renamed"})).unwrap();
+    assert_eq!(result["model"], "Renamed");
+    assert!(!s.item_trusted("model", "Renamed"), "normalizing an imported name cannot confer trust");
+    let result = s.run("model.save", &json!({"name":" Fresh ","graph":graph,"rename":" Normalized "})).unwrap();
+    assert_eq!(result["model"], "Normalized");
+    assert!(s.item_trusted("model", "Normalized"), "fresh user content records the actual saved name");
+}
+
 /// Equal display redactions do not confer consent for different raw addresses or defaults.
 #[test]
 fn permission_policy_consent_binds_raw_params_and_default_targets() {

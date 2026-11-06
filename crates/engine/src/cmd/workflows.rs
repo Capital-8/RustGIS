@@ -556,11 +556,17 @@ fn run_model(s: &mut Session, p: &Value) -> CmdResult {
     }
 }
 
+/// The stored source and destination names used by graph saving and its provenance check.
+pub(crate) fn model_save_names(p: &Value) -> Result<(String, String), String> {
+    let name: String = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or("name is required")?.chars().take(200).collect();
+    let new_name: String = ps(p, "rename").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&name).chars().take(200).collect();
+    Ok((name, new_name))
+}
+
 /// Saves a graph as a model, replacing the one of that name (or adding it).
 fn save_model(s: &mut Session, p: &Value) -> CmdResult {
-    let name: String = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or("name is required")?.chars().take(200).collect();
+    let (name, new_name) = model_save_names(p)?;
     let g = crate::model::graph_from_json(p.get("graph").ok_or("graph is required")?)?;
-    let new_name: String = ps(p, "rename").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&name).chars().take(200).collect();
     let i = s.project.models.iter().position(|m| m.name.eq_ignore_ascii_case(&name));
     if !new_name.eq_ignore_ascii_case(&name) && s.project.models.iter().any(|m| m.name.eq_ignore_ascii_case(&new_name)) {
         return Err(format!("a model named '{new_name}' already exists"));

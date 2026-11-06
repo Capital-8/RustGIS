@@ -60,6 +60,9 @@ pub(super) fn declared(spec: &CommandSpec, params: &Value) -> Effects {
     if spec.id == "cube.open" && crate::cmd::cube_catalog::opens_zarr(params) {
         effects = effects.with(Effect::Files).with(Effect::Network);
     }
+    if spec.id == "map.addTiles" {
+        effects = effects.union(crate::cmd::tiles::add_reach(params));
+    }
     let params = crate::cmd::items::layer_name_left_out(spec.id, params);
     // These owners read an explicit null path as no output file. Keep the existing narrow
     // in-memory raster contract, including rasterization, without ignoring any other place.
@@ -81,11 +84,18 @@ pub(super) fn declared(spec: &CommandSpec, params: &Value) -> Effects {
 /// Adds only source reach of the actual current execution targets, without opening them.
 pub(super) fn command(s: &crate::cmd::InputContext<'_>, spec: &CommandSpec, params: &Value) -> Effects {
     let mut effects = declared(spec, params);
-    if spec.id == "map.zoomToTiles" {
-        effects = effects.union(crate::cmd::tiles::metadata_reach(s, params));
-    }
-    if matches!(spec.id, "layout.export" | "presentation.export" | "share.exportMap")
-        && let Some(select) = spec.inputs
+    effects = effects.union(match spec.id {
+        "map.zoomToTiles" => crate::cmd::tiles::metadata_reach(s, params),
+        "map.search" => crate::cmd::search::metadata_reach(s, params),
+        "map.tiles" | "info.project" => crate::cmd::tiles::listing_reach(s.map()),
+        "map.setTiles" => crate::cmd::tiles::set_reach(s, params),
+        "time.export" => crate::cmd::time::export_reach(s, params),
+        _ => Effects::NONE,
+    });
+    if matches!(
+        spec.id,
+        "layout.export" | "presentation.export" | "share.exportMap" | "animation.export" | "project.thumbnail" | "map.thumbnail"
+    ) && let Some(select) = spec.inputs
         && let Ok(inputs) = select(s, params)
     {
         // Reuse the export owner's actual frame/page selection, never every project map.
