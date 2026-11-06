@@ -2109,7 +2109,7 @@ impl RustGisApp {
         assistantpane::peer_replaced(self);
         self.ui.web_file = None;
         self.map.deleting = None;
-        self.ui.cog_probes.clear();
+        self.retire_cog_probes();
         if let Some(steps) = self.ws.recording.take() {
             self.session.notify(
                 crate::i18n::fmt(
@@ -2124,6 +2124,17 @@ impl RustGisApp {
             self.session.notify(notice, false);
         }
         Ok(())
+    }
+
+    /// Reports pending header reads retired by either ordinary or peer project replacement.
+    fn retire_cog_probes(&mut self) {
+        for (p, _, _) in std::mem::take(&mut self.ui.cog_probes) {
+            let url = p.get("url").and_then(Value::as_str).unwrap_or("");
+            let url = serviceui::address_in_message(rustgis_engine::data::s3_address::inner(url));
+            let why = i18n::fmt("{url}: its project was closed while it was read, so it wasn't added", &[("url", &url)]);
+            self.landed_in_dialog(&p, Err(&why));
+            self.session.notify(why, false);
+        }
     }
 
     /// Runs a command by id: `ui.*` here, everything else in the engine.
@@ -2224,13 +2235,7 @@ impl RustGisApp {
             // A probe still under way is for an address added to the old project: dropped, so
             // its layer never lands in the new one, and said, as a download landing late is. A plugin
             // command waiting for it went with the old project's waits.
-            for (p, _, _) in std::mem::take(&mut self.ui.cog_probes) {
-                let url = p.get("url").and_then(Value::as_str).unwrap_or("");
-                let url = serviceui::address_in_message(rustgis_engine::data::s3_address::inner(url));
-                let why = i18n::fmt("{url}: its project was closed while it was read, so it wasn't added", &[("url", &url)]);
-                self.landed_in_dialog(&p, Err(&why));
-                self.session.notify(why, false);
-            }
+            self.retire_cog_probes();
         }
         // Undo and redo can move vertices: an index chosen before may now name another vertex.
         // A step moved or deleted, from the pane, Command Search, the assistant or a script: the
@@ -6156,8 +6161,31 @@ mod peer_output_tests {
         app.assistant.queued = Some("old project action".into());
         app.ui.web_file = Some("prior.rgis".into());
         let generation = app.session.opened;
+        app.ui.cog_probes.push((
+            json!({"url":"https://peer-probe.invalid/elevation.tif?token=RGSYNTH_peer_probe","name":"Elevation"}),
+            None,
+            Default::default(),
+        ));
+        app.dialogs.info = Some(crate::serviceui::downloading("Elevation"));
+        let probe_mark = app.session.notice_mark();
         app.open_peer_text(&text).unwrap();
         assert_ne!(app.session.opened, generation);
+        assert!(app.ui.cog_probes.is_empty());
+        assert!(app.dialogs.info.is_none(), "a retired peer probe cannot keep the reading message open");
+        let retired = app
+            .session
+            .notices_since(probe_mark)
+            .iter()
+            .filter(|n| n.text.contains("peer-probe.invalid/elevation.tif") && n.text.contains("project was closed"))
+            .count();
+        assert_eq!(retired, 1, "the peer replacement must say which pending read was omitted");
+        assert!(app.session.notices_since(probe_mark).iter().all(|n| !n.text.contains("RGSYNTH_peer_probe")));
+        let clean_mark = app.session.notice_mark();
+        app.open_peer_text(&text).unwrap();
+        assert!(
+            app.session.notices_since(clean_mark).iter().all(|n| !n.text.contains("project was closed")),
+            "a clean peer replacement does not replay a retired read"
+        );
         assert!(app.session.project.tasks.is_empty());
         assert!(app.ui.web_file.is_none() && app.assistant.queued.is_none());
         assert!(!serde_json::to_string(&app.session.project).unwrap().contains("RGSYNTH_4"));

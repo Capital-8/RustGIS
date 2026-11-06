@@ -294,6 +294,7 @@ fn public_text(text: String) -> String {
     rustgis_engine::render::rustgis_tiles::logins::scrub(&text)
 }
 
+/// Publishes a completed result, reporting withheld subtrees before enforcing the response budget.
 fn public_result(s: &mut Session, value: Value, tokens: usize) -> String {
     let mut withheld = Withheld::default();
     let mut value = public_addresses(value, 0, &mut withheld);
@@ -314,6 +315,7 @@ fn public_result(s: &mut Session, value: Value, tokens: usize) -> String {
     bounded_json(&value, tokens)
 }
 
+/// Counts output withheld for depth limits or field names that collide after redaction.
 #[derive(Default)]
 struct Withheld {
     depth: usize,

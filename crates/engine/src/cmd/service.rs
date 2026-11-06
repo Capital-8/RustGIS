@@ -83,12 +83,18 @@ pub(crate) fn without_token(p: &Value) -> Result<Option<Value>, String> {
     Ok(Some(owned))
 }
 
+/// One layer's exact capabilities document and the origin history used to reach it.
+struct CapabilitySource {
+    address: String,
+    crossed_origin: bool,
+}
+
 /// Capability discovery is shared by supplied-document GUI requests and native commands.
 /// Sources stay alongside layers so a landing page and a collection may use the same name.
 #[derive(Default)]
 struct Discovery {
     service: Service,
-    sources: Vec<String>,
+    sources: Vec<CapabilitySource>,
     next: Option<String>,
     error: Option<String>,
     excluded_layers: bool,
@@ -130,7 +136,9 @@ fn capabilities(p: &Value) -> Result<Discovery, String> {
     let mut result = Discovery::default();
     let mut seen = std::collections::HashSet::new();
     let mut parent = original.to_string();
+    let mut crossed_origin = false;
     loop {
+        crossed_origin |= crosses_origin(&parent, &address);
         if let Err(e) = crate::render::rustgis_tiles::address::check(&address, Some(&parent)) {
             return result.failed(e);
         }
@@ -175,7 +183,7 @@ fn capabilities(p: &Value) -> Result<Discovery, String> {
         // Distinct offers may share a name (including generated tile names and collection ids).
         for layer in service.layers {
             result.service.layers.push(layer);
-            result.sources.push(address.clone());
+            result.sources.push(CapabilitySource { address: address.clone(), crossed_origin });
         }
         result.service.withheld_addresses = result.service.withheld_addresses.saturating_add(service.withheld_addresses);
         result.service.notes.extend(service.notes);
@@ -365,6 +373,7 @@ struct AdvertisedTemplate {
     crossed_origin: bool,
 }
 
+/// Compares canonical origins without treating a runtime login wrapper as part of the origin.
 fn crosses_origin(from: &str, to: &str) -> bool {
     crate::render::rustgis_tiles::logins::origin(from) != crate::render::rustgis_tiles::logins::origin(to)
 }
@@ -377,6 +386,7 @@ fn advertised_template(source: &str, list: &str, vector: bool, withheld: &mut u3
     advertised_template_with(source, list, vector, withheld, crate::render::rustgis_tiles::cache::download_blocking)
 }
 
+/// Resolves at most two advertised documents while retaining every foreign hop, even on failure.
 #[cfg(not(target_arch = "wasm32"))]
 fn advertised_template_with(
     source: &str,
@@ -513,7 +523,7 @@ pub(crate) fn layers(s: &mut Session, p: &Value) -> CmdResult {
     let mut out = service_json(&found.service);
     if let Some(layers) = out.get_mut("layers").and_then(Value::as_array_mut) {
         for (layer, source) in layers.iter_mut().zip(found.sources) {
-            layer["source_url"] = json!(source);
+            layer["source_url"] = json!(source.address);
         }
     }
     if let Some(next) = found.next {
@@ -547,7 +557,12 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
 /// epilogue. Validation and execution errors return unchanged through that epilogue too.
 fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Discovery, withheld: &mut u32) -> CmdResult {
     let candidates = || {
-        found.service.layers.iter().zip(&found.sources).filter(|(_, source)| ps(p, "source_url").is_none_or(|s| same_address(s, source)))
+        found
+            .service
+            .layers
+            .iter()
+            .zip(&found.sources)
+            .filter(|(_, source)| ps(p, "source_url").is_none_or(|s| same_address(s, &source.address)))
     };
     let (layer, source) = candidates()
         .find(|(l, _)| l.name == want)
@@ -561,6 +576,8 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
                 None => format!("{url}: no layer '{want}' (service.layers lists them)"),
             }
         })?;
+    let capability_crossed = source.crossed_origin;
+    let source = source.address.as_str();
     // A time-enabled layer follows the time slider, at each of its steps, unless a time is asked
     // for: one of its times (the layer named with it), or "default" (`false`), the service's.
     // (`"time": true`, the slider, as for a Zarr variable, `layer.addZarr`'s.)
@@ -628,6 +645,7 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
     match &layer.offer {
         Offer::Tiles { template } => {
             let template = advertised.template.as_deref().unwrap_or(template);
+            let crossed_origin = capability_crossed || advertised.crossed_origin || crosses_origin(source, template);
             let template = match (&time, &slider) {
                 // Its time written as the layer writes its times, filled at each step.
                 (_, Some(st)) => template.replace("{Time}", &format!("{{date:{}}}", st.format)),
@@ -667,7 +685,7 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
             if !legends.is_empty() {
                 add["legend"] = json!(legends);
             }
-            let mut r = add_tiles(s, &add, advertised.crossed_origin)?;
+            let mut r = add_tiles(s, &add, crossed_origin)?;
             // A WMS layer's GetFeatureInfo request, for identify.
             let added = r["index"].as_u64().and_then(|i| usize::try_from(i).ok());
             if let Some(t) = added.and_then(|i| s.map_mut().tiles.get_mut(i)) {
@@ -702,10 +720,11 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
         }
         Offer::VectorTiles { template, layers } => {
             let template = advertised.template.as_deref().unwrap_or(template);
+            let crossed_origin = capability_crossed || advertised.crossed_origin || crosses_origin(source, template);
             let r = add_tiles(
                 s,
                 &json!({"url": template, "kind": "vector", "name": name, "layers": layers, "overlay": true, "bounds": layer.bbox, "connection":p.get("connection")}),
-                advertised.crossed_origin,
+                crossed_origin,
             )?;
             zoom(s);
             Ok(r)
@@ -714,9 +733,10 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
         // and does not count as content (see `super::map_is_empty`): adding a layer after it frames
         // the map again. Documented in docs/user-guide/data-formats.md.
         Offer::Style { url: style } => {
-            let r = super::tiles::add(
+            let r = add_tiles(
                 s,
                 &json!({"url": style, "kind": "style", "name": name, "bounds": layer.bbox, "connection":p.get("connection")}),
+                capability_crossed || crosses_origin(source, style),
             )?;
             zoom(s);
             Ok(r)
@@ -862,7 +882,7 @@ fn coverage(s: &mut Session, p: &Value) -> CmdResult {
         .layers
         .iter()
         .zip(&found.sources)
-        .filter(|(_, source)| ps(p, "source_url").is_none_or(|s| same_address(s, source)))
+        .filter(|(_, source)| ps(p, "source_url").is_none_or(|s| same_address(s, &source.address)))
         .map(|(layer, _)| layer)
         .find(|l| l.name == want || l.name.eq_ignore_ascii_case(want))
         .ok_or_else(|| format!("{url}: no coverage '{want}' (service.layers lists them)"))?;

@@ -1043,6 +1043,32 @@ mod tests {
         assert!(report.nodes.iter().all(|n| n.status != "pending"));
     }
 
+    /// Terminal authority refusal updates the matching model node without claiming delivery.
+    #[test]
+    fn retired_model_file_does_not_remain_pending() {
+        let mut s = session();
+        let login = s
+            .run("connection.new", &json!({"kind":"wms","address":"https://model-retire.invalid/wms","auth":"header","keyName":"X-Key"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        s.run("connection.login", &json!({"id":login,"apiKey":"RGSYNTH_model_retire"})).unwrap();
+        s.run("model.run", &json!({"graph":file_graph()})).unwrap();
+        let id = s.file_outputs[0].id;
+        assert_eq!(s.model_run.as_ref().unwrap().nodes[0].status, "pending");
+        s.run("connection.logout", &json!({"id":login})).unwrap();
+        assert!(s.take_gp_files().is_empty());
+        let report = s.model_run.as_ref().unwrap();
+        assert_eq!(report.nodes[0].status, "error", "a retired export cannot wait for an impossible acknowledgement");
+        assert!(!report.ok && report.error.is_some());
+        assert!(report.pending_files.is_empty());
+        assert!(s.project.gp_history.is_empty(), "refused bytes cannot record successful delivery");
+        let before = report.clone();
+        assert!(s.acknowledge_gp_file(id, None).is_err());
+        assert_eq!(s.model_run.as_ref(), Some(&before));
+    }
+
     #[test]
     fn model_waits_for_all_downloads_and_ignores_older_run_acknowledgements() {
         let mut s = session();

@@ -26,7 +26,7 @@ impl Drop for Claim {
 pub(super) struct Queued {
     c: std::sync::Weak<Continuation>,
     import: bool,
-    claimed: Arc<AtomicBool>,
+    consumed: Arc<AtomicBool>,
 }
 #[derive(Default)]
 pub(crate) struct Work {
@@ -59,9 +59,9 @@ impl Session {
         }
     }
     pub(crate) fn restore_url_request_checkpoint(&mut self, checkpoint: UrlRequestCheckpoint) {
-        // A successfully claimed key stays consumed even if its command later fails.
+        // Claimed and terminally retired keys stay consumed even if their command later fails.
         let mut queued = checkpoint.queued;
-        queued.retain(|_, q| !q.claimed.load(Ordering::SeqCst));
+        queued.retain(|_, q| !q.consumed.load(Ordering::SeqCst));
         self.url_requests = checkpoint.requests.into_iter().filter(|q| queued.contains_key(&q.key)).collect();
         self.policy.work.queued = queued;
         self.retire_abandoned_requests();
@@ -94,14 +94,20 @@ impl Session {
             self.policy
                 .work
                 .queued
-                .insert(q.key, Queued { c: Arc::downgrade(&q.authority), import: false, claimed: Arc::new(AtomicBool::new(false)) });
+                .insert(q.key, Queued { c: Arc::downgrade(&q.authority), import: false, consumed: Arc::new(AtomicBool::new(false)) });
             self.url_requests.push(q);
         }
         Ok(())
     }
     pub(crate) fn discard_plugin_requests(&mut self, keys: &[u64]) {
         self.url_requests.retain(|q| !keys.contains(&q.key));
-        self.policy.work.queued.retain(|key, _| !keys.contains(key));
+        self.policy.work.queued.retain(|key, queued| {
+            let keep = !keys.contains(key);
+            if !keep {
+                queued.consumed.store(true, Ordering::SeqCst);
+            }
+            keep
+        });
     }
     /// Plugin pins and caller lifetimes are part of request sharing, not just URL text.
     pub(crate) fn same_url_caller(&self, a: &Continuation, b: &Continuation) -> bool {
@@ -262,7 +268,7 @@ impl Session {
             }
             self.next_pending = self.next_pending.wrapping_add(1);
             let key = self.next_pending;
-            self.policy.work.queued.insert(key, Queued { c: Arc::downgrade(&c), import, claimed: Arc::new(AtomicBool::new(false)) });
+            self.policy.work.queued.insert(key, Queued { c: Arc::downgrade(&c), import, consumed: Arc::new(AtomicBool::new(false)) });
             self.url_requests.push(UrlRequest { key, params, authority: c });
         }
         if !import
@@ -296,8 +302,11 @@ impl Session {
                 live.push(request);
             } else {
                 self.request_failed(&request.params, "this URL request was revoked before it started");
-                if self.policy.work.queued.remove(&request.key).is_some_and(|q| q.import) {
-                    crate::cmd::geolibre::discard_pending(self, &request.params);
+                if let Some(queued) = self.policy.work.queued.remove(&request.key) {
+                    queued.consumed.store(true, Ordering::SeqCst);
+                    if queued.import {
+                        crate::cmd::geolibre::discard_pending(self, &request.params);
+                    }
                 }
                 revoked += 1;
             }
@@ -327,13 +336,15 @@ impl Session {
             self.request_failed(&request.params, &error);
             if import {
                 // Only the verified owner may abandon this sealed reservation before a reader exists.
-                self.policy.work.queued.remove(&request.key);
+                if let Some(queued) = self.policy.work.queued.remove(&request.key) {
+                    queued.consumed.store(true, Ordering::SeqCst);
+                }
                 crate::cmd::geolibre::discard_pending(self, &request.params);
             }
             return Err(error);
         }
         if let Some(q) = self.policy.work.queued.remove(&request.key) {
-            q.claimed.store(true, Ordering::SeqCst);
+            q.consumed.store(true, Ordering::SeqCst);
         }
         let c = (*c).clone();
         let id = self.download_started();

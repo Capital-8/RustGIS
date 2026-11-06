@@ -132,7 +132,8 @@ pub fn activate(origin: &str, owner: &str, method: Method, value: &str, insecure
     activate_with_random(origin, owner, method, value, insecure, fill_random)
 }
 
-/// Keeps entropy failure on the same activation path on native and browser builds.
+/// Validates the login before requesting entropy, then installs a fresh binding and its active
+/// output redactions together; failed validation or entropy leaves the registry unchanged.
 fn activate_with_random(
     origin: &str,
     owner: &str,

@@ -1251,6 +1251,9 @@ impl Session {
                 continue;
             }
             if let Err(e) = self.check_export_delivery(&file.continuation) {
+                if let Some(report) = &mut self.model_run {
+                    report.file_delivered(file.id, Some(&e));
+                }
                 // Redact before clipping: a partial credential must never become display text.
                 let clean = Self::redacted(&file.file_name);
                 let mut name: String = clean.as_str().chars().take(80).collect();
@@ -1340,6 +1343,7 @@ impl Session {
 
     /// Shared command bookkeeping for ordinary dispatch and execution of an already pinned retry.
     pub(crate) fn command_epilogue(&mut self, id: &str, params: &Value, run: impl FnOnce(&mut Self) -> CmdResult) -> CmdResult {
+        let outermost = self.depth == 0;
         #[cfg(not(target_arch = "wasm32"))]
         let _diagnostic_scope = self.requests_into.as_ref().map_or_else(|| self.diagnostics.enter(), |c| c.enter());
         #[cfg(target_arch = "wasm32")]
@@ -1402,6 +1406,10 @@ impl Session {
             res
         }));
         self.diagnostic_source = previous;
+        // Every top-level invocation consumes its key, even a refusal or panic before guarded.
+        if outermost {
+            self.merge = None;
+        }
         match result {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
@@ -1525,7 +1533,7 @@ impl Session {
         // Requests a failed command left for the front end go with its other changes.
         let requests = self.url_request_checkpoint();
         let retry_state = (self.plugin_retries.clone(), self.url_waits.clone());
-        let file_outputs = self.file_outputs.len();
+        let file_outputs: Vec<_> = self.file_outputs.iter().map(|file| file.id).collect();
         let said = self.notices_given;
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)))
             .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly; the project was restored")));
@@ -1645,7 +1653,8 @@ impl Session {
         if res.is_err() {
             self.restore_url_request_checkpoint(requests);
             (self.plugin_retries, self.url_waits) = retry_state;
-            self.file_outputs.truncate(file_outputs);
+            // Keep only still-present old identities: drained bytes and terminal refusals stay consumed.
+            self.file_outputs.retain(|file| file_outputs.contains(&file.id));
         }
         let quiet = std::mem::take(&mut self.quiet_failure);
         if let Err(e) = &res

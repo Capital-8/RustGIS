@@ -126,6 +126,7 @@ fn listing(s: &mut Session, p: &Value) -> CmdResult {
     let mut identities = std::collections::HashSet::new();
     let mut offered = Vec::new();
     for (layer, source) in found.service.layers.into_iter().zip(found.sources) {
+        let source = source.address;
         if !matches!(layer.offer, Offer::Features { .. }) {
             continue;
         }

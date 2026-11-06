@@ -977,8 +977,16 @@ mod tests {
         assert!(s.download_landed(id, br#"{"type":"Point","coordinates":[1,2]}"#.to_vec()));
         let mut p = taken[0].params().clone();
         p["id"] = json!(id);
+        s.merge_undo("late download");
+        s.run("map.rename", &json!({"name":"Before late completion"})).unwrap();
+        s.merge_undo("late download");
         let e = s.complete_download(id, &p).unwrap_err();
         assert!(e.starts_with("https://x.org/e.geojson") && e.contains("stopped waiting") && !e.contains("hunter2"), "{e}");
+        let before = s.undo_depth();
+        s.run("map.rename", &json!({"name":"After late completion"})).unwrap();
+        assert_eq!(s.undo_depth(), before + 1, "a pre-guard completion refusal must consume its merge key");
+        s.run("edit.undo", &Value::Null).unwrap();
+        assert_eq!(s.map().name, "Before late completion");
         assert!(s.map().layers.is_empty() && s.downloaded.is_empty());
         rustgis_plugins::unload("eng-refuse-real");
     }

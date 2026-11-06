@@ -1921,6 +1921,34 @@ mod file_tests {
         assert_eq!(s.take_gp_files().len(), 8);
     }
 
+    /// Draining an old refused file cannot let a new export escape a failed handler's rollback.
+    #[test]
+    fn failed_commands_cannot_replace_retired_pending_files() {
+        let mut s = task_session(json!([]));
+        let login = s
+            .run("connection.new", &json!({"kind":"wms","address":"https://file-rollback.invalid/wms","auth":"header","keyName":"X-Key"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        s.run("connection.login", &json!({"id":login,"apiKey":"RGSYNTH_file_rollback"})).unwrap();
+        let old =
+            s.run("gp.run", &json!({"tool":"vectorToPmtiles","params":{"input":"Cities","minZoom":0,"maxZoom":0}})).unwrap()["download"]
+                .as_u64()
+                .unwrap();
+        s.run("connection.logout", &json!({"id":login})).unwrap();
+        s.registry.commands.push(C::new("test.replaceFileThenFail", "Failed replacement export", "Test", |s, _| {
+            s.take_gp_files();
+            s.run("gp.run", &json!({"tool":"vectorToPmtiles","params":{"input":"Cities","minZoom":0,"maxZoom":0}}))?;
+            Err("fail after replacing a refused file".into())
+        }));
+        assert!(s.run("test.replaceFileThenFail", &Value::Null).is_err());
+        assert!(s.take_gp_files().is_empty(), "the failed handler's replacement file cannot reach the UI");
+        assert!(s.file_outputs.is_empty());
+        assert!(s.acknowledge_gp_file(old, None).is_err(), "the old refused file must not be restored either");
+        assert!(s.project.gp_history.is_empty());
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn native_export_preserves_the_saved_project_file() {

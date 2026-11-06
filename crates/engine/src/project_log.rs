@@ -194,6 +194,7 @@ fn redacted(v: &Value) -> Value {
     crate::cmd::history::redacted(&embedded_redacted(v, 0))
 }
 
+/// Scrubs bounded nested log parameters and JSON embedded in text before the log retains them.
 fn embedded_redacted(v: &Value, depth: usize) -> Value {
     match v {
         Value::String(t) => {

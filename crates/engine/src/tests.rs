@@ -13295,6 +13295,8 @@ fn service_times_and_directories() {
     assert_eq!(v["layers"][1]["offer"], json!({"type": "service", "url": "https://x.example.org/arcgis/rest/services/Topo/MapServer"}));
     let e = s.run("service.add", &json!({"url": root, "text": dir, "layer": "Topo/MapServer"})).unwrap_err();
     assert!(e.contains("service.layers"), "{e}");
+    let foreign = WMTS.replace("https://gibs.example.org/TC/default/", "https://fallback-b.invalid/TC/default/");
+    service_logins::foreign_service_fallback_stays_anonymous("wmts", url, "TC", WMTS, &foreign);
 }
 
 /// Adding an OGC API collection the listing left out, as 3D Tiles (#1267), says why, not that the
@@ -13659,6 +13661,8 @@ fn wms_layers_with_time() {
     // A layer without times has none to follow it with.
     let e = s.run("service.add", &json!({"url": url, "layer": "roads", "text": WMS, "time": "slider"})).unwrap_err();
     assert!(e.contains("no time to follow"), "{e}");
+    let foreign = WMS.replace("https://maps.example.com/wms?", "https://fallback-b.invalid/wms?");
+    service_logins::foreign_service_fallback_stays_anonymous("wms", url, "population", WMS, &foreign);
 }
 
 /// Identify asks a WMS layer what is at the point (GetFeatureInfo): the request from the

@@ -1496,3 +1496,109 @@ fn delayed_head_refusal_keeps_secrets_out_of_history_across_login_lifecycle() {
         }
     }
 }
+
+/// A foreign capability fallback cannot select a destination login now or after reopening.
+pub(super) fn foreign_service_fallback_stays_anonymous(kind: &str, source: &str, layer: &str, clean: &str, foreign: &str) {
+    let mut results = Vec::new();
+    for (crossed, text) in [(false, clean), (true, foreign)] {
+        let mut s = session(None);
+        let a = new(&mut s, json!({"kind":kind,"address":source,"auth":"header","keyName":"X-Key"}));
+        let b = new(&mut s, json!({"kind":kind,"address":"https://fallback-b.invalid","auth":"header","keyName":"X-Key"}));
+        s.run("connection.login", &json!({"id":a,"apiKey":"RGSYNTH_fallback_a"})).unwrap();
+        s.run("connection.login", &json!({"id":b,"apiKey":"RGSYNTH_fallback_b"})).unwrap();
+        s.run("service.add", &json!({"url":source,"layer":layer,"text":text,"connection":a,"time":"default"})).unwrap();
+        for reopened in [false, true] {
+            if reopened {
+                let saved = s.project.saved_text(None).unwrap().0;
+                s.run("project.openText", &json!({"text":saved})).unwrap();
+            }
+            s.run("connection.login", &json!({"id":b,"apiKey":"RGSYNTH_fallback_rotated"})).unwrap();
+            let tile = &s.map().tiles[0];
+            results.push((
+                crossed,
+                reopened,
+                if crossed {
+                    tile.anonymous && tile.connection.is_empty() && header(&tile.url).is_none()
+                } else {
+                    !tile.anonymous && tile.connection == a && header(&tile.url).is_some()
+                },
+            ));
+        }
+    }
+    assert!(results.iter().all(|(_, _, kept)| *kept), "foreign fallback adopted a login or same-origin binding changed: {results:?}");
+}
+
+/// A foreign capabilities document remains foreign even when it links back to the source origin.
+#[test]
+fn capabilities_round_trip_keeps_foreign_lineage() {
+    let mut results = Vec::new();
+    for crossed in [false, true] {
+        let mut s = session(None);
+        let a = "https://lineage-a.invalid";
+        let bridge = if crossed { "https://lineage-b.invalid/bridge" } else { "https://lineage-a.invalid/bridge" };
+        let id = new(&mut s, json!({"kind":"ogcapi","address":a,"auth":"header","keyName":"X-Key"}));
+        s.run("connection.login", &json!({"id":id,"apiKey":"RGSYNTH_capabilities_lineage"})).unwrap();
+        let link = |url: &str| json!({"links":[{"rel":"data","type":"application/json","href":url}]}).to_string();
+        s.run("service.add", &json!({
+            "url":format!("{a}/root"),"type":"ogcapi","connection":id,"layer":"relief (map tiles)",
+            "text":link(bridge),"documents":[
+                {"url":bridge,"text":link(&format!("{a}/returned"))},
+                {"url":format!("{a}/returned"),"text":json!({"collections":[{"id":"relief","links":[{"rel":"tilesets-map","href":format!("{a}/list")}]}]}).to_string()}
+            ],"tiles":format!("{a}/paint/{{z}}/{{x}}/{{y}}.png")
+        })).unwrap();
+        let tile = &s.map().tiles[0];
+        results.push((
+            crossed,
+            if crossed {
+                tile.anonymous && tile.connection.is_empty() && header(&tile.url).is_none()
+            } else {
+                !tile.anonymous && tile.connection == id && header(&tile.url).is_some()
+            },
+        ));
+    }
+    assert!(results.iter().all(|(_, kept)| *kept), "capabilities discovery forgot its foreign hop: {results:?}");
+}
+
+/// Styles reached through capabilities retain the same origin history as raster/vector tiles.
+#[test]
+fn capabilities_styles_keep_foreign_lineage() {
+    let mut results = Vec::new();
+    for crossed in [false, true] {
+        let mut s = session(None);
+        let a = "https://style-lineage-a.invalid";
+        let b = "https://style-lineage-b.invalid";
+        let source = if crossed { b } else { a };
+        let doc = format!("{source}/rest/services/X/VectorTileServer");
+        let login = new(&mut s, json!({"kind":"ogcapi","address":a,"auth":"header","keyName":"X-Key"}));
+        let other = new(&mut s, json!({"kind":"ogcapi","address":b,"auth":"header","keyName":"X-Key"}));
+        s.run("connection.login", &json!({"id":login,"apiKey":"RGSYNTH_style_a"})).unwrap();
+        s.run("connection.login", &json!({"id":other,"apiKey":"RGSYNTH_style_b"})).unwrap();
+        s.run(
+            "service.add",
+            &json!({
+                "url":format!("{a}/root"),"type":"ogcapi","connection":login,"layer":"style",
+                "text":json!({"links":[{"rel":"data","type":"application/json","href":doc}]}).to_string(),
+                "documents":[{"url":doc,"text":json!({"currentVersion":11,"name":"Private style"}).to_string()}]
+            }),
+        )
+        .unwrap();
+        for reopened in [false, true] {
+            if reopened {
+                let saved = s.project.saved_text(None).unwrap().0;
+                s.run("project.openText", &json!({"text":saved})).unwrap();
+            }
+            s.run("connection.login", &json!({"id":other,"apiKey":"RGSYNTH_style_rotated"})).unwrap();
+            let tile = &s.map().tiles[0];
+            results.push((
+                crossed,
+                reopened,
+                if crossed {
+                    tile.anonymous && tile.connection.is_empty() && header(&tile.url).is_none()
+                } else {
+                    !tile.anonymous && tile.connection == login && header(&tile.url).is_some()
+                },
+            ));
+        }
+    }
+    assert!(results.iter().all(|(_, _, kept)| *kept), "style discovery forgot its foreign hop: {results:?}");
+}

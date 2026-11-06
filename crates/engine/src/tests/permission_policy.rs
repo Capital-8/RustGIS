@@ -270,6 +270,9 @@ fn permission_policy_deferred_url_claim_keeps_owner_and_generation() {
     let q = s.take_url_requests().pop().unwrap();
     assert_eq!(q.params()["url"], url, "opaque transport parameters retain the exact private address");
     assert!(!reported.to_string().contains("RGSYNTH_pending"), "the public pending response must omit credentials");
+    let logged = s.log.entries().last().unwrap();
+    assert_eq!(logged.command, "layer.addUrl");
+    assert!(!serde_json::to_string(logged).unwrap().contains("RGSYNTH_pending"), "the session log must omit credentials");
     let id = s.download_started_for(&q).unwrap();
     assert!(s.download_started_for(&q).is_err());
     let still = s.download_still(id).unwrap();
@@ -1748,4 +1751,30 @@ fn permission_policy_renamed_mask_and_elevation_keep_their_targets() {
     s.run_permitted(scope, p.allow(), &call).unwrap();
     assert_eq!(s.map().layer(cities).unwrap().mask.as_deref(), Some("Renamed mask"));
     assert!(matches!(&s.map().editing.settings.elevation, rustgis_map::design::Elevation::Surface(name) if name == "Renamed surface"));
+}
+
+/// A failed drain can restore untouched queued work, but cannot revive terminally retired work.
+#[test]
+fn permission_policy_rollback_keeps_retired_url_requests_consumed() {
+    let mut s = world();
+    s.leave_downloads = true;
+    let (owner, live) = assistant(245);
+    let call = Call::command("layer.addUrl", json!({"url":"https://rollback.invalid/revoked.csv"}));
+    let p = pending(&s, &owner, &call);
+    s.run_permitted(owner, p.allow(), &call).unwrap();
+    s.request_url(&json!({"url":"https://rollback.invalid/untouched.csv"})).unwrap();
+    live.0.store(false, Ordering::SeqCst);
+    let mark = s.notice_mark();
+    assert!(
+        s.guarded("Failed request drain", true, |s| {
+            s.take_url_requests();
+            Err("fail after retiring a revoked request".into())
+        })
+        .is_err()
+    );
+    live.0.store(true, Ordering::SeqCst);
+    let remaining = s.take_url_requests();
+    let addresses: Vec<_> = remaining.iter().map(|q| q.params()["url"].as_str().unwrap()).collect();
+    assert_eq!(addresses, ["https://rollback.invalid/untouched.csv"], "rollback cannot revive retired authority");
+    assert_eq!(s.notices_since(mark).iter().filter(|n| n.text.contains("revoked before it started")).count(), 1);
 }
