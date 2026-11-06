@@ -585,6 +585,7 @@ struct PutAside {
     policy_work: policy::downloads::Work,
     landed_reads: Vec<(u64, LandedRead)>,
     plugin_retries: Vec<cmd::plugins::fetch::Retry>,
+    url_waits: cmd::plugins::fetch::UrlWaits,
     /// A style of the project still loading, which mustn't move the next one's view.
     style_view: Option<(rustgis_map::TileLayer, Camera, u64)>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -791,8 +792,24 @@ pub struct Session {
     /// Set by [`Session::run_leaving_downloads`]: `layer.addUrl` leaves what it would wait for
     /// to the front end ([`Session::request_url`]), as in the browser.
     leave_downloads: bool,
-    /// Plugin commands waiting for their `host.fetch` answers to run again (the browser).
+    /// Plugin commands waiting for their `host.fetch` answers, or the downloads their
+    /// `layer.addUrl` left to the app, to run again.
     pub(crate) plugin_retries: Vec<cmd::plugins::fetch::Retry>,
+    /// The downloads plugin commands wait for: being made by the app, or landed (#1202).
+    pub(crate) url_waits: cmd::plugins::fetch::UrlWaits,
+    /// The number of the last download request ([`Session::request_url`]).
+    next_request: u64,
+    /// The download requests of the plugin call running now (none outside one): each one's
+    /// number, and what was asked.
+    pub(crate) call_requests: Option<Vec<(u64, serde_json::Value)>>,
+    /// While a plugin command runs again for its downloads: what each one asked for, and what
+    /// adding it answered, for its `layer.addUrl` to answer once.
+    pub(crate) rerun_landed: Vec<(serde_json::Value, CmdResult, cmd::plugins::fetch::Added)>,
+    /// While a plugin command runs again: the errors its earlier runs said, not said again.
+    pub(crate) rerun_said: Vec<String>,
+    /// While plugin commands whose downloads are in run again: the downloads they wait for, still
+    /// theirs though the commands are out of `plugin_retries` until each has run.
+    pub(crate) rerun_requests: Vec<u64>,
     /// How many times the plugin command running now has been run again for its fetches.
     pub(crate) retry_tries: u32,
     /// Set for [`Session::guarded`] by a command whose failure is no news (a plugin command
@@ -1096,6 +1113,12 @@ impl Session {
             request_only: false,
             leave_downloads: false,
             plugin_retries: Vec::new(),
+            url_waits: cmd::plugins::fetch::UrlWaits::default(),
+            next_request: 0,
+            call_requests: None,
+            rerun_landed: Vec::new(),
+            rerun_said: Vec::new(),
+            rerun_requests: Vec::new(),
             retry_tries: 0,
             quiet_failure: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1199,11 +1222,6 @@ impl Session {
         current
     }
 
-    /// Keeps a `layer.addUrl` request for the front end to download off the frame and add when
-    /// it lands (the browser, where a command may not wait): the command's answer, which says
-    /// so. A request made again while it waits is made once (the same address read another way,
-    /// as another layer or with other columns, is another request), and past a few waiting
-    /// requests the next is refused rather than silently dropping one already promised.
     /// Runs a command as [`Session::run`] does, except that the downloads `layer.addUrl` would
     /// wait for (on the desktop) are left to the front end, as in the browser: the app runs the
     /// commands of plugins this way, so a plugin adding data by address doesn't freeze it. The
@@ -1482,8 +1500,8 @@ impl Session {
         self.request_only = false;
         self.quiet_failure = false;
         // Requests a failed command left for the front end go with its other changes.
-        let requests = self.url_requests.len();
-        let queued_authority = self.queued_authority();
+        let requests = self.url_request_checkpoint();
+        let retry_state = (self.plugin_retries.clone(), self.url_waits.clone());
         let file_outputs = self.file_outputs.len();
         let said = self.notices_given;
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)))
@@ -1602,8 +1620,8 @@ impl Session {
             _ => {}
         }
         if res.is_err() {
-            self.url_requests.truncate(requests);
-            self.rollback_queued_authority(&queued_authority);
+            self.restore_url_request_checkpoint(requests);
+            (self.plugin_retries, self.url_waits) = retry_state;
             self.file_outputs.truncate(file_outputs);
         }
         let quiet = std::mem::take(&mut self.quiet_failure);
@@ -1682,6 +1700,7 @@ impl Session {
             url_requests: take(&mut self.url_requests),
             policy_work: self.take_policy_work(),
             plugin_retries: take(&mut self.plugin_retries),
+            url_waits: take(&mut self.url_waits),
             style_view: self.style_view.take(),
             #[cfg(not(target_arch = "wasm32"))]
             sql_results: take(&mut self.sql_results),
@@ -1734,6 +1753,7 @@ impl Session {
             url_requests,
             policy_work,
             plugin_retries,
+            url_waits,
             style_view,
             #[cfg(not(target_arch = "wasm32"))]
             sql_results,
@@ -1753,7 +1773,7 @@ impl Session {
         (self.path, self.model_run, self.style_view) = (path, model_run, style_view);
         self.opened_package = opened_package;
         self.file_identity = file_identity;
-        (self.pending, self.plugin_runs, self.plugin_retries) = (pending, plugin_runs, plugin_retries);
+        (self.pending, self.plugin_runs, self.plugin_retries, self.url_waits) = (pending, plugin_runs, plugin_retries, url_waits);
         self.file_outputs = file_outputs;
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
         self.restore_policy_work(policy_work);
@@ -1858,6 +1878,9 @@ impl Session {
         severity: rustgis_data::diagnostics::Severity,
         source: Option<&'static str>,
     ) {
+        if severity == rustgis_data::diagnostics::Severity::Error && self.rerun_said.iter().any(|said| said == text.as_str()) {
+            return;
+        }
         self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text);
         self.notices.push(Notice { text: text.into_string(), error: severity == rustgis_data::diagnostics::Severity::Error, severity });
         self.notices_given += 1;

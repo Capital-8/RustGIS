@@ -763,6 +763,9 @@ impl Session {
             }
             CommandOp::Registered { spec, params } => {
                 let (spec, params) = (*spec, params.clone());
+                if let Some(error) = self.url_completion_refusal(spec.id, &params)? {
+                    return Err(error);
+                }
                 let run = |s: &mut Session| {
                     s.with_node(node, |s| {
                         let editor = s.trust_editor(spec.id, &params);
@@ -789,10 +792,12 @@ impl Session {
                         result
                     })
                 };
-                match txn {
+                let result = match txn {
                     Txn::Own => self.guarded(spec.label, spec.mutates, run),
                     Txn::Shared => run(self),
-                }
+                };
+                self.url_completion_landed(spec.id, &params, &result);
+                result
             }
         }
     }

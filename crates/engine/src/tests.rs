@@ -9023,7 +9023,8 @@ fn plugin_downloads_are_left_to_the_app() {
     // Nothing answers there: a download that waited fails.
     let url = "http://127.0.0.1:9/places.csv";
     let p = json!({"op": "layer.addUrl", "params": {"url": url, "name": "Places", "x": "lon", "y": "lat"}});
-    assert_eq!(s.run_leaving_downloads("plugin:eng-url/f", &p).unwrap(), json!({"pending": true, "url": url}));
+    // The command waits for the download, to run again once it is added (#1202).
+    assert_eq!(s.run_leaving_downloads("plugin:eng-url/f", &p).unwrap(), json!({"pending": true, "downloading": [url]}));
     assert_eq!((s.undo.len(), s.map().layers.len()), (undo, layers));
     let asked = s.take_url_requests();
     assert_eq!(asked.len(), 1);
@@ -9031,6 +9032,9 @@ fn plugin_downloads_are_left_to_the_app() {
         (asked[0].params()["name"].as_str(), asked[0].params()["x"].as_str(), asked[0].params()["y"].as_str()),
         (Some("Places"), Some("lon"), Some("lat"))
     );
+    assert!(asked[0].params()["request"].is_u64());
+    s.request_failed(asked[0].params(), "dropped");
+    s.poll_plugin_retries();
     assert!(s.run("plugin:eng-url/f", &p).is_err(), "run otherwise, it waits");
     assert!(s.take_url_requests().is_empty());
     // An edit run that way is an undo step still.
@@ -9038,6 +9042,211 @@ fn plugin_downloads_are_left_to_the_app() {
     s.run_leaving_downloads("plugin:eng-url/f", &p).unwrap();
     assert_eq!(s.undo.len(), undo + 1);
     rustgis_plugins::unload("eng-url");
+}
+
+/// A command that gives up says which of its downloads now won't start; one another command
+/// waits for still comes, so it isn't named.
+#[test]
+fn a_command_giving_up_names_the_downloads_it_leaves() {
+    let mut s = world();
+    plugin("eng-giveup", &["edit", "network"]);
+    plugin("eng-giveup-other", &["edit", "network"]);
+    let add = |url: &str| json!({"op": "layer.addUrl", "params": {"url": url}});
+    s.retry_tries = crate::cmd::plugins::fetch::MAX_RETRIES;
+    let e = s.run_leaving_downloads("plugin:eng-giveup/f", &add("https://x.org/new.csv?token=hunter2")).unwrap_err();
+    assert!(e.contains("gave up") && e.contains("its download of https://x.org/new.csv") && !e.contains("hunter2"), "{e}");
+    assert!(s.take_url_requests().is_empty(), "not started");
+    s.retry_tries = 0;
+    s.run_leaving_downloads("plugin:eng-giveup-other/f", &add("https://x.org/shared.csv")).unwrap();
+    s.retry_tries = crate::cmd::plugins::fetch::MAX_RETRIES;
+    let e = s.run_leaving_downloads("plugin:eng-giveup/f", &add("https://x.org/shared.csv")).unwrap_err();
+    assert!(e.contains("gave up") && e.contains("wasn't started"), "{e}: another plugin gets its own request");
+    assert_eq!(s.take_url_requests()[0].params()["url"], "https://x.org/shared.csv", "the other command's still comes");
+    rustgis_plugins::unload("eng-giveup");
+    rustgis_plugins::unload("eng-giveup-other");
+}
+
+/// A plugin command whose `layer.addUrl` left a download to the app runs again once the app
+/// has added it, and that call then answers the layer added, so the command goes on with it
+/// (#1202). A failed download is the call's error then; a command clicked twice waits for the
+/// one download.
+#[test]
+fn a_plugin_command_runs_again_when_its_download_is_added() {
+    let mut s = world();
+    plugin("eng-rerun", &["edit", "network"]);
+    let layers = s.map().layers.len();
+    let url = "https://x.org/places.csv";
+    let p = json!({"op": "layer.addUrl", "params": {"url": url, "name": "Places", "x": "lon", "y": "lat"}});
+    assert_eq!(s.run_leaving_downloads("plugin:eng-rerun/f", &p).unwrap()["downloading"], json!([url]));
+    let asked = s.take_url_requests();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].params()["anonymous"], json!(true), "no saved login goes with a plugin's download");
+    // Clicked again while it downloads: the same download, not a second one.
+    s.run_leaving_downloads("plugin:eng-rerun/f", &p).unwrap();
+    assert!(s.take_url_requests().is_empty(), "one download");
+    assert!(s.poll_plugin_retries().is_empty(), "nothing landed yet");
+    // The app downloads it and adds it, with the request's number, as its own step.
+    let id = s.download_started_for(&asked[0]).unwrap();
+    assert!(
+        s.download_landed(
+            id,
+            b"name,lon,lat
+A,10,50
+B,11,51
+"
+            .to_vec()
+        )
+    );
+    let mut add = asked[0].params().clone();
+    add["id"] = json!(id);
+    s.complete_download(id, &add).unwrap();
+    assert_eq!(s.map().layers.len(), layers + 1);
+    let added = s.map().layer_by_name("Places").unwrap().id;
+    // The command runs again: its `layer.addUrl` answers the layer added, and adds nothing (nor
+    // an undo step of its own, having changed nothing).
+    let undo = s.undo.len();
+    let ran = s.poll_plugin_retries();
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    let (cmd, answer) = &ran[0];
+    assert_eq!(cmd, "plugin:eng-rerun/f");
+    assert_eq!(answer.as_ref().unwrap()["layer"], json!(added), "{answer:?}");
+    assert_eq!((s.map().layers.len(), s.undo.len()), (layers + 1, undo), "added once");
+    assert!(s.take_url_requests().is_empty() && !s.plugin_retries_waiting());
+    assert!(s.poll_plugin_retries().is_empty(), "run once");
+    // A download that fails: the command runs again, and its `layer.addUrl` answers the error.
+    let q = json!({"op": "layer.addUrl", "params": {"url": "https://x.org/gone.csv"}});
+    s.run_leaving_downloads("plugin:eng-rerun/f", &q).unwrap();
+    let asked = s.take_url_requests();
+    s.request_failed(asked[0].params(), "https://x.org/gone.csv?token=hunter2: 404 Not Found");
+    let ran = s.poll_plugin_retries();
+    let e = ran[0].1.as_ref().unwrap_err();
+    assert!(e.contains("404") && !e.contains("hunter2"), "{ran:?}");
+    assert!(!s.plugin_retries_waiting());
+    // A native request and a plugin request get distinct engine routing numbers.
+    let next = s.next_request + 1;
+    s.request_url(&json!({"url": "https://x.org/other.csv", "request": next})).unwrap();
+    let q = json!({"op": "layer.addUrl", "params": {"url": "https://x.org/mine.csv"}});
+    s.run_leaving_downloads("plugin:eng-rerun/f", &q).unwrap();
+    let asked = s.take_url_requests();
+    let urls: Vec<_> = asked.iter().map(|q| (q.params()["url"].as_str(), q.params()["request"].as_u64())).collect();
+    assert_eq!(urls, [(Some("https://x.org/other.csv"), Some(next)), (Some("https://x.org/mine.csv"), Some(next + 1))]);
+    // A run replaced by one asking for another address before its download was started: that
+    // download is never started, and the notice of the replaced run says so.
+    let first = json!({"op": "layer.addUrl", "params": {"url": "https://x.org/first.csv"}});
+    s.run_leaving_downloads("plugin:eng-rerun/f", &first).unwrap();
+    let mark = s.notice_mark();
+    let second = json!({"op": "layer.addUrl", "params": {"url": "https://x.org/second.csv"}});
+    s.run_leaving_downloads("plugin:eng-rerun/f", &second).unwrap();
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(
+        said.iter().any(|t| t.contains("replaced by this one") && t.contains("its download of https://x.org/first.csv wasn't started")),
+        "{said:?}"
+    );
+    let left = s.take_url_requests();
+    assert!(left.iter().all(|q| q.params()["url"] != "https://x.org/first.csv"), "{} remaining requests", left.len());
+    rustgis_plugins::unload("eng-rerun");
+}
+
+/// Retry metadata and queued capabilities obey the same outer transaction as actual plugin edits.
+#[test]
+fn plugin_download_retries_roll_back_with_their_outer_command() {
+    let mut s = world();
+    plugin("eng-outer-url", &["edit", "network"]);
+    let call = |url: &str| json!({"op":"layer.addUrl", "params":{"url":url}});
+    s.run_leaving_downloads("plugin:eng-outer-url/f", &call("https://x.org/kept.csv")).unwrap();
+    let before = serde_json::to_value(&s.project).unwrap();
+    let mut pending = Value::Null;
+    let result = s.guarded("Failed plugin composite", true, |s| {
+        pending = s.run_leaving_downloads("plugin:eng-outer-url/f", &call("https://x.org/rolled-back.csv"))?;
+        s.run("layer.addDataText", &json!({"fileName":"broken.geojson", "text":"{"}))
+    });
+    assert_eq!(pending["downloading"], json!(["https://x.org/rolled-back.csv"]), "the real plugin suspended before the outer failure");
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+    let kept = s.take_url_requests();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].params()["url"], "https://x.org/kept.csv");
+    assert!(s.plugin_retries_waiting() && s.poll_plugin_retries().is_empty());
+    s.request_failed(kept[0].params(), "cancelled");
+    assert_eq!(s.poll_plugin_retries().len(), 1);
+    // An opaque request taken during a failed outer guard stays retired, not just hidden.
+    let mut escaped = None;
+    let result = s.guarded("Failed plugin wrapper", true, |s| {
+        s.run_leaving_downloads("plugin:eng-outer-url/f", &call("https://x.org/escaped.csv"))?;
+        escaped = s.take_url_requests().pop();
+        Err("outer command failed".into())
+    });
+    assert!(result.is_err());
+    let escaped = escaped.unwrap();
+    assert!(s.download_started_for(&escaped).is_err());
+    assert!(!s.plugin_retries_waiting() && s.poll_plugin_retries().is_empty() && s.take_url_requests().is_empty());
+    // A prior queued key consumed inside a failed guard is never restored by its checkpoint.
+    s.request_url(&json!({"url":"https://x.org/consumed.csv"})).unwrap();
+    let issued = s.take_url_requests();
+    let result = s.guarded("Claim then fail", true, |s| {
+        let id = s.download_started_for(&issued[0])?;
+        s.download_failed(id);
+        Err("failed after claim".into())
+    });
+    assert!(result.is_err() && s.download_started_for(&issued[0]).is_err());
+    rustgis_plugins::unload("eng-outer-url");
+}
+
+/// A routing number cannot consume another session's claim or wait; a revoked original owner
+/// is retired before dequeue and never rerun as a fresh native User.
+#[test]
+fn plugin_download_retries_keep_their_original_owner() {
+    use crate::policy::{Call, Effects, Outcome, Revocation, Scope};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct Live(AtomicBool);
+    impl Revocation for Live {
+        fn allows(&self, _: Effects) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let mut s = world();
+    plugin("eng-owned-url", &["edit", "network"]);
+    let params = json!({"op":"layer.addUrl","params":{"url":"https://x.org/owned.csv"}});
+    let live = Arc::new(Live(AtomicBool::new(true)));
+    let scope = Scope::assistant(146101, live.clone());
+    let call = Call::command("plugin:eng-owned-url/f", params.clone());
+    let Outcome::NeedsApproval(prepared) = s.review(&scope, &call) else { panic!("plugin must ask") };
+    let pending = s.with_deferred_downloads(|s| s.run_permitted(scope, prepared.allow(), &call)).unwrap();
+    assert_eq!(pending["downloading"], json!(["https://x.org/owned.csv"]));
+    assert!(s.plugin_retries_waiting(), "approved work is pending before revocation");
+    let before = serde_json::to_value(&s.project).unwrap();
+    live.0.store(false, Ordering::SeqCst);
+    assert!(s.take_url_requests().is_empty());
+    let ran = s.poll_plugin_retries();
+    assert_eq!(ran.len(), 1);
+    assert!(ran[0].1.is_err());
+    assert!(!s.plugin_retries_waiting() && s.poll_plugin_retries().is_empty());
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+    let mut first = world();
+    let mut second = world();
+    first.run_leaving_downloads("plugin:eng-owned-url/f", &params).unwrap();
+    second.run_leaving_downloads("plugin:eng-owned-url/f", &params).unwrap();
+    let foreign = first.take_url_requests();
+    let rightful = second.take_url_requests();
+    assert_eq!(foreign[0].params()["request"], rightful[0].params()["request"], "routing numbers are session-local");
+    assert!(second.download_started_for(&foreign[0]).is_err());
+    let other = Scope::assistant(146102, Arc::new(Live(AtomicBool::new(true))));
+    second.with_scope(other, |s| s.request_failed(rightful[0].params(), "foreign cancellation")).unwrap();
+    assert!(second.poll_plugin_retries().is_empty() && second.plugin_retries_waiting());
+    let id = second.download_started_for(&rightful[0]).unwrap();
+    assert!(second.download_landed(id, b"name,lon,lat\nA,1,2\n".to_vec()));
+    let mut p = rightful[0].params().clone();
+    p["id"] = json!(id);
+    second.complete_download(id, &p).unwrap();
+    let ran = second.poll_plugin_retries();
+    assert_eq!(ran.len(), 1);
+    assert!(ran[0].1.is_ok());
+    assert!(second.download_started_for(&rightful[0]).is_err());
+    assert!(first.poll_plugin_retries().is_empty() && first.plugin_retries_waiting());
+    rustgis_plugins::unload("eng-owned-url");
 }
 
 #[test]
@@ -9598,6 +9807,43 @@ fn geopackage_plugin_writes_are_user_only_and_reload_needs_files() {
 #[test]
 fn plugin_process_child() {
     rustgis_plugins::testing::serve_if_child();
+}
+
+/// An error a command says before the call that leaves a download stays, and is said once: the
+/// runs after it do the same again, and don't repeat it (#1202).
+#[test]
+fn a_command_run_again_does_not_repeat_its_errors() {
+    let mut s = world();
+    let dir = std::env::temp_dir().join(format!("rustgis-test-eng-said-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = rustgis_plugins::testing::child_run("tests::plugin_process_child");
+    std::fs::write(dir.join("plugin.json"), rustgis_plugins::testing::process_manifest("eng-said", &["edit", "network"], &run)).unwrap();
+    rustgis_plugins::load(rustgis_plugins::Package::from_dir(&dir).unwrap(), "test").unwrap();
+    let said = |s: &Session, mark, text: &str| s.notices_since(mark).iter().filter(|n| n.error && n.text.contains(text)).count();
+    let mark = s.notice_mark();
+    let first = "https://x.org/first.csv";
+    let p = json!({"op": "layer.addUrl", "params": {"url": first}});
+    s.run_leaving_downloads("plugin:eng-said/d", &p).unwrap();
+    assert_eq!(said(&s, mark, "said before the call"), 1, "said while it waits");
+    let asked = s.take_url_requests();
+    // Each download that fails runs it again, its `layer.addUrl` answering the error: nothing more.
+    s.request_failed(asked[0].params(), "404 Not Found");
+    let ran = s.poll_plugin_retries();
+    assert!(ran[0].1.as_ref().is_err_and(|e| e.contains("404")), "{ran:?}");
+    assert_eq!(said(&s, mark, "said before the call"), 1, "not repeated");
+    // A real guest error after the successful host call is a failure, never suspension.
+    let failed = json!({"op":"layer.addUrl", "params":{"url":"https://x.org/not-started.csv"}, "fail":true});
+    assert!(s.run_leaving_downloads("plugin:eng-said/d", &failed).unwrap_err().contains("nope"));
+    assert!(s.take_url_requests().is_empty() && !s.plugin_retries_waiting());
+    assert!(s.poll_plugin_retries().is_empty());
+    // The next time it is asked for, it is said again.
+    let mark = s.notice_mark();
+    s.run_leaving_downloads("plugin:eng-said/d", &p).unwrap();
+    assert_eq!(said(&s, mark, "said before the call"), 1, "a new run says it");
+    s.plugin_retries.clear();
+    let _ = s.take_url_requests();
+    rustgis_plugins::unload("eng-said");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

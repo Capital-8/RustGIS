@@ -2176,6 +2176,7 @@ impl RustGisApp {
         let notice_mark = self.session.notice_mark();
         // A plugin's command that adds data by address doesn't freeze the app: the download is
         // left for the frame loop (`ui.addUrl`), as in the browser.
+        let in_place = matches!(&dispatch, AppDispatch::InPlace(_));
         let resolved_lineage = match &dispatch {
             AppDispatch::ResolvedTiles { crossed_origin, .. } => Some(*crossed_origin),
             _ => None,
@@ -2221,7 +2222,8 @@ impl RustGisApp {
                 self.session.notify(text, true);
             }
             // A probe still under way is for an address added to the old project: dropped, so
-            // its layer never lands in the new one, and said, as a download landing late is.
+            // its layer never lands in the new one, and said, as a download landing late is. A plugin
+            // command waiting for it went with the old project's waits.
             for (p, _, _) in std::mem::take(&mut self.ui.cog_probes) {
                 let url = p.get("url").and_then(Value::as_str).unwrap_or("");
                 let url = serviceui::address_in_message(rustgis_engine::data::s3_address::inner(url));
@@ -2293,6 +2295,13 @@ impl RustGisApp {
                             replay[key] = json!(rustgis_engine::render::rustgis_tiles::logins::inner(url));
                         }
                     }
+                }
+                self.record_step(id, &replay, active);
+            } else if in_place {
+                // The request number correlates this delivery; replay starts a fresh request.
+                let mut replay = params.clone();
+                if let Some(object) = replay.as_object_mut() {
+                    object.remove("request");
                 }
                 self.record_step(id, &replay, active);
             } else {
@@ -4166,6 +4175,8 @@ impl RustGisApp {
                 };
                 if result.is_ok() {
                     connectiontree::name_recent(self, before, origin.as_deref());
+                } else if let Err(error) = &result {
+                    self.session.request_failed(p, error);
                 }
                 return result;
             }
@@ -4223,7 +4234,8 @@ impl RustGisApp {
                 return Ok(Value::Null);
             }
             let url = address;
-            let mut q = json!({});
+            // The request receipt is correlation only; its admitted claim stays outside JSON.
+            let mut q = json!({"url": url});
             for k in ["name", "layer", "crs", "connection"] {
                 if let Some(v) = p.get(k).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
                     q[k] = v.clone();
@@ -4245,6 +4257,9 @@ impl RustGisApp {
                 p.get("zoom").and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| matches!(s, "true" | "yes" | "1" | "on"))))
             {
                 q["zoom"] = json!(zoom);
+            }
+            if let Some(number) = p.get("request").filter(|v| v.is_u64()) {
+                q["request"] = number.clone();
             }
             for k in ["service", "coverage", "anonymous"] {
                 if p.get(k).and_then(Value::as_bool) == Some(true) {
@@ -4306,6 +4321,7 @@ impl RustGisApp {
             if let Some(id) = claim
                 && let Err(e) = self.session.download_continues(id)
             {
+                self.session.request_failed(&p, &e);
                 self.landed_in_dialog(&p, Err(&e));
                 self.session.notify(e, true);
                 continue;
@@ -4331,26 +4347,30 @@ impl RustGisApp {
                             self.map.invalidate();
                             self.landed_in_dialog(&pending, Ok(()));
                         }
-                        Err(e) => self.landed_in_dialog(&pending, Err(&e)),
+                        Err(e) => {
+                            self.session.request_failed(&pending, &e);
+                            self.landed_in_dialog(&pending, Err(&e));
+                        }
                     }
                 }
                 Ok(false) => {
                     p["whole"] = json!(true);
                     let pending = p.clone();
                     // Downloaded whole: the line waits for the download (`add_download`).
+                    let notice_mark = self.session.notice_mark();
                     let started = if claim.is_some() {
                         self.add_url(&p, None, claim)
                     } else {
                         connectiontree::run_add_url(self, p, origin.as_deref())
                     };
                     if let Err(e) = started {
+                        self.session.request_failed(&pending, &e);
                         self.landed_in_dialog(&pending, Err(&e));
-                        if claim.is_some() {
-                            self.session.notify(e, true);
-                        }
+                        self.command_failed("layer.addUrl", &e, notice_mark);
                     }
                 }
                 Err(e) => {
+                    self.session.request_failed(&p, &e);
                     if let Some(id) = claim {
                         self.session.download_failed(id);
                     }
@@ -4373,6 +4393,7 @@ impl RustGisApp {
             match r {
                 Ok(bytes) => self.add_landed(serviceui::Landed { id, url, params: p, origin }, bytes),
                 Err(e) => {
+                    self.session.request_failed(&p, &e);
                     self.session.download_failed(id);
                     rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, &p);
                     // Named without the address's keys, token or signature.
@@ -4413,10 +4434,13 @@ impl RustGisApp {
         if !current {
             let shown = serviceui::address_in_message(&url);
             let why = i18n::fmt("{url}: downloaded after its project was closed, so it wasn't added", &[("url", &shown)]);
+            self.session.request_failed(&p, &why);
             self.landed_in_dialog(&p, Err(&why));
             self.session.notify(why, false);
             return;
         }
+        // Named redacted: a notice with a key in it loses what follows it.
+        let shown = rustgis_engine::sources::redact(&url);
         p["id"] = json!(id);
         p["url"] = json!(url);
         let zoom = p.get("zoom").and_then(Value::as_bool) == Some(true);
@@ -4435,8 +4459,12 @@ impl RustGisApp {
                 self.landed_in_dialog(&pending, Ok(()));
             }
             Err(e) => {
+                self.session.request_failed(&pending, &e);
                 rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, &pending);
-                let e = if e.starts_with(&url) { e } else { format!("{url}: {e}") };
+                // Running it said the error already: again only to name the address it lacks. An
+                // error may name it redacted.
+                let named = e.starts_with(&url) || e.starts_with(&shown);
+                let e = if named { e } else { format!("{shown}: {e}") };
                 self.landed_in_dialog(&pending, Err(&e));
             }
         }
@@ -4714,7 +4742,7 @@ impl RustGisApp {
         }
         // Plugin commands that waited for `host.fetch` answers (the browser) run again once
         // they are in; their errors are notices already.
-        let _ = self.session.poll_plugin_retries();
+        pluginstart::run_again(self, ctx);
         // A frame may not come until the user moves: look again while commands wait.
         if self.session.plugin_retries_waiting() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -5056,6 +5084,29 @@ pub(crate) fn click_in_one_frame(h: &mut egui_kittest::Harness<'_, RustGisApp>, 
     input.events.extend([egui::Event::PointerMoved(at), button(true), button(false)]);
     h.step();
     h.input_mut().time = None;
+}
+
+/// Runs a test that owns process-wide accounts/registrations in its own executable process.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn isolate_account_test(name: &str) -> bool {
+    if std::env::var("RUSTGIS_ACCOUNT_SCENARIO").as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::env::current_exe().and_then(|executable| {
+        std::process::Command::new(executable).args(["--exact", name]).env("RUSTGIS_ACCOUNT_SCENARIO", name).output()
+    });
+    assert!(output.is_ok(), "could not start isolated account scenario: {:?}", output.as_ref().err());
+    let Ok(output) = output else { return true };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut summaries = stdout.lines().filter(|line| line.starts_with("test result:"));
+    let ran_one = summaries.next().is_some_and(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"))
+        && summaries.next().is_none();
+    assert!(
+        output.status.success() && ran_one,
+        "isolated account scenario failed or ran no test:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
 }
 
 /// Tests that fetch through the tile cache take turns: it has one fetcher for the whole process,
@@ -5560,6 +5611,48 @@ mod record_tests {
         assert_eq!(notices.len(), 1, "a normal late drop must not also report a continuation error");
         assert!(!notices[0].error && notices[0].text.contains("project was closed"));
         assert!(late.session.map().layer_by_name("Roads").is_none());
+    }
+
+    /// A `ui.addUrl` the app runs that fails is said once, by running it: after a probe found a
+    /// file to download whole, and for a request a command queued.
+    #[test]
+    fn a_failed_ui_add_url_the_app_runs_is_said_once() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::isolate_account_test("record_tests::a_failed_ui_add_url_the_app_runs_is_said_once") {
+            return;
+        }
+        let mut app = RustGisApp::with_sample();
+        let p = json!({"url": "https://x.org/a.csv", "connection": "no such connection"});
+        let errors = |app: &RustGisApp, mark| app.session.notices_since(mark).iter().filter(|n| n.error).count();
+        let mark = app.session.notice_mark();
+        let probe: crate::Slot<Result<bool, String>> = Default::default();
+        *probe.lock().unwrap() = Some(Ok(false));
+        app.ui.cog_probes.push((p.clone(), None, probe));
+        app.poll_data_downloads();
+        assert_eq!(errors(&app, mark), 1, "{:?}", app.session.notices_since(mark));
+        // A valid admitted request can still fail to start when all claim slots are occupied.
+        let mut claims = Vec::new();
+        for number in 0..64 {
+            app.session.request_url(&json!({"url":format!("https://x.org/held-{number}.csv")})).unwrap();
+            let request = app.session.take_url_requests().pop().unwrap();
+            claims.push(app.session.download_started_for(&request).unwrap());
+        }
+        let mark = app.session.notice_mark();
+        app.session.request_url(&json!({"url":"https://x.org/queued.csv"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+            },
+            app,
+        );
+        h.step();
+        let app = h.state();
+        assert_eq!(errors(app, mark), 1, "{:?}", app.session.notices_since(mark));
+        for claim in claims {
+            assert!(h.state().session.download_is_pending(claim), "another request keeps its claim");
+            h.state_mut().session.download_failed(claim);
+        }
     }
 
     #[test]

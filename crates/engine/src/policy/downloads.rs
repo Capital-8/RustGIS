@@ -22,14 +22,21 @@ impl Drop for Claim {
         self.live.store(false, Ordering::SeqCst);
     }
 }
+#[derive(Clone)]
 pub(super) struct Queued {
     c: std::sync::Weak<Continuation>,
     import: bool,
+    claimed: Arc<AtomicBool>,
 }
 #[derive(Default)]
 pub(crate) struct Work {
     pub(super) queued: BTreeMap<u64, Queued>,
     pub(super) claims: BTreeMap<u64, Claim>,
+}
+/// A guarded command restores prior opaque requests and retires every newly issued key.
+pub(crate) struct UrlRequestCheckpoint {
+    requests: Vec<UrlRequest>,
+    queued: BTreeMap<u64, Queued>,
 }
 impl Session {
     /// The current project generation, used to prune adapter-owned remembered operations.
@@ -40,10 +47,121 @@ impl Session {
     pub(crate) fn queued_authority(&self) -> Vec<u64> {
         self.policy.work.queued.keys().copied().collect()
     }
-    /// Retires only newly issued queued keys after failure, even if a caller retained its request.
-    pub(crate) fn rollback_queued_authority(&mut self, before: &[u64]) {
-        self.policy.work.queued.retain(|key, _| before.contains(key));
+    /// Keeps sealed prior requests, including their original owning Arc, across rollback.
+    pub(crate) fn url_request_checkpoint(&self) -> UrlRequestCheckpoint {
+        UrlRequestCheckpoint {
+            requests: self
+                .url_requests
+                .iter()
+                .map(|q| UrlRequest { key: q.key, params: q.params.clone(), authority: q.authority.clone() })
+                .collect(),
+            queued: self.policy.work.queued.clone(),
+        }
+    }
+    pub(crate) fn restore_url_request_checkpoint(&mut self, checkpoint: UrlRequestCheckpoint) {
+        // A successfully claimed key stays consumed even if its command later fails.
+        let mut queued = checkpoint.queued;
+        queued.retain(|_, q| !q.claimed.load(Ordering::SeqCst));
+        self.url_requests = checkpoint.requests.into_iter().filter(|q| queued.contains_key(&q.key)).collect();
+        self.policy.work.queued = queued;
         self.retire_abandoned_requests();
+    }
+    /// Only successful plugin suspension may retain its new non-import requests through rollback.
+    pub(crate) fn suspend_plugin_requests(&mut self, before: &[u64], asked: &[(u64, Value)]) -> Vec<UrlRequest> {
+        let mut retained = Vec::new();
+        for q in std::mem::take(&mut self.url_requests) {
+            let number = q.params.get("request").and_then(Value::as_u64);
+            if !before.contains(&q.key)
+                && self.policy.work.queued.get(&q.key).is_some_and(|queued| !queued.import)
+                && asked.iter().any(|(n, _)| Some(*n) == number)
+            {
+                retained.push(q);
+            } else {
+                self.url_requests.push(q);
+            }
+        }
+        retained
+    }
+    pub(crate) fn restore_plugin_requests(&mut self, requests: Vec<UrlRequest>) -> Result<(), String> {
+        self.retire_abandoned_requests();
+        if self.policy.work.queued.len().saturating_add(requests.len()) > crate::MAX_URL_REQUESTS {
+            return Err(format!("{} downloads are already waiting; try again when they have landed", crate::MAX_URL_REQUESTS));
+        }
+        for q in &requests {
+            self.check_delivery(&q.authority)?;
+        }
+        for q in requests {
+            self.policy
+                .work
+                .queued
+                .insert(q.key, Queued { c: Arc::downgrade(&q.authority), import: false, claimed: Arc::new(AtomicBool::new(false)) });
+            self.url_requests.push(q);
+        }
+        Ok(())
+    }
+    pub(crate) fn discard_plugin_requests(&mut self, keys: &[u64]) {
+        self.url_requests.retain(|q| !keys.contains(&q.key));
+        self.policy.work.queued.retain(|key, _| !keys.contains(key));
+    }
+    /// Plugin pins and caller lifetimes are part of request sharing, not just URL text.
+    pub(crate) fn same_url_caller(&self, a: &Continuation, b: &Continuation) -> bool {
+        a.scope.same_caller(&b.scope) && Arc::ptr_eq(&a.epoch, &b.epoch) && a.opened == b.opened && a.map == b.map
+    }
+    /// Failure notification settles routing only; named ingress must own the original wait.
+    /// Native adapters retain the documented root delivery convention.
+    pub fn request_failed(&mut self, p: &Value, error: &str) {
+        let Some(n) = p.get("request").and_then(Value::as_u64) else { return };
+        if !self.policy_ingress_idle() && self.url_waits.owner(n).is_none_or(|c| self.check_delivery_owner(c).is_err()) {
+            return;
+        }
+        if self.url_waits.holds(n, p) {
+            self.url_waits.land(n, Err(crate::sources::redact_text(error)), crate::cmd::plugins::fetch::Added::default());
+        }
+        if self.url_waits.given_up(n, p) {
+            self.url_waits.refused(n);
+        }
+    }
+    /// Only a validated frozen claim can consume retry routing or remove its landed bytes.
+    pub(super) fn url_completion_refusal(&mut self, command: &str, p: &Value) -> Result<Option<String>, String> {
+        if !matches!(command, "layer.addUrl" | "layer.addDownload") {
+            return Ok(None);
+        }
+        let Some(id) = p.get("id").and_then(Value::as_u64).filter(|id| self.claim_for(*id).is_some()) else { return Ok(None) };
+        let c = self.claim_for(id).ok_or("no claimed download with that id")?;
+        self.continuation_owner(&c)?;
+        self.download_params(id, p, command == "layer.addUrl")?;
+        let Some(n) = p.get("request").and_then(Value::as_u64) else { return Ok(None) };
+        let added = self.url_waits.added_already(n, p);
+        if !added && !self.url_waits.given_up(n, p) {
+            return Ok(None);
+        }
+        self.downloaded.retain(|(k, _)| *k != id);
+        self.landed_reads.retain(|(k, _)| *k != id);
+        let url = crate::sources::redact_text(p.get("url").and_then(Value::as_str).unwrap_or("download"));
+        if added {
+            Ok(Some(format!("{url}: it was added already for its plugin command, so it wasn't added again")))
+        } else {
+            self.url_waits.refused(n);
+            Ok(Some(format!("{url}: it came after its plugin command stopped waiting, so it wasn't added")))
+        }
+    }
+    /// Admitted owner-only completions share retry bookkeeping, including in-place probes.
+    pub(super) fn url_completion_landed(&mut self, command: &str, p: &Value, result: &CmdResult) {
+        if !matches!(command, "layer.addUrl" | "layer.addDownload") {
+            return;
+        }
+        let Some(id) = p.get("id").and_then(Value::as_u64) else { return };
+        let Some(c) = self.claim_for(id) else { return };
+        if self.check_delivery_owner(&c).is_err() || self.download_params(id, p, command == "layer.addUrl").is_err() {
+            return;
+        }
+        if let Some(n) = p.get("request").and_then(Value::as_u64)
+            && self.url_waits.holds(n, p)
+            && !result.as_ref().is_ok_and(|v| v.get("pending").and_then(Value::as_bool) == Some(true))
+        {
+            let added = crate::cmd::plugins::fetch::Added::of(self.map(), result);
+            self.url_waits.land(n, result.clone(), added);
+        }
     }
     /// Captures a handler's authority, or checks the equivalent direct native ingress.
     pub fn request_url(&mut self, p: &Value) -> CmdResult {
@@ -90,20 +208,63 @@ impl Session {
         }
         let c = Arc::new(c);
         self.retire_abandoned_requests();
-        let mut params = std::borrow::Cow::Borrowed(p);
-        if self.web_logins.is_anonymous() {
-            params.to_mut().as_object_mut().ok_or("download parameters must be an object")?.insert("anonymous".into(), json!(true));
+        if !p.is_object() {
+            return Err("a download is asked for by an object: its \"url\" and how to read it".into());
         }
-        let p = params.as_ref();
-        let duplicate = self.url_requests.iter().any(|q| q.params == *p && q.authority.scope.same_caller(&c.scope));
-        if !duplicate {
+        let asked = self.asked_for(p);
+        let waiting = self
+            .url_requests
+            .iter()
+            .find(|q| {
+                crate::cmd::plugins::fetch::same_request(&q.params, &asked)
+                    && self.same_url_caller(&q.authority, &c)
+                    && self.check_continuation(&q.authority).is_ok()
+            })
+            .and_then(|q| q.params.get("request").and_then(Value::as_u64));
+        // A handed-back receipt is honored only through the original validated opaque claim.
+        let given = p
+            .get("id")
+            .and_then(Value::as_u64)
+            .filter(|id| self.download_params(*id, p, true).is_ok())
+            .and_then(|id| self.policy.work.claims.get(&id))
+            .filter(|claim| self.same_url_caller(&claim.c, &c))
+            .and_then(|claim| claim.params.get("request").and_then(Value::as_u64))
+            .filter(|n| self.url_waits.holds(*n, &asked));
+        let made = self
+            .call_requests
+            .as_ref()
+            .and_then(|_| {
+                self.url_waits.in_flight(&asked, |n| {
+                    self.url_waits.owner(n).is_some_and(|owner| self.same_url_caller(owner, &c) && self.check_continuation(owner).is_ok())
+                })
+            })
+            .filter(|n| !self.url_waits.taken_away(*n, &self.project));
+        let number = match given.or(waiting).or(made) {
+            Some(n) => n,
+            None => {
+                self.next_request = self.next_request.checked_add(1).ok_or("download request numbers were exhausted")?;
+                self.next_request
+            }
+        };
+        if (given.is_some() && waiting != Some(number)) || (waiting.is_none() && !self.url_waits.has(number)) {
             if self.policy.work.queued.len() >= crate::MAX_URL_REQUESTS {
                 return Err(format!("{} downloads are already waiting; try again when they have landed", crate::MAX_URL_REQUESTS));
             }
+            let mut params = asked.clone();
+            params.as_object_mut().ok_or("download parameters must be an object")?.insert("request".into(), json!(number));
+            if given.is_some() {
+                params.as_object_mut().ok_or("download parameters must be an object")?.insert("whole".into(), json!(true));
+            }
             self.next_pending = self.next_pending.wrapping_add(1);
             let key = self.next_pending;
-            self.policy.work.queued.insert(key, Queued { c: Arc::downgrade(&c), import });
-            self.url_requests.push(UrlRequest { key, params: p.clone(), authority: c });
+            self.policy.work.queued.insert(key, Queued { c: Arc::downgrade(&c), import, claimed: Arc::new(AtomicBool::new(false)) });
+            self.url_requests.push(UrlRequest { key, params, authority: c });
+        }
+        if !import
+            && let Some(asked_now) = self.call_requests.as_mut()
+            && !asked_now.iter().any(|(n, _)| *n == number)
+        {
+            asked_now.push((number, asked));
         }
         self.request_only = true;
         Ok(json!({"pending":true,"url":p.get("url")}))
@@ -124,6 +285,7 @@ impl Session {
             if ok.is_ok() {
                 live.push(request);
             } else {
+                self.request_failed(&request.params, "this URL request was revoked before it started");
                 if self.policy.work.queued.remove(&request.key).is_some_and(|q| q.import) {
                     crate::cmd::geolibre::discard_pending(self, &request.params);
                 }
@@ -152,6 +314,7 @@ impl Session {
             self.check_delivery(&c)
         };
         if let Err(error) = ready {
+            self.request_failed(&request.params, &error);
             if import {
                 // Only the verified owner may abandon this sealed reservation before a reader exists.
                 self.policy.work.queued.remove(&request.key);
@@ -159,7 +322,9 @@ impl Session {
             }
             return Err(error);
         }
-        self.policy.work.queued.remove(&request.key);
+        if let Some(q) = self.policy.work.queued.remove(&request.key) {
+            q.claimed.store(true, Ordering::SeqCst);
+        }
         let c = (*c).clone();
         let id = self.download_started();
         self.policy.work.claims.insert(id, Claim { c, params: request.params.clone(), live: Arc::new(AtomicBool::new(true)), import });
@@ -176,10 +341,11 @@ impl Session {
         if let Some(claim) = self.policy.work.claims.get(&id)
             && let Err(e) = self.check_continuation(&claim.c)
         {
-            if let Some(claim) = self.policy.work.claims.remove(&id)
-                && claim.import
-            {
-                crate::cmd::geolibre::discard_pending(self, &claim.params);
+            if let Some(claim) = self.policy.work.claims.remove(&id) {
+                self.request_failed(&claim.params, &e);
+                if claim.import {
+                    crate::cmd::geolibre::discard_pending(self, &claim.params);
+                }
             }
             self.downloading.retain(|n| *n != id);
             self.downloaded.retain(|(n, _)| *n != id);
@@ -230,7 +396,7 @@ impl Session {
             if ["geolibreProject", "geolibreLayer", "geolibreZarr"].contains(&key.as_str()) && !claim.import {
                 return Err("a simple URL completion cannot import a project's internal targets".into());
             }
-            let refinement = (key == "id" && !in_place && value.as_u64() == Some(id))
+            let refinement = (key == "id" && value.as_u64() == Some(id))
                 || (key == "cog" && in_place && value.as_bool() == Some(true))
                 || (key == "whole" && value.as_bool() == Some(true))
                 || (key == "zoom" && value.as_bool() == Some(false) && claim.params.get(key).and_then(Value::as_bool) == Some(true));
