@@ -26,8 +26,20 @@ pub fn is_sheet_name(name: &str) -> bool {
 /// The sheets of a workbook, in order.
 pub fn sheet_names(bytes: &[u8]) -> Result<Vec<String>> {
     check_expansion(bytes)?;
-    let wb = open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| DataError::Format(format!("spreadsheet: {e}")))?;
-    Ok(wb.sheet_names())
+    check_compound(bytes)?;
+    guarded(|| {
+        let wb = open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| DataError::Format(format!("spreadsheet: {e}")))?;
+        Ok(wb.sheet_names())
+    })
+}
+
+/// Runs calamine on a workbook, turning a panic into an error. calamine indexes some of a file's
+/// tables without checking them (an `.xls` sector chain that points past its allocation table
+/// panics, even in 0.38), so a damaged file is refused rather than taking the app down. In the
+/// browser, where a panic can't be caught, this guards nothing.
+fn guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(DataError::Format("spreadsheet: the file is damaged and can't be read".into())))
 }
 
 /// Reads one sheet of a workbook (`sheet` by name, without regard to case; the first when `None`),
@@ -61,6 +73,11 @@ struct Grid {
 
 fn grid(bytes: &[u8], sheet: Option<&str>) -> Result<Grid> {
     check_expansion(bytes)?;
+    check_compound(bytes)?;
+    guarded(|| grid_unguarded(bytes, sheet))
+}
+
+fn grid_unguarded(bytes: &[u8], sheet: Option<&str>) -> Result<Grid> {
     let mut wb = open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| DataError::Format(format!("spreadsheet: {e}")))?;
     let names = wb.sheet_names();
     let pick = match sheet.map(str::trim).filter(|s| !s.is_empty()) {
@@ -105,6 +122,97 @@ fn check_expansion(bytes: &[u8]) -> Result<()> {
     crate::zip::read_matching_within(bytes, |n| n.ends_with(".xml") || n.ends_with(".bin"), crate::zip::MAX_TOTAL)
         .map(|_| ())
         .map_err(|e| DataError::Format(format!("spreadsheet: {e}")))
+}
+
+/// The signature of a compound file (`.xls`).
+const COMPOUND: &[u8] = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1";
+/// Sector ids from here up are markers, not sectors.
+const RESERVED_SECTORS: u32 = 0xFFFF_FFFA;
+const DIFAT_SECTOR: u32 = 0xFFFF_FFFC;
+const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
+
+/// Refuses a compound file (`.xls`) whose sector allocation table calamine can't walk safely.
+/// calamine follows each chain of sectors through the table without checking it: a chain that
+/// loops runs forever, growing memory as it goes, and a link past the table or into a free sector
+/// panics (still so in calamine 0.38). The table is rebuilt here as calamine builds it, and every
+/// chain in it must end without looping or leaving the table. Other files pass unchecked.
+fn check_compound(bytes: &[u8]) -> Result<()> {
+    if !bytes.starts_with(COMPOUND) {
+        return Ok(());
+    }
+    let bad = |what: &str| Err(DataError::Format(format!("spreadsheet: the .xls file is damaged ({what})")));
+    let u16_at = |at: usize| bytes.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+    let size: usize = match u16_at(30) {
+        0x09 => 512,
+        0x0C => 4096,
+        // calamine refuses the rest itself.
+        _ => return Ok(()),
+    };
+    // The sectors follow the header, which takes one sector; calamine reads a sector cut short by
+    // the end of the file as far as it goes.
+    let body = bytes.get(size..).unwrap_or(&[]);
+    let sector = |id: u32| -> &[u8] {
+        let start = (id as usize).saturating_mul(size);
+        body.get(start..start.saturating_add(size).min(body.len())).unwrap_or(&[])
+    };
+    let words = |b: &[u8]| b.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect::<Vec<u32>>();
+    let max_sector = body.len() / size;
+    // The FAT's sectors: 109 listed in the header, more in a chain of DIFAT sectors whose last
+    // entry links to the next.
+    let mut difat = words(bytes.get(76..512).unwrap_or(&[]));
+    let mut next = bytes.get(68..72).map_or(END_OF_CHAIN, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let mut hops = 0usize;
+    while next < RESERVED_SECTORS {
+        hops += 1;
+        if hops > max_sector + 1 {
+            return bad("its DIFAT chain loops");
+        }
+        difat.extend(words(sector(next)));
+        next = difat.pop().unwrap_or(END_OF_CHAIN);
+    }
+    let fat_sectors: Vec<u32> = difat.into_iter().filter(|id| *id < DIFAT_SECTOR).collect();
+    // A file can't hold more FAT sectors than it has sectors.
+    if fat_sectors.len() > max_sector + 1 {
+        return bad("its allocation table is larger than the file");
+    }
+    let fat: Vec<u32> = fat_sectors.iter().flat_map(|id| words(sector(*id))).collect();
+    // Every link must lead, without looping, to an end of chain. 0: not seen, 1: on the chain
+    // being walked, 2: known to end well.
+    let mut state = vec![0u8; fat.len()];
+    let mut path = Vec::new();
+    for start in 0..fat.len() {
+        // A free or special sector isn't a link; a chain that reaches one fails below.
+        if fat.get(start).is_some_and(|l| *l >= RESERVED_SECTORS && *l != END_OF_CHAIN) {
+            continue;
+        }
+        let mut at = start;
+        path.clear();
+        loop {
+            match state.get(at).copied() {
+                Some(2) => break,
+                Some(1) => return bad("a chain of sectors loops"),
+                _ => {}
+            }
+            let link = fat.get(at).copied().unwrap_or(END_OF_CHAIN);
+            if link == END_OF_CHAIN {
+                break;
+            }
+            if link as usize >= fat.len() {
+                return bad("a chain of sectors runs past the allocation table");
+            }
+            if let Some(s) = state.get_mut(at) {
+                *s = 1;
+            }
+            path.push(at);
+            at = link as usize;
+        }
+        for i in path.iter().chain(std::iter::once(&start)) {
+            if let Some(s) = state.get_mut(*i) {
+                *s = 2;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a sheet whose cells span more than [`MAX_CELLS`] before calamine lays it out as a dense
@@ -376,6 +484,53 @@ mod tests {
         let far = xlsx(&[("Far", &[&[r#"<c r="A1"><v>1</v></c>"#], &[r#"<c r="XFD1048576"><v>2</v></c>"#]])]);
         let e = read(&far, "t", None, &CsvOptions::default()).unwrap_err().to_string();
         assert!(e.contains("too large") && e.contains("XFD"), "{e}");
+    }
+
+    /// A compound-file (`.xls`) header with the given fields, followed by `body`.
+    fn ole2(sector_shift: u16, fat_sectors: u32, first_dir: u32, difat_start: u32, difat_sectors: u32, body: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 512];
+        b[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        b[24..26].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[26..28].copy_from_slice(&3u16.to_le_bytes());
+        b[28..30].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        b[30..32].copy_from_slice(&sector_shift.to_le_bytes());
+        b[32..34].copy_from_slice(&6u16.to_le_bytes());
+        b[44..48].copy_from_slice(&fat_sectors.to_le_bytes());
+        b[48..52].copy_from_slice(&first_dir.to_le_bytes());
+        b[56..60].copy_from_slice(&4096u32.to_le_bytes());
+        b[60..64].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes());
+        b[68..72].copy_from_slice(&difat_start.to_le_bytes());
+        b[72..76].copy_from_slice(&difat_sectors.to_le_bytes());
+        // The header's DIFAT points every FAT sector at sector 0.
+        for i in 0..109 {
+            let v: u32 = if i == 0 { 0 } else { 0xFFFF_FFFF };
+            b[76 + i * 4..80 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(body);
+        b
+    }
+
+    #[test]
+    fn hostile_xls_is_refused() {
+        // RUSTSEC-2026-0436: calamine before 0.38 panicked or allocated without bound on a
+        // malformed compound file, and 0.38 still panics on a sector chain past the allocation
+        // table. Each of these must be an error, not a crash.
+        let sector = [0xFFu8; 512];
+        let books = [
+            ole2(9, u32::MAX, 0, 0xFFFF_FFFE, 0, &sector),
+            ole2(9, 1, u32::MAX - 1, 0xFFFF_FFFE, 0, &sector),
+            ole2(9, 1, 0, 0, 0x7FFF_FFFF, &sector),
+            ole2(31, 1, 0, 0xFFFF_FFFE, 0, &sector),
+            ole2(0, 1, 0, 0xFFFF_FFFE, 0, &sector),
+            ole2(9, 1, 0, 0xFFFF_FFFE, 0, &[]),
+            ole2(9, 1, 0, 0xFFFF_FFFE, 0, &[0u8; 512]),
+        ];
+        for (i, book) in books.iter().enumerate() {
+            assert!(read(book, "t.xls", None, &CsvOptions::default()).is_err(), "book {i}");
+            // Some damaged headers still list no sheets; none may panic.
+            let _ = sheet_names(book);
+            assert!(columns(book, None).is_err(), "book {i}");
+        }
     }
 
     #[test]
