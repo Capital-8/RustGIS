@@ -18,6 +18,10 @@ pub enum LayerRole {
     GdalPath,
     DuckDbDatabase,
     GpkgPath,
+    PostgisEditDatabase,
+    PostgisDatabase,
+    MysqlDatabase,
+    SqlServerDatabase,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

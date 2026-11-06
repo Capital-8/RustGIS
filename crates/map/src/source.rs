@@ -1241,6 +1241,15 @@ impl SourceLayer {
         {
             out.push((R::DuckDbDatabase, p.as_str(), false, paths::is_local(p)));
         }
+        if let Some(pg) = postgis {
+            out.push((R::PostgisDatabase, pg.database.as_str(), true, false));
+        }
+        if let Some(my) = mysql {
+            out.push((R::MysqlDatabase, my.database.as_str(), true, false));
+        }
+        if let Some(ms) = sqlserver {
+            out.push((R::SqlServerDatabase, ms.database.as_str(), true, false));
+        }
         out
     }
 
@@ -1250,6 +1259,9 @@ impl SourceLayer {
             crate::LayerRole::Streamed => self.path.as_mut(),
             crate::LayerRole::GdalPath => Some(&mut self.gdal.as_mut()?.path),
             crate::LayerRole::DuckDbDatabase => self.duckdb.as_mut()?.database.as_mut(),
+            crate::LayerRole::PostgisDatabase => Some(&mut self.postgis.as_mut()?.database),
+            crate::LayerRole::MysqlDatabase => Some(&mut self.mysql.as_mut()?.database),
+            crate::LayerRole::SqlServerDatabase => Some(&mut self.sqlserver.as_mut()?.database),
             _ => None,
         }
     }

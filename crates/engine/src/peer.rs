@@ -195,7 +195,10 @@ fn reopen(p: &mut Project, at: &At) {
     let Leaf::Map(rustgis_map::SlotPos::Layer { layer, role }) = &at.leaf else { return };
     let Some(layer) = map.layers.get_mut(*layer) else { return };
     match role {
-        rustgis_map::LayerRole::Streamed => {
+        rustgis_map::LayerRole::Streamed
+        | rustgis_map::LayerRole::PostgisDatabase
+        | rustgis_map::LayerRole::MysqlDatabase
+        | rustgis_map::LayerRole::SqlServerDatabase => {
             if let Some(source) = &mut layer.source
                 && let Err(e) = source.reopen()
             {

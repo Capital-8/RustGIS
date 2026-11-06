@@ -618,6 +618,33 @@ mod tests {
         for done in std::mem::take(&mut *held.lock().unwrap()) {
             done(Err("probe revoked".into()));
         }
+        // The same real probe can succeed while its owner remains loaded. Reuse the built-in
+        // FGB writer and installed fetcher; no server or replacement completion token is needed.
+        let bytes = rustgis_engine::data::source::fgb::write(&app.session.map().layer_by_name("Cities").unwrap().dataset).unwrap();
+        cache::set_fetcher(move |url, done| {
+            let (url, _) = cache::split_download_limit(&url);
+            let (_, range) = cache::split_range(url);
+            let answer = match range {
+                Some((a, b)) => bytes.get(a as usize..b.saturating_add(1).min(bytes.len() as u64) as usize).unwrap_or_default().to_vec(),
+                None => bytes.clone(),
+            };
+            done(Ok(answer));
+        });
+        load();
+        let p = json!({"url":"http://127.0.0.1:9/policy-recorded.fgb", "name":"Recorded source"});
+        app.run("plugin:ui-policy-probe/f", json!({"op":"layer.addUrl", "params":p})).unwrap();
+        let request = app.session.take_url_requests().pop().unwrap();
+        app.ws.recording = Some(Vec::new());
+        app.add_url(request.params(), Some(&request), None).unwrap();
+        assert_eq!(app.ui.cog_probes.len(), 1, "the actual live probe still lands through its UI receiver");
+        app.poll_data_downloads();
+        let steps = app.ws.recording.as_ref().unwrap();
+        assert!(app.session.map().layer_by_name("Recorded source").is_some());
+        assert_eq!(steps.len(), 1, "successful in-place delivery records its replayable command");
+        assert_eq!(steps[0].command, "layer.addUrl");
+        assert_eq!(steps[0].params["url"], p["url"]);
+        assert!(steps[0].params.get("id").is_none(), "opaque completion ids are not replay parameters");
+        plugins::unload("ui-policy-probe");
     }
 
     /// A GeoTIFF asked for as a scan keeps only its pixels: the app downloads it whole, once,

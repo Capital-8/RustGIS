@@ -944,6 +944,8 @@ impl Default for UiState {
 enum AppDispatch {
     Direct,
     Prepared(Box<rustgis_engine::policy::PreparedCommand>),
+    InPlace(u64),
+    Download(u64),
     #[cfg(not(target_arch = "wasm32"))]
     Read(Box<rustgis_engine::cmd::reads::Read>),
     ResolvedTiles {
@@ -2131,8 +2133,8 @@ impl RustGisApp {
 
     /// Reports failures before engine dispatch as well as execution, without repeating its notice.
     fn command_failed(&mut self, id: &str, error: &str, notice_mark: u64) {
-        log::info!("{id}: {error}");
         let text = rustgis_engine::Session::redacted(error);
+        log::info!("{id}: {}", text.as_str());
         if !self.session.notices_since(notice_mark).iter().any(|notice| notice.error && notice.text == text.as_str()) {
             self.session.notify_redacted(text, true);
         }
@@ -2180,6 +2182,8 @@ impl RustGisApp {
         };
         let mut r = match dispatch {
             AppDispatch::Prepared(prepared) => self.session.run_prepared(*prepared),
+            AppDispatch::InPlace(id) => self.session.add_in_place_for(id, &params),
+            AppDispatch::Download(id) => self.session.complete_download(id, &params),
             #[cfg(not(target_arch = "wasm32"))]
             AppDispatch::Read(read) => rustgis_engine::cmd::reads::read_land(&mut self.session, *read),
             AppDispatch::ResolvedTiles { template, crossed_origin } => {
@@ -4154,11 +4158,16 @@ impl RustGisApp {
             let p = bound.as_ref();
             let url = rustgis_engine::data::login_address::inner(p.get("url").and_then(Value::as_str).unwrap_or(url));
             if url.to_ascii_lowercase().split(['?', '#']).next().is_some_and(|u| u.ends_with(".pmtiles")) {
-                return if let Some(id) = claim {
-                    self.session.add_in_place_for(id, p)
+                let before = self.session.sources.generation;
+                let result = if let Some(id) = claim {
+                    self.run_with_prepared("layer.addUrl", p.clone(), AppDispatch::InPlace(id))
                 } else {
-                    connectiontree::run_named(self, "layer.addUrl", p.clone(), origin.as_deref())
+                    self.run("layer.addUrl", p.clone())
                 };
+                if result.is_ok() {
+                    connectiontree::name_recent(self, before, origin.as_deref());
+                }
+                return result;
             }
             let address = p.get("url").and_then(Value::as_str).unwrap_or(url).to_string();
             // A GeoTIFF, FlatGeobuf or GeoParquet: its header (or footer) first, off the
@@ -4311,20 +4320,18 @@ impl RustGisApp {
                     }
                     let before = self.session.sources.generation;
                     let pending = p.clone();
-                    let notice_mark = self.session.notice_mark();
-                    let added = if let Some(id) = claim { self.session.add_in_place_for(id, &p) } else { self.run("layer.addUrl", p) };
+                    let added = if let Some(id) = claim {
+                        self.run_with_prepared("layer.addUrl", p, AppDispatch::InPlace(id))
+                    } else {
+                        self.run("layer.addUrl", p)
+                    };
                     match added {
                         Ok(_) => {
                             connectiontree::name_recent(self, before, origin.as_deref());
                             self.map.invalidate();
                             self.landed_in_dialog(&pending, Ok(()));
                         }
-                        Err(e) => {
-                            if claim.is_some() {
-                                self.command_failed("layer.addUrl", &e, notice_mark);
-                            }
-                            self.landed_in_dialog(&pending, Err(&e));
-                        }
+                        Err(e) => self.landed_in_dialog(&pending, Err(&e)),
                     }
                 }
                 Ok(false) => {
@@ -4418,7 +4425,7 @@ impl RustGisApp {
         }
         let before = self.session.sources.generation;
         let pending = p.clone();
-        match self.session.complete_download(id, &p) {
+        match self.run_with_prepared("layer.addDownload", p, AppDispatch::Download(id)) {
             Ok(r) => {
                 connectiontree::name_recent(self, before, origin.as_deref());
                 if r.get("zoomed").and_then(Value::as_bool) == Some(true) {
@@ -4431,7 +4438,6 @@ impl RustGisApp {
                 rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, &pending);
                 let e = if e.starts_with(&url) { e } else { format!("{url}: {e}") };
                 self.landed_in_dialog(&pending, Err(&e));
-                self.session.notify(e, true);
             }
         }
     }
@@ -4701,8 +4707,9 @@ impl RustGisApp {
         // Addresses commands asked for where they couldn't download themselves (the browser):
         // fetched off the frame and added when they land, as Home › Add › Add Data › From URL does.
         for request in self.session.take_url_requests() {
+            let notice_mark = self.session.notice_mark();
             if let Err(e) = self.add_url(request.params(), Some(&request), None) {
-                self.session.notify(e, true);
+                self.command_failed("layer.addUrl", &e, notice_mark);
             }
         }
         // Plugin commands that waited for `host.fetch` answers (the browser) run again once
@@ -5374,17 +5381,59 @@ mod record_tests {
         assert_eq!(said(&app), 1);
     }
 
-    /// Data added from a download isn't a step: its download is used up, so a task couldn't
-    /// add it again.
+    /// The actual URL completion receiver says when a successful download cannot be recorded.
+    /// Failed and revoked deliveries neither add a layer nor claim a recording omission.
     #[test]
     fn downloaded_data_isnt_recorded() {
-        let mut app = RustGisApp::with_sample();
-        app.ws.recording = Some(Vec::new());
-        app.record_step("layer.addDownload", &json!({"id": 1, "url": "https://example.com/rivers.geojson"}), None);
-        assert_eq!(app.ws.recording.as_ref().map(Vec::len), Some(0));
-        assert!(app.session.notices.iter().any(|n| n.text.contains("session only")));
-        app.record_step("layer.color", &json!({"layer": "Lakes", "color": "#123456"}), None);
-        assert_eq!(app.ws.recording.as_ref().map(Vec::len), Some(1));
+        use rustgis_engine::{policy, render::rustgis_tiles::cache};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Live(AtomicBool);
+        impl policy::Revocation for Live {
+            fn allows(&self, _: policy::Effects) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let _turn = crate::fetching::turn();
+        for outcome in ["added", "transport failed", "decode failed", "revoked"] {
+            let held = Arc::new(Mutex::new(Vec::<cache::Done>::new()));
+            let callbacks = held.clone();
+            cache::set_fetcher(move |_, done| callbacks.lock().unwrap().push(done));
+            let mut app = RustGisApp::with_sample();
+            app.ws.recording = Some(Vec::new());
+            let params = json!({"url":"https://recording.invalid/places.geojson", "name":"Recorded download"});
+            let live = Arc::new(Live(AtomicBool::new(true)));
+            if outcome == "revoked" {
+                let scope = policy::Scope::agent(policy::AgentAccess::Allow, false, "record-download", None, live.clone());
+                app.session.with_scope(scope, |s| s.request_url(&params)).unwrap().unwrap();
+                let request = app.session.take_url_requests().pop().unwrap();
+                app.add_url(request.params(), Some(&request), None).unwrap();
+            } else {
+                app.run("ui.addUrl", params).unwrap();
+            }
+            assert_eq!(app.ui.downloads.len(), 1, "the real UI download is pending");
+            assert_eq!(held.lock().unwrap().len(), 1);
+            assert!(app.ws.recording.as_ref().unwrap().is_empty());
+            let mark = app.session.notice_mark();
+            live.0.store(outcome != "revoked", Ordering::SeqCst);
+            let result = match outcome {
+                "transport failed" => Err("synthetic download failure".to_string()),
+                "decode failed" => Ok(b"not a GeoJSON document".to_vec()),
+                _ => Ok(br#"{"type":"Point","coordinates":[1,2]}"#.to_vec()),
+            };
+            held.lock().unwrap().pop().unwrap()(result);
+            app.poll_data_downloads();
+            let succeeded = outcome == "added";
+            assert!(app.ui.downloads.is_empty());
+            assert_eq!(app.session.map().layer_by_name("Recorded download").is_some(), succeeded);
+            assert!(app.ws.recording.as_ref().unwrap().is_empty());
+            let notices = app.session.notices_since(mark);
+            let omitted = notices.iter().filter(|n| n.text.contains("isn't recorded") && n.text.contains("session only")).count();
+            assert_eq!(omitted, usize::from(succeeded), "{outcome}: {notices:?}");
+            assert_eq!(notices.iter().filter(|n| n.error).count(), usize::from(!succeeded), "{outcome}: {notices:?}");
+        }
     }
 
     #[test]

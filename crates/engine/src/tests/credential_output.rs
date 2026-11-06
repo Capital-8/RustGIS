@@ -556,3 +556,59 @@ fn short_basic_passwords_are_scrubbed_only_from_output_while_active() {
     other.notify("alpha", false);
     assert_eq!(other.notices.last().unwrap().text, "alpha", "revocation does not retain the short-password pattern");
 }
+
+/// Imported database origins are output fields even when no database has been opened.
+#[test]
+fn durable_database_origins_clean_each_owned_field_without_opening_a_database() {
+    for (role, scheme, suffix) in [
+        ("edit", "postgresql", "/postgis/origin/database"),
+        ("postgis", "postgresql", "/source/postgis/database"),
+        ("mysql", "mysql", "/source/mysql/database"),
+        ("sqlserver", "mssql", "/source/sqlserver/database"),
+    ] {
+        for private in [false, true] {
+            let public = format!("{scheme}://reader@db-origin.invalid/gis");
+            let address =
+                if private { format!("{scheme}://reader:RGSYNTH_db_origin_20261106@db-origin.invalid/gis") } else { public.clone() };
+            let dataset = rustgis_data::Dataset::new("Origin", rustgis_data::GeometryType::None, Vec::new());
+            let mut layer = serde_json::to_value(rustgis_map::Layer::new(1, dataset)).unwrap();
+            let origin = json!({"database":address, "table":"rows"});
+            if role == "edit" {
+                layer["postgis"] = json!({"origin":origin, "key":"id", "srid":4326, "writable":false});
+            } else {
+                layer["source"] = json!({});
+                layer["source"][role] = origin;
+            }
+            let mut project = Project::default();
+            project.map_mut().layers.push(serde_json::from_value(layer).unwrap());
+            // This is the real import decoder before normalization opens any source. Session::new
+            // preserves the decoded project; neither output API opens a database or runs a command.
+            let imported = Project::from_peer_raw(&serde_json::to_string(&project).unwrap()).unwrap();
+            let mut s = Session::new(imported);
+            let before = serde_json::to_value(&s.project).unwrap();
+            let slot = format!("/maps/0/layers/0{suffix}");
+            assert_eq!(before.pointer(&slot), Some(&json!(address)), "{role}: Deserialize keeps the imported field");
+            // Output serialization uses each field's JSON representation (not f32 -> Value widening).
+            let mut expected: Value = serde_json::from_str(&serde_json::to_string(&s.project).unwrap()).unwrap();
+            *expected.pointer_mut(&slot).unwrap() = json!(public);
+            let (saved, report) = s.project.saved_text(None).unwrap();
+            let outputs = [
+                ("save", (saved, report)),
+                ("embedder", s.peer_text(Peer::Embedder).unwrap()),
+                ("bridge", s.peer_text(Peer::Bridge).unwrap()),
+            ];
+            for (kind, (text, report)) in outputs {
+                assert!(!text.contains("RGSYNTH_db_origin_20261106"), "{kind}: {role}");
+                assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), expected, "{kind}: {role}, private={private}");
+                assert_eq!(report.layer_addresses(), u32::from(private), "{kind}: {role}");
+                let notices = if private {
+                    vec!["1 layer address(es) were saved without their keys, tokens, passwords or URL fragments; after RustGIS closes, add those layers again to restore missing values".to_string()]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(report.notices(), notices, "{kind}: {role}");
+            }
+            assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "{role}: all output rolls back live fields");
+        }
+    }
+}

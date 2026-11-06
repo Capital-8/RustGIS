@@ -107,8 +107,8 @@ impl Session {
         if self.depth > 0 || !self.policy.nodes.is_empty() || self.policy.cursor.is_some() {
             return Err("background reads can only start before handler dispatch".into());
         }
-        if !matches!(command, "layer.addData" | "layer.loadAll" | "model.run") {
-            return Err("only Add Data, Load All and models can prepare background work".into());
+        if !matches!(command, "layer.addData" | "layer.loadAll" | "model.run" | "script.run") {
+            return Err("only Add Data, Load All, models and scripts can prepare background work".into());
         }
         let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
         if command == "layer.loadAll" {
@@ -117,9 +117,9 @@ impl Session {
         }
         let mut op = self.authorize(command, &Value::Object(params))?;
         self.check_read_command(&op)?;
-        let model_copy = command == "model.run" && self.policy_user();
-        if model_copy {
-            // A model's native copy may read through several tools. Bind the original
+        let copy_command = matches!(command, "model.run" | "script.run") && self.policy_user();
+        if copy_command {
+            // A model's or script's native copy may read through several tools. Bind the original
             // session's runtime stores, including web logins, before that copy exists.
             let mut node = (*op.node).clone();
             node.auth = Some(Arc::new(super::scope::RuntimeAccounts::capture(self)?));
@@ -127,7 +127,7 @@ impl Session {
         }
         let node = op.node.clone();
         let mut owner = self.continuation_for(node.clone())?;
-        if model_copy {
+        if copy_command {
             owner.accounts = self.policy_accounts();
             owner.s3 = Some(vec![crate::render::rustgis_tiles::s3::account_identity()?]);
         }
@@ -1026,9 +1026,17 @@ impl Session {
         }
         self.check_continuation(c)
     }
+    /// Refuses foreign ingress before a failed start may retire its owner's queued work.
+    pub(super) fn check_delivery_owner(&self, c: &Continuation) -> Result<(), String> {
+        if !self.policy.scopes.is_empty() && !self.scope().same_caller(&c.scope) {
+            return Err("this run belongs to another caller".into());
+        }
+        Ok(())
+    }
     /// Native workers may deliver at root; an existing ingress must own the stored continuation.
     pub(crate) fn check_delivery(&self, c: &Continuation) -> Result<(), String> {
-        if self.policy.scopes.is_empty() { self.check_continuation(c) } else { self.continuation_owner(c) }
+        self.check_delivery_owner(c)?;
+        self.check_continuation(c)
     }
     /// Re-enters stored authority synchronously and restores stacks even on panic.
     pub(crate) fn resume<T>(&mut self, c: &Continuation, f: impl FnOnce(&mut Session) -> T) -> Result<T, String> {

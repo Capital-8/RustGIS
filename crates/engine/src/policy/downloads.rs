@@ -124,7 +124,9 @@ impl Session {
             if ok.is_ok() {
                 live.push(request);
             } else {
-                self.policy.work.queued.remove(&request.key);
+                if self.policy.work.queued.remove(&request.key).is_some_and(|q| q.import) {
+                    crate::cmd::geolibre::discard_pending(self, &request.params);
+                }
                 revoked += 1;
             }
         }
@@ -137,16 +139,26 @@ impl Session {
     }
     /// Claims one engine-issued request immediately before its first I/O.
     pub fn download_started_for(&mut self, request: &UrlRequest) -> Result<u64, String> {
-        if self.policy.work.claims.len() >= 64 {
-            return Err("64 downloads are already awaiting completion".into());
-        }
         let q = self.policy.work.queued.get(&request.key).ok_or("this URL request was already claimed or dropped")?;
         let c = q.c.upgrade().ok_or("this URL request was dropped")?;
         if !Arc::ptr_eq(&request.authority, &c) {
             return Err("this URL request belongs to another session".into());
         }
-        self.check_delivery(&c)?;
+        self.check_delivery_owner(&c)?;
         let import = q.import;
+        let ready = if self.policy.work.claims.len() >= 64 {
+            Err("64 downloads are already awaiting completion".into())
+        } else {
+            self.check_delivery(&c)
+        };
+        if let Err(error) = ready {
+            if import {
+                // Only the verified owner may abandon this sealed reservation before a reader exists.
+                self.policy.work.queued.remove(&request.key);
+                crate::cmd::geolibre::discard_pending(self, &request.params);
+            }
+            return Err(error);
+        }
         self.policy.work.queued.remove(&request.key);
         let c = (*c).clone();
         let id = self.download_started();
@@ -164,7 +176,11 @@ impl Session {
         if let Some(claim) = self.policy.work.claims.get(&id)
             && let Err(e) = self.check_continuation(&claim.c)
         {
-            self.policy.work.claims.remove(&id);
+            if let Some(claim) = self.policy.work.claims.remove(&id)
+                && claim.import
+            {
+                crate::cmd::geolibre::discard_pending(self, &claim.params);
+            }
             self.downloading.retain(|n| *n != id);
             self.downloaded.retain(|(n, _)| *n != id);
             self.landed_reads.retain(|(n, _)| *n != id);

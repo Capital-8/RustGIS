@@ -315,6 +315,22 @@ mod tests {
         assert!(app.session.map().layers.is_empty());
     }
 
+    /// Uses the real importer to reserve a grouped URL layer without starting its read.
+    fn deferred_zarr(app: &mut RustGisApp) -> (usize, u32) {
+        app.session
+            .run_leaving_downloads(
+                "project.importGeolibre",
+                &json!({"text":json!({
+                    "name":"Deferred Zarr", "version":"0.2.0", "mapView":{},
+                    "layers":[{"id":"overflow","name":"Overflow","type":"zarr","groupId":"folder",
+                        "source":{"url":"https://example.invalid/overflow.zarr"}}],
+                    "layerGroups":[{"id":"folder","name":"Folder"}]
+                }).to_string()}),
+            )
+            .unwrap();
+        (app.session.project.active_map, app.session.map().layer_by_name("Overflow").unwrap().id)
+    }
+
     #[test]
     fn geolibre_zarr_start_failure_removes_reservation_through_app_frame() {
         for late_failure in [false, true] {
@@ -342,18 +358,7 @@ mod tests {
                 assert!(app.session.download_is_pending(unrelated), "an unclaimed failure must leave other downloads alone");
                 app.session.download_failed(unrelated);
             }
-            app.session
-                .run_leaving_downloads(
-                    "project.importGeolibre",
-                    &json!({"text":json!({
-                "name":"Deferred Zarr", "version":"0.2.0", "mapView":{},
-                "layers":[{"id":"overflow","name":"Overflow","type":"zarr","groupId":"folder",
-                    "source":{"url":"https://example.org/overflow.zarr"}}], "layerGroups":[{"id":"folder","name":"Folder"}]
-            }).to_string()}),
-                )
-                .unwrap();
-            let target = app.session.project.active_map;
-            let id = app.session.map().layer_by_name("Overflow").unwrap().id;
+            let (target, id) = deferred_zarr(&mut app);
             assert!(app.session.map().groups.iter().any(|g| g.children.contains(&id)));
             if late_failure {
                 // Claim/start in the origin map, then let the actual admitted reader fail on a
@@ -389,6 +394,151 @@ mod tests {
                 app.session.download_failed(claim);
             }
         }
+    }
+
+    /// Rejections before reader creation must retire both live and undo/redo reservations.
+    #[test]
+    fn geolibre_zarr_pre_start_rejection_retires_reservation_through_app_frame() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _turn = crate::fetching::turn();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let count = sent.clone();
+        cache::set_fetcher(move |_, done| {
+            count.fetch_add(1, Ordering::SeqCst);
+            done(Err("unexpected imported read".into()));
+        });
+        for case in ["revoked", "map", "capacity"] {
+            let mut app = RustGisApp::with_sample();
+            let unrelated = serde_json::to_value(&app.session.project.maps[0]).unwrap();
+            // These logins belong only to this Session, not a process-wide Earthdata account.
+            let login = if case == "revoked" {
+                let id = app
+                    .session
+                    .run(
+                        "connection.new",
+                        &json!({
+                            "kind":"wms", "address":"https://retirement.invalid", "auth":"header", "keyName":"X-Key"
+                        }),
+                    )
+                    .unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                app.session.run("connection.login", &json!({"id":id,"apiKey":"RGSYNTH_retirement_session"})).unwrap();
+                Some(id)
+            } else {
+                None
+            };
+            let mut claims = Vec::new();
+            if case == "capacity" {
+                for n in 0..64 {
+                    app.session.request_url(&json!({"url":format!("https://example.invalid/held-{n}.csv")})).unwrap();
+                    let request = app.session.take_url_requests().pop().unwrap();
+                    claims.push(app.session.download_started_for(&request).unwrap());
+                }
+            }
+            let (target, id) = deferred_zarr(&mut app);
+            let token = app.session.map().layer(id).unwrap().dataset.source.clone().unwrap();
+            assert!(app.session.map().groups.iter().any(|g| g.children.contains(&id)));
+            // This ordinary edit leaves a real undo snapshot containing the reservation.
+            app.session.run("map.rename", &json!({"name":"Queued import"})).unwrap();
+            if let Some(login) = login {
+                app.session.run("connection.logout", &json!({"id":login})).unwrap();
+            }
+            if case == "map" {
+                let name = app.session.project.maps[0].name.clone();
+                app.session.run("map.activate", &json!({"name":name})).unwrap();
+            }
+            let active = app.session.project.active_map;
+            let mark = app.session.notice_mark();
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.logic(ui.ctx()));
+            output.textures_delta.clear();
+            assert_eq!(sent.load(Ordering::SeqCst), 0, "{case}: rejected before any send");
+            assert_eq!(app.session.project.active_map, active, "{case}");
+            assert_eq!(serde_json::to_value(&app.session.project.maps[0]).unwrap(), unrelated, "{case}: unrelated map");
+            assert!(app.session.project.maps[target].layer(id).is_none(), "{case}: reservation removed");
+            assert!(app.session.project.maps[target].groups.iter().all(|g| !g.children.contains(&id)), "{case}: group repaired");
+            assert!(app.ui.geolibre_zarr.is_empty(), "{case}: no reader started");
+            assert!(app.session.take_url_requests().is_empty());
+            let errors = app.session.notices_since(mark).iter().filter(|n| n.error).count();
+            assert_eq!(errors, 1, "{case}: one refusal notice");
+            assert!(app.session.project.saved_text(None).is_ok(), "{case}: saving is no longer blocked");
+            for claim in &claims {
+                assert!(app.session.download_is_pending(*claim), "capacity refusal preserves other downloads");
+                assert!(app.session.download_still(*claim).unwrap()());
+            }
+            for command in ["edit.undo", "edit.redo"] {
+                app.session.run(command, &Value::Null).unwrap();
+                let saved = app.session.project.saved_text(None).unwrap().0;
+                assert!(!saved.contains(&token), "{case}: {command} cannot resurrect the reservation");
+            }
+            for claim in claims {
+                app.session.download_failed(claim);
+            }
+        }
+    }
+
+    /// Failed foreign and duplicate claims must leave the rightful import untouched.
+    #[test]
+    fn geolibre_zarr_rejected_claim_preserves_the_original_request() {
+        let mut a = RustGisApp::with_sample();
+        let mut b = RustGisApp::with_sample();
+        let (map_a, layer_a) = deferred_zarr(&mut a);
+        let (map_b, layer_b) = deferred_zarr(&mut b);
+        let qa = a.session.take_url_requests().pop().unwrap();
+        let qb = b.session.take_url_requests().pop().unwrap();
+        assert!(b.session.download_started_for(&qa).unwrap_err().contains("another session"));
+        assert!(a.session.project.maps[map_a].layer(layer_a).is_some());
+        assert!(b.session.project.maps[map_b].layer(layer_b).is_some());
+        let foreign = b.session.with_scope(rustgis_engine::policy::Scope::peer(), |s| s.download_started_for(&qb)).unwrap();
+        assert!(foreign.unwrap_err().contains("another caller"));
+        assert!(b.session.project.maps[map_b].layer(layer_b).is_some());
+        let id = b.session.download_started_for(&qb).unwrap();
+        assert!(b.session.download_started_for(&qb).is_err(), "a duplicate does not retire the already claimed import");
+        assert!(b.session.project.maps[map_b].layer(layer_b).is_some());
+        assert!(b.session.download_continues(id).is_ok());
+        assert!(a.session.download_started_for(&qa).is_ok(), "foreign rejection preserves the other session too");
+    }
+
+    /// A deterministic stage boundary covers invalidation after claim but before reader creation.
+    #[test]
+    fn geolibre_zarr_claimed_invalidation_retires_only_its_reservation() {
+        let mut app = RustGisApp::with_sample();
+        let connection = app
+            .session
+            .run(
+                "connection.new",
+                &json!({
+                    "kind":"wms", "address":"https://claimed-retirement.invalid", "auth":"header", "keyName":"X-Key"
+                }),
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        app.session.run("connection.login", &json!({"id":connection,"apiKey":"RGSYNTH_claimed_retirement"})).unwrap();
+        let (target, layer) = deferred_zarr(&mut app);
+        let request = app.session.take_url_requests().pop().unwrap();
+        let claimed = app.session.download_started_for(&request).unwrap();
+        app.session.run("connection.logout", &json!({"id":connection})).unwrap();
+        // This unrelated current request has no default dependency on the reserved layer.
+        app.session.active_layer = None;
+        assert!(app.session.selected_layers().is_empty());
+        app.session.request_url(&json!({"url":"https://example.invalid/unrelated.csv"})).unwrap();
+        let unrelated = app.session.take_url_requests().pop().unwrap();
+        let unrelated = app.session.download_started_for(&unrelated).unwrap();
+        let error = app.session.download_continues(claimed).unwrap_err();
+        assert!(error.contains("account"), "{error}");
+        assert!(!app.session.download_is_pending(claimed));
+        assert!(app.session.project.maps[target].layer(layer).is_none());
+        assert!(app.session.project.maps[target].groups.iter().all(|g| !g.children.contains(&layer)));
+        assert!(app.session.project.saved_text(None).is_ok());
+        assert!(app.session.download_continues(unrelated).is_ok());
+        app.session.download_failed(unrelated);
     }
 
     /// A full active reader must not let queued stores issue downloads or retain chunk buffers.

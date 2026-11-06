@@ -295,11 +295,16 @@ fn public_text(text: String) -> String {
 }
 
 fn public_result(s: &mut Session, value: Value, tokens: usize) -> String {
-    let mut withheld = 0usize;
+    let mut withheld = Withheld::default();
     let mut value = public_addresses(value, 0, &mut withheld);
-    if withheld > 0 {
+    if withheld.depth > 0 || withheld.keys > 0 {
         let mark = s.notice_mark();
-        s.notify(format!("Tool result: {withheld} subtrees at nesting depth {MAX_DEPTH} were withheld."), false);
+        if withheld.depth > 0 {
+            s.notify(format!("Tool result: {} subtrees at nesting depth {MAX_DEPTH} were withheld.", withheld.depth), false);
+        }
+        if withheld.keys > 0 {
+            s.notify(format!("Tool result: {} object(s) were withheld because redacted field names coincide.", withheld.keys), false);
+        }
         if let Some(notices) = value.get_mut("notices").and_then(Value::as_array_mut) {
             notices.extend(s.notices_since(mark).iter().map(|n| json!(n.text)));
         } else {
@@ -309,16 +314,32 @@ fn public_result(s: &mut Session, value: Value, tokens: usize) -> String {
     bounded_json(&value, tokens)
 }
 
-/// `v` with its strings made public ([`public_text`]), to a depth of [`MAX_DEPTH`].
-fn public_addresses(v: Value, depth: usize, withheld: &mut usize) -> Value {
+#[derive(Default)]
+struct Withheld {
+    depth: usize,
+    keys: usize,
+}
+
+/// `v` with string values and field names made public ([`public_text`]), to a depth of
+/// [`MAX_DEPTH`]. An object whose public field names collide is withheld as a whole.
+fn public_addresses(v: Value, depth: usize, withheld: &mut Withheld) -> Value {
     match v {
         Value::String(s) => Value::String(public_text(s)),
         Value::Array(a) if depth < MAX_DEPTH => Value::Array(a.into_iter().map(|x| public_addresses(x, depth + 1, withheld)).collect()),
         Value::Object(o) if depth < MAX_DEPTH => {
-            Value::Object(o.into_iter().map(|(k, x)| (k, public_addresses(x, depth + 1, withheld))).collect())
+            let mut public = serde_json::Map::new();
+            for (key, value) in o {
+                let key = public_text(key);
+                if public.contains_key(&key) {
+                    withheld.keys = withheld.keys.saturating_add(1);
+                    return json!("[redacted field names coincide]");
+                }
+                public.insert(key, value);
+            }
+            Value::Object(public.into_iter().map(|(key, value)| (key, public_addresses(value, depth + 1, withheld))).collect())
         }
         Value::Array(_) | Value::Object(_) => {
-            *withheld = withheld.saturating_add(1);
+            withheld.depth = withheld.depth.saturating_add(1);
             json!("[too deep]")
         }
         other => other,
@@ -867,7 +888,7 @@ mod tests {
         let binding = logins::activate(origin, "assistant", logins::Method::Header("X-Key".into()), "assistant-secret", false).unwrap();
         let archive = logins::bind(&binding, &format!("{origin}/a.pmtiles")).unwrap();
         let result = json!({"layers": [{"next": {"request": {"url": format!("pmtiles:x@{archive}")}}}], "count": 2});
-        let v = public_addresses(result, 0, &mut 0);
+        let v = public_addresses(result, 0, &mut Withheld::default());
         assert_eq!(v["layers"][0]["next"]["request"]["url"], format!("pmtiles:x@{origin}/a.pmtiles"));
         assert_eq!(v["count"], 2);
         assert!(logins::deactivate(&binding));
@@ -910,6 +931,34 @@ mod tests {
         assert_eq!(out["echo"], "server said [redacted]");
         assert_eq!(out["clean"], "ordinary café text");
         assert!(s.notices_since(0).is_empty());
+        // A generated row uses imported field names as object keys. Keep the stored data,
+        // but never send a field repeating an active key to the model in plain text.
+        let source = json!({"type":"FeatureCollection","features":[{
+            "type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},
+            "properties":{"fake001":"retained value","clean":"ordinary café text"}
+        }]});
+        s.run("layer.addDataText", &json!({"fileName":"echo-fields.geojson","text":source.to_string()})).unwrap();
+        let name = s.map().layers.last().unwrap().name.clone();
+        let call = ToolCall { id: "echo-fields".into(), name: "read_features".into(), args: json!({"layer":name,"limit":1}) };
+        let scope = Scope::assistant(9035, std::sync::Arc::new(Live::default()));
+        let mark = s.notice_mark();
+        let text = run_with_budget(&mut s, &call, DEFAULT_OUTPUT_TOKENS, scope, None).unwrap();
+        assert!(!text.contains("fake001"), "generated object keys must be scrubbed too: {text}");
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["rows"][0]["[redacted]"], "retained value");
+        assert_eq!(out["rows"][0]["clean"], "ordinary café text");
+        assert!(s.map().layers.last().unwrap().dataset.fields.iter().any(|f| f.name == "fake001"), "stored data stays unchanged");
+        assert!(s.notices_since(mark).is_empty());
+        // Two keys that become equal must not silently overwrite one value with the other.
+        let mark = s.notice_mark();
+        let collision = json!({"success":true,"result":{"fake001":"first value","[redacted]":"second value"}});
+        let text = public_result(&mut s, collision, DEFAULT_OUTPUT_TOKENS);
+        assert!(!text.contains("fake001"));
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["success"], true);
+        assert!(out["result"].is_string(), "ambiguous redacted objects are explicitly withheld");
+        assert_eq!(s.notices_since(mark).len(), 1);
+        assert!(s.notices_since(mark)[0].text.contains("field names"));
     }
 
     #[test]

@@ -2864,7 +2864,7 @@ impl Layer {
             design: _,
             raster,
             source,
-            postgis: _,
+            postgis,
             gpkg,
             connection: _,
             anonymous: _,
@@ -2907,6 +2907,9 @@ impl Layer {
         if let Some(g) = gpkg {
             out.push((LayerRole::GpkgPath, g.path.as_str(), false, paths::is_local(&g.path)));
         }
+        if let Some(pg) = postgis {
+            out.push((LayerRole::PostgisEditDatabase, pg.origin.database.as_str(), true, false));
+        }
         out
     }
 
@@ -2914,9 +2917,15 @@ impl Layer {
     pub fn output_slot_mut(&mut self, role: LayerRole) -> Option<&mut String> {
         match role {
             LayerRole::Dataset => self.dataset.source.as_mut(),
-            LayerRole::Streamed | LayerRole::GdalPath | LayerRole::DuckDbDatabase => self.source.as_mut()?.output_slot_mut(role),
+            LayerRole::Streamed
+            | LayerRole::GdalPath
+            | LayerRole::DuckDbDatabase
+            | LayerRole::PostgisDatabase
+            | LayerRole::MysqlDatabase
+            | LayerRole::SqlServerDatabase => self.source.as_mut()?.output_slot_mut(role),
             LayerRole::Raster | LayerRole::ZarrStore => self.raster.as_mut()?.output_slot_mut(role),
             LayerRole::GpkgPath => Some(&mut self.gpkg.as_mut()?.path),
+            LayerRole::PostgisEditDatabase => Some(&mut self.postgis.as_mut()?.origin.database),
         }
     }
 }
