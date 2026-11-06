@@ -269,11 +269,16 @@ impl Session {
         self.request_only = true;
         Ok(json!({"pending":true,"url":p.get("url")}))
     }
-    /// Taking an opaque request sends nothing. Authority is checked again when it is claimed.
+    /// Taking an opaque request sends nothing and retains other callers' queued requests.
+    /// Authority is checked again when the owner or native host claims it.
     pub fn take_url_requests(&mut self) -> Vec<UrlRequest> {
         let mut live = Vec::new();
         let mut revoked = 0;
         for request in std::mem::take(&mut self.url_requests) {
+            if self.check_delivery_owner(&request.authority).is_err() {
+                self.url_requests.push(request);
+                continue;
+            }
             let ok = self
                 .policy
                 .work

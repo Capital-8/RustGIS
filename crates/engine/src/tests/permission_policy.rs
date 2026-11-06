@@ -263,6 +263,9 @@ fn permission_policy_deferred_url_claim_keeps_owner_and_generation() {
     let call = Call::command("layer.addUrl", json!({"url":"https://example.invalid/data.geojson"}));
     let p = pending(&s, &scope, &call);
     s.run_permitted(scope.clone(), p.allow(), &call).unwrap();
+    let mark = s.notice_mark();
+    assert!(s.with_scope(foreign.clone(), |s| s.take_url_requests()).unwrap().is_empty());
+    assert!(s.notices_since(mark).is_empty(), "a foreign drain cannot retire the owner's queued request");
     let q = s.take_url_requests().pop().unwrap();
     let id = s.download_started_for(&q).unwrap();
     assert!(s.download_started_for(&q).is_err());
@@ -1527,6 +1530,80 @@ fn permission_policy_renamed_streamed_inputs_keep_their_reach() {
         assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
     }
     assert!(outcomes.iter().all(|(_, asks, shown)| *asks && *shown), "{outcomes:?}");
+}
+
+/// In-memory range reads need Network, while local paths and external drivers retain Files.
+#[test]
+fn permission_policy_remote_range_reads_need_only_network() {
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    s.map_mut().layer_mut(id).unwrap().selection.clear();
+    let (scope, _) = assistant(3601);
+    for (path, driver, files, network) in [
+        ("https://example.invalid/roads.fgb", false, false, true),
+        ("http://example.invalid/roads.parquet?subset=all", false, false, true),
+        ("s3://example/roads.geoparquet", false, false, true),
+        ("/local/roads.fgb", false, true, false),
+        ("https://example.invalid/roads.fgb", true, true, true),
+    ] {
+        let mut source = rustgis_map::source::SourceLayer::default();
+        source.path = Some(path.into());
+        source.gdal = driver.then(|| rustgis_map::source::GdalOrigin {
+            path: "external-driver-source".into(),
+            layer: "roads".into(),
+            family: None,
+            crs: None,
+        });
+        s.map_mut().layer_mut(id).unwrap().source = Some(source);
+        for call in
+            [Call::command("layer.loadAll", json!({"layer":"Cities"})), Call::tool("buffer", json!({"input":"Cities","distance":10}))]
+        {
+            let approved = pending(&s, &scope, &call);
+            let why = &approved.review().why;
+            assert_eq!(why.contains("files"), files, "{path}: {why}");
+            assert_eq!(why.contains("internet"), network, "{path}: {why}");
+        }
+    }
+}
+
+/// Unicode folds do not alias distinct executor names, for prior renames or new outputs.
+#[test]
+fn permission_policy_planned_names_use_executor_ascii_case() {
+    let mut s = world();
+    let cities = s.map().layer_by_name("Cities").unwrap().id;
+    let countries = s.map().layer_by_name("Countries").unwrap().id;
+    let (scope, _) = assistant(3602);
+    let call = Call::command(
+        "script.run",
+        json!({"script":
+            "layer.rename {\"layer\":\"Cities\",\"name\":\"K\"}\nlayer.rename {\"layer\":\"Countries\",\"name\":\"K\"}\nlayer.visibility {\"layer\":\"k\",\"visible\":false}\nlayer.visibility {\"layer\":\"K\",\"visible\":true}"
+        }),
+    );
+    let approved = pending(&s, &scope, &call);
+    s.run_permitted(scope.clone(), approved.allow(), &call).unwrap();
+    assert_eq!(s.map().layer_by_name("k").unwrap().id, cities);
+    assert!(!s.map().layer(cities).unwrap().visible);
+    assert_eq!(s.map().layer_by_name("K").unwrap().id, countries);
+    assert!(s.map().layer(countries).unwrap().visible);
+    for first in [
+        format!(
+            "layer.addDataText {}",
+            json!({"name":"Kelvin","fileName":"point.geojson","text":"{\"type\":\"Point\",\"coordinates\":[0,0]}"})
+        ),
+        "gp.run {\"tool\":\"buffer\",\"params\":{\"input\":\"K\",\"distance\":10,\"output\":\"Kelvin\"}}".into(),
+    ] {
+        for next in [
+            "layer.visibility {\"layer\":\"Kelvin\",\"visible\":false}",
+            "gp.run {\"tool\":\"buffer\",\"params\":{\"input\":\"Kelvin\",\"distance\":10}}",
+        ] {
+            let call = Call::command("script.run", json!({"script":format!("{first}\n{next}")}));
+            assert!(
+                matches!(s.review(&scope, &call), Outcome::Refused(reason)
+                    if reason.contains("Kelvin") && (reason.contains("no layer") || reason.contains("no earlier output"))),
+                "Unicode-distinct missing outputs must refuse before execution"
+            );
+        }
+    }
 }
 
 /// Secondary optional inputs must retain future names for the planner's existing alias resolver.

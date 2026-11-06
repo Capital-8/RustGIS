@@ -290,6 +290,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn metadata_worker_keeps_still_and_drops_revoked_completion() {
+        let _turn = crate::cache::turn();
         let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker = checks.clone();
         let still: crate::cache::Still = Arc::new(move || {
@@ -309,6 +310,7 @@ mod tests {
 
     #[test]
     fn cleared_metadata_rejects_an_older_completion() {
+        let _turn = crate::cache::turn();
         let epoch = EPOCH.load(Ordering::SeqCst);
         forget();
         remember_info("/old-completion.mbtiles", &Err("obsolete read".into()), epoch);

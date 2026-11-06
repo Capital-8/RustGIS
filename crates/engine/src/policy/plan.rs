@@ -666,15 +666,15 @@ impl<'a> Builder<'a> {
                     Target::MadeLayer { .. } => Target::MadeLayer { map: self.context().map().instance_id(), name: spelling.clone() },
                     other => other,
                 };
-                self.symbols.insert((self.context().map().instance_id(), spelling.to_lowercase()), target);
+                self.symbols.insert((self.context().map().instance_id(), spelling.to_ascii_lowercase()), target);
             }
         }
         if self.strict
             && matches!(id, "layer.addData" | "layer.addDataText" | "layer.addDatabase" | "layer.addSql" | "layer.addEncodedPolyline")
             && let Some(name) = params.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty())
         {
-            self.outputs.insert((self.context().map().instance_id(), name.trim().to_lowercase()));
-            self.table_outputs.insert(name.trim().to_lowercase());
+            self.outputs.insert((self.context().map().instance_id(), name.trim().to_ascii_lowercase()));
+            self.table_outputs.insert(name.trim().to_ascii_lowercase());
         }
         if self.strict
             && let Some(transition) = spec.transition
@@ -724,9 +724,9 @@ impl<'a> Builder<'a> {
         if !crate::cmd::gp::writes_files(pin.spec())
             && let Some(name) = params.get("output").and_then(Value::as_str).filter(|n| !n.trim().is_empty())
         {
-            self.outputs.insert((self.context().map().instance_id(), name.trim().to_lowercase()));
-            self.table_outputs.insert(name.trim().to_lowercase());
-            self.dataset_outputs.insert(name.trim().to_lowercase(), (n.number, self.context().map().instance_id()));
+            self.outputs.insert((self.context().map().instance_id(), name.trim().to_ascii_lowercase()));
+            self.table_outputs.insert(name.trim().to_ascii_lowercase());
+            self.dataset_outputs.insert(name.trim().to_ascii_lowercase(), (n.number, self.context().map().instance_id()));
         }
         n.op = Op::Tool(pin);
         n.display.operation = n.id().to_string();
@@ -786,9 +786,9 @@ impl<'a> Builder<'a> {
                             // These schemas explicitly accept files as well as project datasets.
                             // Keep the original path as private equality data, never a guessed layer.
                             n.places.push(json!({p.name:name}));
-                        } else if let Some(&(producer, map)) = self.dataset_outputs.get(&name.to_lowercase()) {
+                        } else if let Some(&(producer, map)) = self.dataset_outputs.get(&name.to_ascii_lowercase()) {
                             n.targets.push(Target::ProducedDataset { producer, map, name: name.into() });
-                        } else if self.strict && !self.outputs.contains(&(self.context().map().instance_id(), name.to_lowercase())) {
+                        } else if self.strict && !self.outputs.contains(&(self.context().map().instance_id(), name.to_ascii_lowercase())) {
                             return Err(format!("no layer or table named '{name}' and no earlier output"));
                         } else {
                             n.targets.push(Target::MadeLayer { map: self.context().map().instance_id(), name: name.into() });
@@ -822,7 +822,7 @@ impl<'a> Builder<'a> {
                             }
                             other => other,
                         });
-                    } else if self.outputs.contains(&(self.context().map().instance_id(), name.to_lowercase())) {
+                    } else if self.outputs.contains(&(self.context().map().instance_id(), name.to_ascii_lowercase())) {
                         n.targets.push(Target::MadeLayer { map: self.context().map().instance_id(), name });
                     } else if self.strict {
                         return Err(format!("no layer '{name}' and no earlier output"));
@@ -893,7 +893,7 @@ impl<'a> Builder<'a> {
                             && !params
                                 .get("table")
                                 .and_then(Value::as_str)
-                                .is_some_and(|n| self.table_outputs.contains(&n.to_lowercase())) =>
+                                .is_some_and(|n| self.table_outputs.contains(&n.to_ascii_lowercase())) =>
                     {
                         return Err(e);
                     }
@@ -1013,9 +1013,9 @@ impl<'a> Builder<'a> {
                 if a == b && an.eq_ignore_ascii_case(bn)),
         }
     }
-    /// One map-qualified planned spelling lookup for targets and effect inference.
+    /// Map-qualified planned spellings match the executor's ASCII case-insensitive lookup.
     fn symbol(&self, name: &str) -> Option<&Target> {
-        self.symbols.get(&(self.context().map().instance_id(), name.to_lowercase()))
+        self.symbols.get(&(self.context().map().instance_id(), name.to_ascii_lowercase()))
     }
     /// Literal names retain the executor's map-layer precedence; known future outputs never
     /// fall back to a same-named old layer as if they already had a source.
@@ -1045,7 +1045,9 @@ impl<'a> Builder<'a> {
             Ok(id) => Ok(self.layer_target(id, reads)),
             Err(error)
                 if self.strict
-                    && !value.as_str().is_some_and(|n| self.outputs.contains(&(self.context().map().instance_id(), n.to_lowercase()))) =>
+                    && !value
+                        .as_str()
+                        .is_some_and(|n| self.outputs.contains(&(self.context().map().instance_id(), n.to_ascii_lowercase()))) =>
             {
                 Err(error)
             }

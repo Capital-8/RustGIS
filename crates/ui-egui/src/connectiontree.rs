@@ -1022,6 +1022,7 @@ mod tests {
 
     #[test]
     fn a_foreign_followup_does_not_adopt_that_origins_saved_login() {
+        let _turn = crate::fetching::turn();
         let mut app = RustGisApp::with_sample();
         let foreign = "https://foreign-ui-followup.invalid/points.geojson";
         let c = app

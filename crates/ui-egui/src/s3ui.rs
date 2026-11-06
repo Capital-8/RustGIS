@@ -823,6 +823,7 @@ mod tests {
         }
         use rustgis_engine::data::secrets::MemorySecrets;
         use std::sync::Arc;
+        let _turn = crate::fetching::turn();
         let app = || {
             RustGisApp::with_sample().with_services(crate::Services { secrets: Some(Arc::new(MemorySecrets::new())), ..Default::default() })
         };

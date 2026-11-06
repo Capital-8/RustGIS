@@ -1800,7 +1800,10 @@ mod file_tests {
         let call = crate::policy::Call::tool("vectorToPmtiles", json!({"input":"Cities","minZoom":0,"maxZoom":0}));
         let pending = s.run_scoped(owner.clone(), &call).unwrap();
         let id = pending["download"].as_u64().unwrap();
-        assert!(s.run_scoped(foreign, &crate::policy::Call::command("gp.fileDelivered", json!({"id":id}))).is_err());
+        assert!(s.run_scoped(foreign.clone(), &crate::policy::Call::command("gp.fileDelivered", json!({"id":id}))).is_err());
+        let mark = s.notice_mark();
+        assert!(s.with_scope(foreign, |s| s.take_gp_files()).unwrap().is_empty());
+        assert!(s.notices_since(mark).is_empty(), "a foreign drain leaves the owner's bytes and notices alone");
         assert_eq!(s.take_gp_files().len(), 1);
         assert!(s.take_gp_files().is_empty());
         assert_eq!(s.acknowledge_gp_file(id, None).unwrap()["delivered"], true);

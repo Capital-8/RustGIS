@@ -1041,7 +1041,7 @@ impl Session {
         self.check_continuation(c)
     }
     /// Refuses foreign ingress before a failed start may retire its owner's queued work.
-    pub(super) fn check_delivery_owner(&self, c: &Continuation) -> Result<(), String> {
+    pub(crate) fn check_delivery_owner(&self, c: &Continuation) -> Result<(), String> {
         if !self.policy.scopes.is_empty() && !self.scope().same_caller(&c.scope) {
             return Err("this run belongs to another caller".into());
         }

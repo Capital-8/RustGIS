@@ -5113,7 +5113,9 @@ pub(crate) fn isolate_account_test(name: &str) -> bool {
 }
 
 /// Tests that fetch through the tile cache take turns: it has one fetcher for the whole process,
-/// and a test that replaces it (`set_fetcher`) would answer another's downloads.
+/// and a test that replaces it (`set_fetcher`) would answer another's downloads. So do tests that
+/// log in to a connection, as a login replaced or ended empties the cache (`cache::clear`), and
+/// tests that wait for what it reads (tiles, an archive's header), which that would drop.
 #[cfg(test)]
 pub(crate) mod fetching {
     use std::sync::{Mutex, MutexGuard};

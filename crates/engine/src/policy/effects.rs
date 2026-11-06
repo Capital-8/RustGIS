@@ -123,10 +123,11 @@ pub(super) fn command(s: &crate::cmd::InputContext<'_>, spec: &CommandSpec, para
 /// Pure reach of a source the executor will read, without opening it.
 pub(super) fn source_reach(source: &rustgis_map::source::SourceLayer) -> Effects {
     let mut effects = Effects::NONE;
-    if source.path.is_some() || source.gdal.is_some() || source.duckdb.is_some() {
+    let remote = source.path.as_deref().is_some_and(rustgis_data::source::is_remote_name);
+    if (source.path.is_some() && !remote) || source.gdal.is_some() || source.duckdb.is_some() {
         effects = effects.with(Effect::Files);
     }
-    if source.path.as_deref().is_some_and(rustgis_data::source::is_remote_name)
+    if remote
         || source.postgis.is_some()
         || source.mysql.is_some()
         || source.sqlserver.is_some()

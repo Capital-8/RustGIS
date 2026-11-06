@@ -460,6 +460,7 @@ mod tests {
 
     #[test]
     fn http_requires_permission_and_bindings_reject_scheme_host_and_port_changes() {
+        let _turn = crate::cache::turn();
         assert!(activate("http://insecure-login.test", "http", Method::Header("X-Key".into()), "short", false).is_err());
         let binding = activate("https://scoped-login.test", "scope", Method::Header("X-Key".into()), "scope-secret", false).unwrap();
         let bound = bind(&binding, "https://scoped-login.test/tile").unwrap();
@@ -475,6 +476,7 @@ mod tests {
 
     #[test]
     fn bindings_isolate_connections_and_revoke_generations() {
+        let _turn = crate::cache::turn();
         let target = "https://binding-login.example";
         let a = activate(target, "session-a/connection", Method::Header("X-Key".into()), "a", false).unwrap();
         let b = activate(target, "session-b/connection", Method::Header("X-Key".into()), "b", false).unwrap();
@@ -494,6 +496,7 @@ mod tests {
 
     #[test]
     fn failed_random_source_installs_nothing_and_preserves_a_live_login() {
+        let _turn = crate::cache::turn();
         let target = "https://random-failure-login.example";
         let old = activate(target, "random-replacement", Method::Header("X-Key".into()), "old-credential", false).unwrap();
         let address = bind(&old, &format!("{target}/tile")).unwrap();
@@ -516,6 +519,7 @@ mod tests {
 
     #[test]
     fn collisions_retry_without_overwriting_and_exhaust_after_four_attempts() {
+        let _turn = crate::cache::turn();
         let target = "https://collision-login.example";
         let method = || Method::Header("X-Key".into());
         let old = activate_with_random(target, "collision-old", method(), "old-key", false, |bytes| {
@@ -565,6 +569,7 @@ mod tests {
     /// Identity includes an empty session and ignores a different session with a shared prefix.
     #[test]
     fn runtime_identity_binds_session_generations_and_absence() {
+        let _turn = crate::cache::turn();
         let session = 9_150_001;
         let empty = account_identity(session).unwrap();
         assert!(empty.is_current());
@@ -601,6 +606,7 @@ mod tests {
 
     #[test]
     fn scrubs_header_and_basic_payload() {
+        let _turn = crate::cache::turn();
         let password = "scrub-password: /é";
         let value = basic("scrub-user", password);
         let binding = activate("https://scrub-login.example", "scrub", Method::Header("Authorization".into()), &value, false).unwrap();

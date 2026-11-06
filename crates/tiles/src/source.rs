@@ -671,6 +671,7 @@ mod tests {
 
     #[test]
     fn resolves_raster_and_vector_templates_at_once() {
+        let _turn = crate::cache::turn();
         let Resolve::Ready(r) = resolve(&spec(Kind::Raster, "https://{s}.tile.example.com/{z}/{x}/{y}.png")) else { panic!("not ready") };
         assert_eq!(r.attribution, vec!["© OSM".to_string()]);
         match r.style.sources.first().map(|s| &s.1) {
@@ -702,6 +703,7 @@ mod tests {
 
     #[test]
     fn own_style_layers_draw_vector_tiles() {
+        let _turn = crate::cache::turn();
         let mut own = spec(Kind::Vector, "https://tiles.example.com/fields/{z}/{x}/{y}.pbf");
         own.style_layers = r##"[{"id": "f", "type": "fill", "source": "elsewhere", "source-layer": "fields",
             "paint": {"fill-color": ["step", ["get", "score"], "#d73027", 50, "#1a9850"]}}]"##
@@ -755,6 +757,7 @@ mod tests {
 
     #[test]
     fn refuses_forbidden_addresses() {
+        let _turn = crate::cache::turn();
         assert!(matches!(resolve(&spec(Kind::Raster, "http://169.254.169.254/{z}/{x}/{y}.png")), Resolve::Failed(_)));
         // A self-hosted server the user names is fine.
         assert!(matches!(resolve(&spec(Kind::Raster, "http://localhost:8080/{z}/{x}/{y}.png")), Resolve::Ready(_)));
@@ -811,6 +814,7 @@ mod tests {
 
     #[test]
     fn an_elevation_source_on_its_way_holds_back_only_its_own_layers() {
+        let _turn = crate::cache::turn();
         // Its TileJSON isn't here yet (the first fetch of an address is on its way).
         let doc = serde_json::json!({"version": 8, "sources": {
             "dem": {"type": "raster-dem", "url": "https://on-its-way.example.com/dem.json"},
@@ -850,6 +854,7 @@ mod tests {
 
     #[test]
     fn a_relief_layer_whose_source_was_left_out_draws_nothing() {
+        let _turn = crate::cache::turn();
         // Lit from every side with white, a hillshade would show on any slope drawn.
         let doc = serde_json::json!({"version": 8, "sources": {"dem": {"type": "raster-dem", "url": "http://169.254.169.254/dem.json"}},
             "layers": [
@@ -882,6 +887,7 @@ mod tests {
 
     #[test]
     fn a_style_that_left_something_out_draws_the_rest_and_says_so() {
+        let _turn = crate::cache::turn();
         let doc = serde_json::json!({"version": 8, "sources": {}, "layers": [{"id": "bg", "type": "background", "paint": {"background-color": "#f00"}}]});
         let left_out = vec!["elevation source dem left out, so its relief isn't drawn: gone".to_owned()];
         let r = Resolved {
@@ -1039,6 +1045,7 @@ mod tests {
     /// origin inherits it, one at another origin goes without, and a revoked login reads none.
     #[test]
     fn every_sprite_at_the_styles_origin_inherits_its_login() {
+        let _turn = crate::cache::turn();
         use crate::logins::{self, Method};
         let origin = "https://sprites-login.example.com";
         let binding = logins::activate(origin, "sprites", Method::Header("X-Key".into()), "sprites-secret", false).unwrap();

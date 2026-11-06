@@ -953,6 +953,7 @@ pub(crate) mod tests {
 
     #[test]
     fn written_archives_read_back() {
+        let _turn = crate::cache::turn();
         let dir = std::env::temp_dir().join(format!("rustgis-pmtiles-write-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let new = |tile_type| NewArchive {
@@ -1001,6 +1002,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_tiles_from_root_and_leaf_directories() {
+        let _turn = crate::cache::turn();
         let dir = std::env::temp_dir().join(format!("rustgis-pmtiles-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tiles = vec![(0u8, 0u32, 0u32, b"zero".to_vec()), (1, 1, 0, b"one-one-zero".to_vec()), (2, 3, 3, b"two".to_vec())];
@@ -1039,6 +1041,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_raster_archive_resolves_and_decodes_and_truncations_fail_cleanly() {
+        let _turn = crate::cache::turn();
         let dir = std::env::temp_dir().join(format!("rustgis-pmtiles-raster-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut png = Vec::new();
