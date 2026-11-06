@@ -319,6 +319,10 @@ fn permission_policy_metadata_presence_and_unreviewed_default() {
 /// Actual execution families retain additive reach and every plugin call asks separately.
 #[test]
 fn permission_policy_effects_and_real_plugin_approval() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if isolate_account_test("tests::permission_policy::permission_policy_effects_and_real_plugin_approval") {
+        return;
+    }
     use crate::policy::{Effect, command_effects};
     let mut s = world();
     for id in ["layer.addSql", "cube.reduce", "cube.trend"] {
@@ -1045,6 +1049,10 @@ fn permission_policy_stored_cross_map_clipboard_and_managed_share_targets() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn permission_policy_plugin_preparation_keeps_owner_before_remote_send() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if isolate_account_test("tests::permission_policy::permission_policy_plugin_preparation_keeps_owner_before_remote_send") {
+        return;
+    }
     use rustgis_data::source::{Batch, FeatureSource, Request, SourceInfo};
     use std::{
         io::{Read, Write},
@@ -1144,6 +1152,10 @@ fn permission_policy_plugin_preparation_keeps_owner_before_remote_send() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn permission_policy_plugin_tools_follow_the_callers_control_while_running() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if isolate_account_test("tests::permission_policy::permission_policy_plugin_tools_follow_the_callers_control_while_running") {
+        return;
+    }
     use std::{
         sync::mpsc,
         time::{Duration, Instant},

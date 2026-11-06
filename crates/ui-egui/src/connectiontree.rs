@@ -1145,20 +1145,27 @@ mod tests {
         for (case, (replace, ready)) in
             [(None, true), (Some(false), false), (Some(false), true), (Some(true), false), (Some(true), true)].into_iter().enumerate()
         {
+            let href = format!("https://review29{case}.blob.core.windows.net/old-assets/points.csv");
+            let token_url = stac::sas_token_url(&href).unwrap();
+            let (asset, token) = (href.clone(), token_url.clone());
             let sent = Arc::new(Mutex::new(Vec::new()));
             let held = Arc::new(Mutex::new(Vec::<cache::Done>::new()));
             let (seen, callbacks) = (sent.clone(), held.clone());
             cache::set_fetcher(move |url, done| {
-                seen.lock().unwrap().push(url);
+                let plain = cache::split_download_limit(&url).0;
+                // Earlier frames' workers can still reach the process-wide fetcher.
+                if plain != token && plain.split('?').next() != Some(asset.as_str()) {
+                    done(Err("outside the signing fixture".into()));
+                    return;
+                }
+                seen.lock().unwrap().push(plain.to_string());
                 callbacks.lock().unwrap().push(done);
             });
             let mut app = RustGisApp::with_sample();
             let (text, _) = app.session.project.saved_text(None).unwrap();
-            let href = format!("https://review29{case}.blob.core.windows.net/old-assets/points.csv");
-            let token_url = stac::sas_token_url(&href).unwrap();
             add_asset(&mut app, &href, "Old asset", None, None).unwrap();
             assert_eq!(app.ui.connection_tree.tokens.len(), 1);
-            assert_eq!(sent.lock().unwrap().len(), 1);
+            assert_eq!(sent.lock().unwrap().as_slice(), std::slice::from_ref(&token_url));
             let finish = || {
                 for done in std::mem::take(&mut *held.lock().unwrap()) {
                     done(Ok(br#"{"token":"sig=review29-synthetic"}"#.to_vec()));
@@ -1186,12 +1193,16 @@ mod tests {
             }
             assert!(drained && app.ui.connection_tree.tokens.is_empty(), "old signing must retire before inspecting its slot");
             if replace.is_some() {
-                assert_eq!(sent.lock().unwrap().len(), 1, "the old asset must not be requested");
+                assert_eq!(sent.lock().unwrap().as_slice(), std::slice::from_ref(&token_url), "the old asset must not be requested");
                 assert!(app.ui.downloads.is_empty() && app.ui.cog_probes.is_empty());
                 assert!(stac::cached_token(&token_url).is_none(), "an old response must not update the token cache");
                 assert_eq!(app.session.notices_since(mark).iter().filter(|n| n.text.contains("project was closed")).count(), 1);
             } else {
-                assert_eq!(sent.lock().unwrap().len(), 2, "a current signing response starts its asset download");
+                assert_eq!(
+                    *sent.lock().unwrap(),
+                    [token_url.clone(), stac::sign(&href, "sig=review29-synthetic")],
+                    "a current signing response starts exactly its asset download"
+                );
                 assert_eq!(app.ui.downloads.len(), 1);
                 assert!(stac::cached_token(&token_url).is_some());
             }

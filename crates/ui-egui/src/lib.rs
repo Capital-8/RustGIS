@@ -5677,6 +5677,10 @@ mod download_service_tests {
             cache::set_fetcher(move |url, done| {
                 let (url, _) = cache::split_download_limit(&url);
                 let plain = logins::inner(url).split('?').next().unwrap();
+                if ![a, b].iter().any(|origin| plain == *origin || plain.starts_with(&format!("{origin}/"))) {
+                    done(Err("outside the lineage fixture".into()));
+                    return;
+                }
                 seen.lock().unwrap().push((plain.to_string(), logins::apply(url).unwrap().is_some()));
                 done(Ok(documents.iter().find(|(at, _)| at == plain).map(|(_, body)| body.clone()).unwrap_or_default()));
             });
@@ -5963,6 +5967,10 @@ mod peer_output_tests {
                 let (seen, callbacks) = (sent.clone(), held.clone());
                 cache::set_fetcher(move |url, done| {
                     let plain = cache::split_download_limit(&url).0.to_string();
+                    if !plain.starts_with("https://review29-service.invalid/") {
+                        done(Err("outside the service fixture".into()));
+                        return;
+                    }
                     seen.lock().unwrap().push(plain.clone());
                     callbacks.lock().unwrap().push((plain, done));
                 });

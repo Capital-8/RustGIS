@@ -40,7 +40,7 @@ fn world() -> Session {
     s
 }
 
-/// Separates a scenario's process-wide account changes and reads from parallel tests.
+/// Separates a scenario's process-wide account and registry state from parallel tests.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn isolate_account_test(name: &str) -> bool {
     if std::env::var("RUSTGIS_ACCOUNT_SCENARIO").as_deref() == Ok(name) {
@@ -2420,6 +2420,10 @@ fn imported_tasks_and_notebooks_reject_network_and_reserved_actions() {
 /// paths. A locally authored model still runs the same real plugin tool.
 #[test]
 fn imported_items_reject_resolved_plugin_tools() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if isolate_account_test("tests::imported_items_reject_resolved_plugin_tools") {
+        return;
+    }
     let mut s = world();
     plugin("eng-tool-containment", &[]);
     let tool = "plugin:eng-tool-containment/m";
@@ -8953,6 +8957,10 @@ fn plugin_tools_name_their_output_layer_with_edit_alone() {
 /// name, with edit and file requirements preserved. Process tools share the same boundary.
 #[test]
 fn plugin_bridges_cannot_run_another_plugins_tools() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if isolate_account_test("tests::plugin_bridges_cannot_run_another_plugins_tools") {
+        return;
+    }
     let mut s = world();
     for id in ["eng-bridge-owner", "eng-bridge-other"] {
         let mut pkg = rustgis_plugins::Package::from_zip(&rustgis_plugins::testing::package(id, &["edit"])).unwrap();
@@ -9405,6 +9413,10 @@ fn plugin_fetches_run_the_command_again_when_they_land() {
 
 #[test]
 fn plugin_tools_run_in_the_geoprocessing_pane() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if isolate_account_test("tests::plugin_tools_run_in_the_geoprocessing_pane") {
+        return;
+    }
     let mut s = world();
     plugin("eng-tools", &[]);
     let tools = s.run("gp.tools", &Value::Null).unwrap();
@@ -9536,6 +9548,10 @@ fn plugin_tools_run_off_the_session() {
 
 #[test]
 fn plugin_file_parameters_reach_files_and_stay_out_of_the_history() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if isolate_account_test("tests::plugin_file_parameters_reach_files_and_stay_out_of_the_history") {
+        return;
+    }
     use crate::cmd::plugins::{Reach, reaches};
     let mut s = world();
     plugin("eng-file", &["files"]);
@@ -9586,6 +9602,10 @@ fn plugin_process_child() {
 
 #[test]
 fn process_plugins_reach_the_project_like_modules() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if isolate_account_test("tests::process_plugins_reach_the_project_like_modules") {
+        return;
+    }
     let mut s = world();
     let dir = std::env::temp_dir().join(format!("rustgis-test-eng-process-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
