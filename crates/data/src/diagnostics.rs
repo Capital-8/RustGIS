@@ -910,7 +910,7 @@ mod tests {
         // swallow the rest of the message.
         for text in [
             "The saved password is missing or doesn't match this connection.",
-            "4 layer address(es) were saved without their keys, tokens or passwords: after RustGIS closes, add those layers again to give them",
+            "4 layer address(es) were saved without their keys, tokens, passwords or URL fragments; after RustGIS closes, add those layers again to restore missing values",
             "3 layer(s) read the database of the connection 'db' and need its password: right-click the connection in Data Sources › Connections, or one of the layers, and choose Log In…",
             "Set Color's step keeps its key parameter. If that is an access key, delete the step (Edit Steps) before sharing the task.",
             "Exported /data/a[1].png",

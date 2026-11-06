@@ -254,6 +254,7 @@ pub enum Public {
     Unchanged,
     Changed {
         address: String,
+        /// Omitted user-info, query pairs and fragment components; not a credential count.
         removed: u16,
     },
     /// A recognized address whose authority cannot safely be delimited; retain only its prefix.

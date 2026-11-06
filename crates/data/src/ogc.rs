@@ -2289,7 +2289,9 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 | Offer::VectorTiles { template: u, .. }
                 | Offer::Service { url: u }
                 | Offer::Coverage(Coverage { endpoint: u, .. }) => {
-                    if crate::address::Scope::of(url).is_some_and(|scope| scope.covers_below(u)) {
+                    if crate::address::Scope::of(crate::login_address::inner(url))
+                        .is_some_and(|scope| scope.covers_below(crate::login_address::inner(u)))
+                    {
                         *u = with_query(u, &format!("token={token}"));
                     } else {
                         service.withheld_addresses = service.withheld_addresses.saturating_add(1);
@@ -6224,6 +6226,21 @@ mod tests {
         let s = parse("https://gis.example.org/arcgis/rest/services/P/FeatureServer?token=abc", fs).unwrap();
         let Offer::Features { url } = &s.layers[0].offer else { panic!() };
         assert!(url.ends_with("&token=abc"), "{url}");
+        // A bound service constructs the same requests while retaining only its own login.
+        for address in [
+            "https://gis.example.org/arcgis/rest/services/P/FeatureServer",
+            "https://gis.example.org/arcgis/rest/services/P/FeatureServer?token=abc",
+        ] {
+            let expected = parse(address, fs).unwrap();
+            let bound = crate::login_address::bind("0123456789abcdef", "https://gis.example.org", address).unwrap();
+            let service = parse(&bound, fs).unwrap();
+            let Offer::Features { url } = &service.layers[0].offer else { panic!("features expected") };
+            let offered = crate::login_address::parse(url).unwrap().unwrap();
+            assert_eq!((offered.binding, offered.origin), ("0123456789abcdef", "https://gis.example.org"));
+            let Offer::Features { url: expected } = &expected.layers[0].offer else { panic!("features expected") };
+            assert_eq!(offered.url, expected, "{address}");
+            assert_eq!(service.withheld_addresses, 0, "{address}");
+        }
     }
 
     #[test]
@@ -6438,16 +6455,16 @@ mod tests {
         assert_eq!(resolve_tiles(clean, clean, tileset, false).unwrap().withheld_addresses, 0);
         // Even a suffix appended by RustGIS must pass the raw-path check. The normal style
         // stays under its service; an advertised '..' style does not inherit its token.
+        let address = "https://h.invalid/rest/services/a/VectorTileServer?token=RGSYNTH_style_20261103";
+        let bound = crate::login_address::bind("0123456789abcdef", "https://h.invalid", address).unwrap();
         for (style, withheld) in [("resources/styles", 0), ("../other/styles", 1), ("%2e%2e/other/styles", 1)] {
             let description = serde_json::json!({"defaultStyles": style});
-            let service = parse(
-                "https://h.invalid/rest/services/a/VectorTileServer?token=RGSYNTH_style_20261103",
-                description.to_string().as_bytes(),
-            )
-            .unwrap();
-            assert_eq!(service.withheld_addresses, withheld);
-            let Offer::Style { url } = &service.layers[0].offer else { panic!("expected style") };
-            assert_eq!(url.contains("RGSYNTH_style_20261103"), withheld == 0);
+            for address in [address, bound.as_str()] {
+                let service = parse(address, description.to_string().as_bytes()).unwrap();
+                assert_eq!(service.withheld_addresses, withheld, "{address}: {style}");
+                let Offer::Style { url } = &service.layers[0].offer else { panic!("expected style") };
+                assert_eq!(url.contains("RGSYNTH_style_20261103"), withheld == 0, "{address}: {style}");
+            }
         }
     }
 

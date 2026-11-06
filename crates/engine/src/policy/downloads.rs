@@ -111,6 +111,7 @@ impl Session {
     /// Taking an opaque request sends nothing. Authority is checked again when it is claimed.
     pub fn take_url_requests(&mut self) -> Vec<UrlRequest> {
         let mut live = Vec::new();
+        let mut revoked = 0;
         for request in std::mem::take(&mut self.url_requests) {
             let ok = self
                 .policy
@@ -124,8 +125,13 @@ impl Session {
                 live.push(request);
             } else {
                 self.policy.work.queued.remove(&request.key);
-                self.notify("a deferred URL request was revoked before it started", true);
+                revoked += 1;
             }
+        }
+        match revoked {
+            0 => {}
+            1 => self.notify("1 deferred URL request was revoked before it started", true),
+            n => self.notify(format!("{n} deferred URL requests were revoked before they started"), true),
         }
         live
     }

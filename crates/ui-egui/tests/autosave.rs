@@ -140,7 +140,7 @@ fn unsaved_work_is_kept_and_offered_back_after_a_crash() {
     assert_eq!(app.session.path.as_deref(), Some(std::path::absolute(&project).unwrap().as_path()), "Save writes back to its file");
     assert!(app.session.dirty(), "recovered work is unsaved");
     assert!(
-        !app.session.notices.iter().any(|n| n.text.contains("without their credentials")),
+        !app.session.notices.iter().any(|n| n.text.contains("without credentials or URL fragments")),
         "a clean recovery reports no credential loss"
     );
     // The copy is this run's now, unchanged, until the work is saved.
@@ -179,9 +179,12 @@ fn unsaved_work_is_kept_and_offered_back_after_a_crash() {
     let app = h.state();
     assert!(app.session.map().layer_by_name("Credential recovery").is_some());
     assert!(!serde_json::to_string(&app.session.project).unwrap().contains(secret), "the recovered state contains no token");
-    let losses: Vec<_> = app.session.notices.iter().filter(|n| n.text.contains("without their credentials")).collect();
+    let losses: Vec<_> = app.session.notices.iter().filter(|n| n.text.contains("without credentials or URL fragments")).collect();
     assert_eq!(losses.len(), 1, "recovery reports the credential loss once");
-    assert_eq!(losses[0].text, "1 executable step(s) were written without their credentials; supply them again before replay");
+    assert_eq!(
+        losses[0].text,
+        "1 executable step(s) were written without credentials or URL fragments; supply missing values again before replay"
+    );
     assert!(!losses[0].error);
 }
 

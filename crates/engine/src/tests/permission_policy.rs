@@ -211,6 +211,45 @@ fn permission_policy_task_content_and_trust_follow_undo() {
     assert!(!s.item_trusted("task", "Reviewed"), "undo of creation removes its content record");
 }
 
+/// A drain counts revoked requests once while preserving a current owner's queued request.
+#[test]
+fn permission_policy_revoked_url_requests_report_one_counted_notice() {
+    let mut s = world();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        s.leave_downloads = true;
+    }
+    let (revoked, live) = assistant(3401);
+    let (current, _) = assistant(3402);
+    for (scope, file) in [(&revoked, "revoked-first"), (&current, "current"), (&revoked, "revoked-second")] {
+        let call = Call::command("layer.addUrl", json!({"url":format!("https://example.invalid/{file}.geojson")}));
+        let p = pending(&s, scope, &call);
+        s.run_permitted(scope.clone(), p.allow(), &call).unwrap();
+    }
+    live.0.store(false, Ordering::SeqCst);
+    let mark = s.notice_mark();
+    let requests = s.take_url_requests();
+    assert_eq!(requests.len(), 1, "only the current owner's request survives");
+    assert_eq!(requests[0].params()["url"], "https://example.invalid/current.geojson");
+    let notices = s.notices_since(mark);
+    assert_eq!(notices.len(), 1, "one notice for both revoked requests: {notices:?}");
+    assert!(notices[0].error);
+    assert_eq!(notices[0].text, "2 deferred URL requests were revoked before they started");
+    let id = s.with_scope(current.clone(), |s| s.download_started_for(&requests[0])).unwrap().unwrap();
+    assert!(s.download_continues(id).is_ok(), "the survivor retains its original owner");
+    assert!(s.queued_authority().is_empty(), "revoked keys were retired and the survivor was claimed");
+    let mark = s.notice_mark();
+    assert!(s.take_url_requests().is_empty());
+    assert!(s.notices_since(mark).is_empty(), "a repeated empty drain is quiet");
+
+    let call = Call::command("layer.addUrl", json!({"url":"https://example.invalid/clean.geojson"}));
+    let p = pending(&s, &current, &call);
+    s.run_permitted(current, p.allow(), &call).unwrap();
+    let mark = s.notice_mark();
+    assert_eq!(s.take_url_requests().len(), 1);
+    assert!(s.notices_since(mark).is_empty(), "a clean drain is quiet");
+}
+
 /// A request has one opaque claim, refuses a foreign completion, and revokes before sending.
 #[test]
 fn permission_policy_deferred_url_claim_keeps_owner_and_generation() {

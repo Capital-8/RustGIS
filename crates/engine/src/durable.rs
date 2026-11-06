@@ -42,11 +42,11 @@ impl Report {
         for (n, text) in [
             (
                 self.addresses,
-                "layer address(es) were saved without their keys, tokens or passwords: after RustGIS closes, add those layers again to give them",
+                "layer address(es) were saved without their keys, tokens, passwords or URL fragments; after RustGIS closes, add those layers again to restore missing values",
             ),
-            (self.videos, "video address(es) were written without their keys, tokens or passwords"),
-            (self.steps, "executable step(s) were written without their credentials; supply them again before replay"),
-            (self.lines, "command line(s) were written without their credentials; supply them again before replay"),
+            (self.videos, "video address(es) were written without their keys, tokens, passwords or URL fragments"),
+            (self.steps, "executable step(s) were written without credentials or URL fragments; supply missing values again before replay"),
+            (self.lines, "command line(s) were written without credentials or URL fragments; supply missing values again before replay"),
             (self.withheld, "credential-bearing slot(s) could not be read and were withheld"),
             (self.unchecked, "step(s) contain opaque parameters that may hold credentials and were kept unchecked"),
             (self.not_retained, "address(es) exceeded the bridge retention limit; their keys will not survive a round trip"),

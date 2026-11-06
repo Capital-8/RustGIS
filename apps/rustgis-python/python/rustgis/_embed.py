@@ -209,7 +209,7 @@ class _Embedded(_Api):
                 self._hold([(notice, False) for notice in notices])
             self._sent_notices = notices
             if keys > self._sent_keys:
-                self._hold([(f"{keys} layer address(es) went to the map widget without their keys: those layers stay empty there", False)])
+                self._hold([(f"{keys} layer address(es) went to the map widget without their keys or URL fragments; restore missing values if needed", False)])
             self._sent_keys = keys
         except RustGISError as e:
             self._hold([(f"couldn't show the project in the app: {e}", True)])

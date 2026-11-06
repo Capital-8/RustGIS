@@ -138,6 +138,28 @@ fn durable_empty_query_pairs_preserve_clean_urls_and_report_real_loss() {
     }
 }
 
+/// Fragments are deliberately omitted, but their notice must not call them credentials.
+#[test]
+fn durable_fragment_removal_is_reported_accurately_and_clean_addresses_stay_quiet() {
+    for fragment in ["", "#section", "#token=RGSYNTH_fragment"] {
+        let url = format!("https://h.invalid/tiles/{{z}}/{{x}}/{{y}}.png{fragment}");
+        let mut project = Project::default();
+        project.map_mut().tiles.push(rustgis_map::TileLayer::new("Fragment", rustgis_map::TileKind::Raster, &url));
+        let (saved, report) = project.saved_text(None).unwrap();
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["maps"][0]["tiles"][0]["url"], "https://h.invalid/tiles/{z}/{x}/{y}.png");
+        assert_eq!(project.map().tiles[0].url, url);
+        assert_eq!(report.layer_addresses(), u32::from(!fragment.is_empty()));
+        if fragment.is_empty() {
+            assert!(report.notices().is_empty());
+        } else {
+            let notices = report.notices();
+            assert_eq!(notices.len(), 1);
+            assert!(notices[0].contains("URL fragments"), "{notices:?}");
+        }
+    }
+}
+
 #[test]
 fn durable_clean_and_opaque_content_keep_their_meaning() {
     let mut s = marked();
@@ -203,6 +225,89 @@ fn durable_clean_and_opaque_content_keep_their_meaning() {
     s.project.tasks[0].steps[0].params = json!({"url": "rustgis-s3:broken:RGSYNTH_output_20261103"});
     let (text, report) = s.project.saved_text(None).unwrap();
     assert!(!text.contains(SECRET) && report.withheld > 0);
+}
+
+/// Address lists clean string leaves, while opaque values keep their data and say so.
+#[test]
+fn durable_address_roles_report_opaque_shapes_without_rewriting_data() {
+    let public = "https://h.invalid/a?layer=1";
+    let secret = format!("{public}&token={SECRET}");
+    let opaque = json!({"url":{"href":secret}});
+    let nested = json!({"urls":[[secret]]});
+    let clean_object = json!({"url":{"href":public}});
+    for (params, expected, steps, unchecked) in [
+        (json!({"url":public}), json!({"url":public}), 0, 0),
+        (json!({"urls":[secret]}), json!({"urls":[public]}), 1, 0),
+        (clean_object.clone(), clean_object, 0, 0),
+        (opaque.clone(), opaque, 0, 1),
+        (nested.clone(), nested, 0, 1),
+    ] {
+        let mut project = Project::default();
+        project.tasks.push(Task {
+            name: "Address shapes".into(),
+            description: String::new(),
+            steps: vec![TaskStep {
+                title: String::new(),
+                instructions: String::new(),
+                command: "layer.addUrl".into(),
+                params: params.clone(),
+            }],
+        });
+        let before = serde_json::to_value(&project).unwrap();
+        let (text, report) = project.saved_text(None).unwrap();
+        let written: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(written["tasks"][0]["steps"][0]["params"], expected);
+        assert_eq!(serde_json::to_value(&project).unwrap(), before);
+        assert_eq!((report.steps, report.unchecked, report.withheld), (steps, unchecked, 0), "{params}");
+        assert_eq!(report.notices().len(), usize::from(steps > 0) + usize::from(unchecked > 0));
+        if unchecked > 0 {
+            assert_eq!(report.notices(), ["1 step(s) contain opaque parameters that may hold credentials and were kept unchecked"]);
+        }
+        assert!(!crate::log_params(&params).into_log_value().to_string().contains(SECRET), "logs have a separate stricter policy");
+    }
+}
+
+/// A newer embedded project must not be rewritten with this writer's schema or version.
+#[test]
+fn durable_future_documents_keep_their_exact_text_unchecked() {
+    let mut future = Project::default();
+    future.map_mut().tiles.push(rustgis_map::TileLayer::new(
+        "Future",
+        rustgis_map::TileKind::Raster,
+        format!("https://h.invalid/{{z}}/{{x}}/{{y}}.png?token={SECRET}"),
+    ));
+    let mut document = serde_json::to_value(&future).unwrap();
+    let format = crate::project::FORMAT + 1;
+    document["format"] = json!(format);
+    document["futureRequired"] = json!({"meaning":"preserve this unknown field"});
+    let source = serde_json::to_string_pretty(&document).unwrap();
+    for command in ["project.openText", "map.import"] {
+        let mut project = Project::default();
+        project.tasks.push(Task {
+            name: "Future document".into(),
+            description: String::new(),
+            steps: vec![TaskStep {
+                title: String::new(),
+                instructions: String::new(),
+                command: command.into(),
+                params: json!({"text":source}),
+            }],
+        });
+        let before = serde_json::to_value(&project).unwrap();
+        let (text, report) = project.saved_text(None).unwrap();
+        let written: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(written["tasks"][0]["steps"][0]["params"]["text"], source, "{command}: future document bytes stay exact");
+        let embedded: Value = serde_json::from_str(written["tasks"][0]["steps"][0]["params"]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(embedded["format"], format);
+        assert_eq!(embedded["futureRequired"], document["futureRequired"]);
+        assert_eq!(serde_json::to_value(&project).unwrap(), before);
+        assert_eq!((report.steps, report.unchecked, report.withheld), (0, 1, 0));
+        assert_eq!(report.notices(), ["1 step(s) contain opaque parameters that may hold credentials and were kept unchecked"]);
+    }
+    let malformed = source.strip_suffix('}').unwrap();
+    let (clean, report) = crate::roles::command("project.openText", &json!({"text":malformed}), 0);
+    assert_eq!(clean.unwrap()["text"], "[parameters withheld]", "malformed credential-bearing text keeps its existing handling");
+    assert_eq!((report.withheld, report.unchecked), (1, 0));
 }
 
 #[test]

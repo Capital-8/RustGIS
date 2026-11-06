@@ -17,9 +17,10 @@ pub fn public_label(s: &str) -> Option<String> {
         let (_, raw) = t.split_once("://")?;
         let authority = raw.split(['/', '?', '#']).next()?;
         let path = raw.get(authority.len()..)?.split(['?', '#']).next()?;
-        // A path `@` after userinfo may be a malformed password tail. Refuse ambiguous output
-        // rather than choosing another host; percent-encode a database name's `@` to keep it.
-        if authority.contains('@') && path.contains('@') {
+        // A path `@` after userinfo, or several path `@`s, can be a malformed password tail.
+        // Refuse ambiguous output rather than choosing another host; percent-encode a
+        // database name's `@` to keep it.
+        if (authority.contains('@') && path.contains('@')) || path.matches('@').nth(1).is_some() {
             return None;
         }
         let public = split_secrets(t, SECRET_KEYS).0;
@@ -245,6 +246,8 @@ mod tests {
             "postgresql://user:p@ss/word@host.invalid/db",
             "postgresql://user@ss/word@host.invalid/db",
             "postgresql://user@host.invalid/db@tag",
+            "postgresql://user:pass/word@host.invalid/db@tag",
+            "postgresql://user:pass/word@host.invalid/db@tag@tail",
         ] {
             assert_eq!(super::public_label(ambiguous), None, "{ambiguous}");
         }

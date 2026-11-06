@@ -41,6 +41,12 @@ pub enum Document {
     Model,
 }
 
+/// Compatibility metadata is read before any embedded document uses this version's types.
+#[derive(serde::Deserialize)]
+struct DocumentFormat {
+    format: u64,
+}
+
 const WITHHELD: &str = "[parameters withheld]";
 const NESTED: &str = "[withheld: nested too deep]";
 const DATA: &[&str] = &[
@@ -172,6 +178,12 @@ fn object(id: &str, value: &Value, depth: usize, config_depth: usize, registered
             if v.is_object() && registered && (role == Some(Role::Configuration) || CONFIG.contains(&k.as_str())) {
                 object("", v, depth, config_depth + 1, true, report)
             } else {
+                // String leaves are cleaned below; opaque shapes keep their meaning.
+                unchecked |= match v {
+                    Value::Object(_) => suspicious(v),
+                    Value::Array(a) => a.iter().any(|v| !v.is_string() && suspicious(v)),
+                    _ => false,
+                };
                 address(v, report)
             }
         } else if registered && (role == Some(Role::Configuration) || CONFIG.contains(&k.as_str())) && v.is_object() {
@@ -331,6 +343,10 @@ impl Durable for VecSteps {
 /// access. Unchanged documents keep their exact text; only changed typed copies are serialized.
 fn document(kind: Document, v: &Value, depth: usize, report: &mut Report) -> Option<Value> {
     let Some(text) = v.as_str().filter(|s| s.len() as u64 <= crate::project::MAX_BYTES) else { return invalid(v, report) };
+    if serde_json::from_str::<DocumentFormat>(text).is_ok_and(|f| f.format > u64::from(crate::project::FORMAT)) {
+        report.unchecked = report.unchecked.saturating_add(1);
+        return None;
+    }
     let result = match kind {
         Document::Project => text_document::<crate::Project>(text, depth),
         Document::Map => {
