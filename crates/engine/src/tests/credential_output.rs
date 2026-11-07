@@ -530,7 +530,7 @@ fn peer_video_credential_losses_are_counted() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn short_basic_passwords_are_scrubbed_only_from_output_while_active() {
-    if isolate_account_test("tests::credential_output::short_basic_passwords_are_scrubbed_only_from_output_while_active") {
+    if isolate_process_test("tests::credential_output::short_basic_passwords_are_scrubbed_only_from_output_while_active") {
         return;
     }
     use crate::render::rustgis_tiles::logins;
@@ -566,6 +566,7 @@ fn durable_database_origins_clean_each_owned_field_without_opening_a_database() 
         ("mysql", "mysql", "/source/mysql/database"),
         ("sqlserver", "mssql", "/source/sqlserver/database"),
         ("duckdb", "postgresql", "/source/duckdb/database"),
+        ("gdal+duckdb", "postgresql", "/source/duckdb/database"),
     ] {
         for private in [false, true] {
             let public = format!("{scheme}://reader@db-origin.invalid/gis");
@@ -574,14 +575,17 @@ fn durable_database_origins_clean_each_owned_field_without_opening_a_database() 
             let dataset = rustgis_data::Dataset::new("Origin", rustgis_data::GeometryType::None, Vec::new());
             let mut layer = serde_json::to_value(rustgis_map::Layer::new(1, dataset)).unwrap();
             let mut origin = json!({"database":address, "table":"rows"});
-            if role == "duckdb" {
+            if matches!(role, "duckdb" | "gdal+duckdb") {
                 origin["family"] = json!("Points");
             }
             if role == "edit" {
                 layer["postgis"] = json!({"origin":origin, "key":"id", "srid":4326, "writable":false});
             } else {
                 layer["source"] = json!({});
-                layer["source"][role] = origin;
+                layer["source"][if role == "gdal+duckdb" { "duckdb" } else { role }] = origin;
+                if role == "gdal+duckdb" {
+                    layer["source"]["gdal"] = json!({"path":"unused.geojson", "layer":"rows"});
+                }
             }
             let mut project = Project::default();
             project.map_mut().layers.push(serde_json::from_value(layer).unwrap());
@@ -611,6 +615,13 @@ fn durable_database_origins_clean_each_owned_field_without_opening_a_database() 
                     Vec::new()
                 };
                 assert_eq!(report.notices(), notices, "{kind}: {role}");
+            }
+            if role == "gdal+duckdb" {
+                let mark = s.notice_mark();
+                let (_, bytes) = crate::cmd::items::item_bytes(&mut s, "layer", &json!({"layer":1})).unwrap();
+                let written: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(written, expected["maps"][0]["layers"][0]);
+                assert_eq!(s.notices_since(mark).len(), usize::from(private), "layer export has one aggregate notice or none");
             }
             assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "{role}: all output rolls back live fields");
         }
@@ -694,7 +705,10 @@ fn nested_notebook_source_stays_opaque_but_is_reported_unchecked() {
             assert_eq!(report.steps, 0);
         }
     }
-    assert_eq!(crate::log_params(&json!({"key":"abc", "source":{"url":"https://h.invalid/a"}})).into_log_value()["key"], "");
+    for url in ["https://h.invalid/a", "pg:host=h dbname=gis", "mariadb://h/gis", "pmtiles:https://h.invalid/a", "cog:https://h.invalid/a"]
+    {
+        assert_eq!(crate::log_params(&json!({"key":"abc", "source":{"url":url}})).into_log_value()["key"], "", "{url}");
+    }
     assert_eq!(crate::log_params(&json!({"key":"abc", "data":{"url":"https://h.invalid/a"}})).into_log_value()["key"], "abc");
 }
 
@@ -702,7 +716,7 @@ fn nested_notebook_source_stays_opaque_but_is_reported_unchecked() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn bridge_round_trip_reopens_its_protected_reader() {
-    if super::isolate_account_test("tests::credential_output::bridge_round_trip_reopens_its_protected_reader") {
+    if super::isolate_process_test("tests::credential_output::bridge_round_trip_reopens_its_protected_reader") {
         return;
     }
     use rustgis_data::source::{fgb, remote};
@@ -749,6 +763,33 @@ fn failed_collections_discovery_retains_its_counted_query_notice() {
         assert_eq!(messages.len(), count);
         if count > 0 {
             assert!(messages[0].text.starts_with("1 address(es)"));
+        }
+    }
+}
+
+/// Coverage reports discovery omissions even when the selected coverage is missing.
+#[test]
+fn coverage_discovery_retains_its_counted_query_notice() {
+    for (query, count) in [("", 0), ("?token=RGSYNTH_coverage", 1)] {
+        let mut s = Session::new(Project::default());
+        let p = json!({"url":format!("https://coverage.invalid/root{query}"), "type":"ogcapi", "layer":"missing",
+            "text":json!({"links":[{"rel":"data", "type":"application/json", "href":"/catalog"}]}).to_string(),
+            "documents":[{"url":"https://coverage.invalid/catalog", "text":"{\"collections\":[]}"}]});
+        assert!(s.run("service.coverage", &p).unwrap_err().contains("no coverage"));
+        assert_eq!(s.notices.iter().filter(|n| n.text.contains("address(es) the service listed")).count(), count);
+    }
+}
+
+/// Capabilities are opaque protocol documents, distinct from user feature data and expressions.
+#[test]
+fn supplied_service_documents_are_preserved_with_counted_unchecked_notices() {
+    for command in ["service.layers", "service.add", "service.coverage", "service.import", "service.groupPlan"] {
+        for private in [false, true] {
+            let text = if private { "<href>https://h.invalid/a?token=RGSYNTH_document</href>" } else { "<href>https://h.invalid/a</href>" };
+            let (clean, report) = crate::roles::command(command, &json!({"text":text}), 0);
+            assert!(clean.is_none(), "{command}: protocol documents keep exact bytes");
+            assert_eq!(report.unchecked, u32::from(private), "{command}: {report:?}");
+            assert_eq!(report.notices().len(), usize::from(private));
         }
     }
 }

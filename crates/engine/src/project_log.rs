@@ -144,9 +144,24 @@ pub(crate) fn address_context(key: &str, v: &Value, depth: usize) -> bool {
     match v {
         Value::String(s) => {
             let s = s.trim_start();
-            ["http://", "https://", "s3://", "rustgis-login:", "rustgis-s3:", "postgres:", "postgresql:", "mysql:", "mssql:"]
-                .iter()
-                .any(|prefix| s.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
+            [
+                "http://",
+                "https://",
+                "s3://",
+                "rustgis-login:",
+                "rustgis-anonymous:",
+                "rustgis-s3:",
+                "postgres:",
+                "postgresql:",
+                "pg:",
+                "mysql:",
+                "mariadb:",
+                "mssql:",
+                "pmtiles:",
+                "cog:",
+            ]
+            .iter()
+            .any(|prefix| s.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
         }
         Value::Array(values) => values.iter().take(LOG_LIST_ITEMS).any(|v| address_context("", v, depth + 1)),
         Value::Object(values) => values.iter().any(|(key, v)| address_context(key, v, depth + 1)),

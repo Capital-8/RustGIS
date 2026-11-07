@@ -46,7 +46,7 @@ pub fn commands() -> Vec<C> {
             r#"{"id": "a saved S3 connection's id or name"} (deletes stored keys; a login in this session keeps working)"#,
         ),
         C::new("connection.resolveS3", "Choose S3 Connection", "Home › Add › Data Sources", resolve_s3).roles(&[]).view().params(
-            r#"{"source": "a pending project S3 source address", "id": "a candidate saved connection id"} → {id, reopened, failed}: explicitly grants this bucket and opens only its waiting sources"#,
+            r#"{"source": "a pending project S3 source address", "id": "a candidate saved connection id"} → {id, reopened, failed, reading}: explicitly grants this bucket and opens only its waiting sources; reading counts the rasters read in place whose overview is still being read (the desktop doesn't wait for it: it lands as the map draws, and one that fails is said then)"#,
         ),
         C::new("connection.forgetPassword", "Forget Saved Password", "Home › Add › Data Sources", forget_password).roles(&[]).view().params(r#"{"id": "a database connection's id or name"}"#),
         C::new("connection.test", "Test Connection", "Home › Add › Data Sources", test).roles(&[]).view().params(
@@ -430,12 +430,26 @@ struct Reopened {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn reopen(s: &mut Session, c: &Connection, saved: bool, session: bool, all_unopened: bool) -> Reopened {
+#[derive(Clone, Copy)]
+enum ReopenMode {
+    Automatic,
+    Login { all_unopened: bool },
+}
+
+/// Reopens this connection's database sources and aggregates refusals. Automatic resolution
+/// preserves peer reconnect barriers; only an explicit matching login releases them.
+#[cfg(not(target_arch = "wasm32"))]
+fn reopen(s: &mut Session, c: &Connection, saved: bool, session: bool, mode: ReopenMode) -> Reopened {
     let Some(key) = crate::connections::database_key(&c.address) else { return Reopened::default() };
     let mut result = Reopened::default();
     let mut first_error = None;
     for layer in s.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
-        let Some(src) = layer.source.as_mut().filter(|src| src.login || all_unopened && !src.is_open()) else { continue };
+        let Some(src) = layer.source.as_mut().filter(|src| match mode {
+            ReopenMode::Automatic => !src.reconnect_required() && !src.is_open(),
+            ReopenMode::Login { all_unopened } => src.login || src.reconnect_required() || all_unopened && !src.is_open(),
+        }) else {
+            continue;
+        };
         let Some((kind, database)) = crate::connections::layer_database(src) else { continue };
         if kind != key.0 || crate::connections::database_key(&crate::sources::redact(database)).as_ref() != Some(&key) {
             continue;
@@ -447,6 +461,9 @@ fn reopen(s: &mut Session, c: &Connection, saved: bool, session: bool, all_unope
             src.error = first_error.clone();
             result.failed += 1;
             continue;
+        }
+        if matches!(mode, ReopenMode::Login { .. }) {
+            src.allow_reconnect();
         }
         src.error = None;
         match src.open() {
@@ -606,7 +623,7 @@ fn login(s: &mut Session, c: &Connection, p: &Value) -> Result<Reopened, String>
                     &key.1,
                     &c.id,
                     pw,
-                    || reopen(s, c, false, false, all_unopened),
+                    || reopen(s, c, false, false, ReopenMode::Login { all_unopened }),
                     |result| result.refused,
                 )
             } else {
@@ -619,7 +636,7 @@ fn login(s: &mut Session, c: &Connection, p: &Value) -> Result<Reopened, String>
                     activate(s, c, password.expose());
                 }
                 let session = password.is_some() && !saved;
-                reopen(s, c, saved, session, all_unopened)
+                reopen(s, c, saved, session, ReopenMode::Login { all_unopened })
             };
             if let Some(pw) = &typed
                 && !result.refused

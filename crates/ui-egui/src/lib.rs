@@ -4409,7 +4409,23 @@ impl RustGisApp {
     /// coverage is then asked for the view and downloaded as From URL… does).
     fn poll_service_steps(&mut self) {
         use rustgis_engine::data::ogc::{TilesStep, resolve_tiles};
-        for step in std::mem::take(&mut self.ui.service_steps) {
+        let steps = std::mem::take(&mut self.ui.service_steps);
+        // A read in the new project can display the same title as a retired read. Preserve
+        // progress belonging to that live generation, even before its answer has landed.
+        let current: std::collections::HashSet<String> = steps
+            .iter()
+            .filter_map(|step| {
+                let (params, dialog, opened, message) = match step {
+                    ServiceStep::Tiles { resolve, dialog, opened, .. } => {
+                        (&resolve.params, *dialog, *opened, "Reading the tileset of {name}")
+                    }
+                    ServiceStep::Coverage { params, dialog, opened, .. } => (params, *dialog, *opened, "Describing {name}"),
+                };
+                (dialog && opened == self.session.opened)
+                    .then(|| i18n::fmt(message, &[("name", params.get("name").and_then(Value::as_str).unwrap_or(""))]))
+            })
+            .collect();
+        for step in steps {
             match step {
                 ServiceStep::Tiles { mut resolve, dialog, origin, opened } => {
                     let pending = dialog.then(|| {
@@ -4418,7 +4434,7 @@ impl RustGisApp {
                             &[("name", resolve.params.get("name").and_then(Value::as_str).unwrap_or(""))],
                         )
                     });
-                    if !self.service_read_current(opened, &resolve.doc, pending.as_deref()) {
+                    if !self.service_read_current(opened, &resolve.doc, pending.as_deref().filter(|message| !current.contains(*message))) {
                         continue;
                     }
                     let Some(r) = resolve.slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
@@ -4479,7 +4495,11 @@ impl RustGisApp {
                 ServiceStep::Coverage { mut params, slot, dialog, origin, opened } => {
                     let pending = dialog
                         .then(|| i18n::fmt("Describing {name}", &[("name", params.get("name").and_then(Value::as_str).unwrap_or(""))]));
-                    if !self.service_read_current(opened, params.get("url").and_then(Value::as_str).unwrap_or(""), pending.as_deref()) {
+                    if !self.service_read_current(
+                        opened,
+                        params.get("url").and_then(Value::as_str).unwrap_or(""),
+                        pending.as_deref().filter(|message| !current.contains(*message)),
+                    ) {
                         continue;
                     }
                     let Some(r) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
@@ -4494,7 +4514,11 @@ impl RustGisApp {
                         let connection = params.as_object_mut().and_then(|p| p.remove("connection"));
                         let get = c.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                         let mut p = json!({"url": get, "name": title, "coverage": true});
-                        if let Some(connection) = connection {
+                        if params.get("anonymous").and_then(Value::as_bool) == Some(true)
+                            || c.get("anonymous").and_then(Value::as_bool) == Some(true)
+                        {
+                            p["anonymous"] = json!(true);
+                        } else if let Some(connection) = connection {
                             p["connection"] = connection;
                         }
                         connectiontree::run_add_url(self, p, origin.as_deref())
@@ -4631,6 +4655,10 @@ impl RustGisApp {
         // Plugin commands that waited for `host.fetch` answers (the browser) run again once
         // they are in; their errors are notices already.
         pluginstart::run_again(self, ctx);
+        // A raster read in place whose overview couldn't be read is read again once its wait is over.
+        self.session.read_in_place_again();
+        // Rasters read in place whose pixels landed since (the browser) say what they lost.
+        self.session.notice_landed_rasters();
         // A frame may not come until the user moves: look again while commands wait.
         if self.session.plugin_retries_waiting() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -4903,6 +4931,7 @@ impl RustGisApp {
         graphicformat::save_draft(self);
         dialogs::show(self, &ctx);
         layerchooser::show(self, &ctx);
+        analysispane::script_details(self, &ctx);
         mapview::confirm_delete(self, &ctx);
         autosave::offer(self, &ctx);
         saveprompt::show(self, &ctx);
@@ -5601,41 +5630,53 @@ mod download_service_tests {
     #[test]
     fn retired_service_steps_clear_only_their_own_pending_dialog() {
         for coverage in [false, true] {
-            for newer in [false, true] {
+            for newer in 0..3 {
                 let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
                 let opened = app.session.opened;
                 let params = json!({"url":"https://retired.invalid/service", "name":"Old read"});
                 let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let step = if coverage {
-                    super::ServiceStep::Coverage { params, slot: slot.clone(), dialog: true, origin: None, opened }
-                } else {
-                    super::ServiceStep::Tiles {
-                        resolve: super::TilesResolve {
-                            params,
-                            list: "https://retired.invalid/list".into(),
-                            doc: "https://retired.invalid/list".into(),
-                            crossed_origin: false,
-                            read: 0,
-                            withheld_addresses: 0,
-                            vector: false,
-                            fallback: "https://retired.invalid/{z}/{y}/{x}".into(),
-                            slot: slot.clone(),
-                        },
-                        dialog: true,
-                        origin: None,
-                        opened,
+                let step = |opened, slot: std::sync::Arc<std::sync::Mutex<Option<Result<Vec<u8>, String>>>>| {
+                    if coverage {
+                        super::ServiceStep::Coverage { params: params.clone(), slot, dialog: true, origin: None, opened }
+                    } else {
+                        super::ServiceStep::Tiles {
+                            resolve: super::TilesResolve {
+                                params: params.clone(),
+                                list: "https://retired.invalid/list".into(),
+                                doc: "https://retired.invalid/list".into(),
+                                crossed_origin: false,
+                                read: 0,
+                                withheld_addresses: 0,
+                                vector: false,
+                                fallback: "https://retired.invalid/{z}/{y}/{x}".into(),
+                                slot: slot.clone(),
+                            },
+                            dialog: true,
+                            origin: None,
+                            opened,
+                        }
                     }
                 };
-                app.ui.service_steps.push(step);
+                app.ui.service_steps.push(step(opened, slot.clone()));
                 app.session.run("project.new", &json!({})).unwrap();
                 let pending = if coverage { "Describing Old read" } else { "Reading the tileset of Old read" };
-                app.dialogs.info = Some(if newer { "New operation" } else { pending }.into());
+                if newer == 2 {
+                    app.ui.service_steps.push(step(app.session.opened, Default::default()));
+                }
+                app.dialogs.info = Some(if newer == 1 { "New operation" } else { pending }.into());
                 *slot.lock().unwrap() = Some(Ok(b"late completion".to_vec()));
                 app.poll_service_steps();
-                assert!(app.ui.service_steps.is_empty());
+                assert_eq!(app.ui.service_steps.len(), usize::from(newer == 2));
                 assert!(app.session.map().tiles.is_empty() && app.session.map().layers.is_empty());
                 assert!(app.session.notices.iter().any(|n| n.text.contains("its project was closed while it was read")));
-                assert_eq!(app.dialogs.info.as_deref(), if newer { Some("New operation") } else { None });
+                assert_eq!(
+                    app.dialogs.info.as_deref(),
+                    match newer {
+                        1 => Some("New operation"),
+                        2 => Some(pending),
+                        _ => None,
+                    }
+                );
             }
         }
     }

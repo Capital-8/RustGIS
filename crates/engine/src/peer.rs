@@ -173,6 +173,7 @@ fn source_choice(layer: Option<&rustgis_map::Layer>) -> Result<Option<String>, (
     let raster = layer.raster.as_ref().map(|r| {
         (
             r.path.as_deref().map(public),
+            r.in_place,
             &r.file_name,
             r.embedded.as_deref(),
             &r.subdataset,
@@ -232,10 +233,16 @@ impl Exchange {
         let mut held = 0usize;
         let mut omitted = 0u32;
         for slot in slots(p) {
-            if wrapped(slot.value) {
+            if wrapped(slot.value) || slot.layer.and_then(|l| l.source.as_ref()).is_some_and(|s| s.reconnect_required()) {
                 continue;
             }
+            // A clean database address may still use a typed password held by its driver.
+            let database = slot
+                .layer
+                .and_then(|l| l.source.as_ref())
+                .is_some_and(|s| s.postgis.is_some() || s.mysql.is_some() || s.sqlserver.is_some() || s.duckdb.is_some());
             let public = match durable::public_address(slot.value) {
+                Kept::Unchanged if database => slot.value.to_string(),
                 Kept::Unchanged => continue,
                 Kept::Changed(s) => s,
                 Kept::Withheld(prefix) => prefix.into(),
@@ -309,6 +316,9 @@ impl Exchange {
                 };
                 (!e.ambiguous
                     && raw.contains(&e.key)
+                    && !current
+                        .get(&slot.key)
+                        .is_some_and(|(_, _, layer)| layer.and_then(|l| l.source.as_ref()).is_some_and(|s| s.reconnect_required()))
                     && *count == 1
                     && accounts.get(e.public.as_str()) == Some(&Some(e.full.as_str()))
                     && unique(&current, &e.full)
@@ -342,11 +352,14 @@ fn reopen(p: &mut Project, at: &At) {
         rustgis_map::LayerRole::Streamed
         | rustgis_map::LayerRole::PostgisDatabase
         | rustgis_map::LayerRole::MysqlDatabase
-        | rustgis_map::LayerRole::SqlServerDatabase => {
-            if let Some(source) = &mut layer.source
-                && let Err(e) = source.reopen()
-            {
-                source.error = Some(rustgis_data::diagnostics::Redacted::new(&e).into_string());
+        | rustgis_map::LayerRole::SqlServerDatabase
+        | rustgis_map::LayerRole::DuckDbDatabase
+        | rustgis_map::LayerRole::GdalPath => {
+            if let Some(source) = &mut layer.source {
+                source.allow_reconnect();
+                if let Err(e) = source.reopen() {
+                    source.error = Some(rustgis_data::diagnostics::Redacted::new(&e).into_string());
+                }
             }
         }
         rustgis_map::LayerRole::Raster => {
@@ -408,13 +421,31 @@ impl Session {
         let mut p = Project::from_peer_raw(text)?;
         let exchange = self.exchange.as_ref().filter(|e| peer == Peer::Bridge && e.generation == self.opened);
         let raw = exchange.map(|e| e.incoming(&p));
+        // Normalization may open a database with a typed process-local password. Keep every
+        // incoming database source closed until last/live/raw/normalized selection agrees.
+        for map in p.maps.iter_mut().chain(p.offline_areas.iter_mut().map(|a| &mut a.data)) {
+            for source in map.layers.iter_mut().filter_map(|l| l.source.as_mut()) {
+                if source.postgis.is_some() || source.mysql.is_some() || source.sqlserver.is_some() || source.duckdb.is_some() {
+                    source.require_reconnect();
+                }
+            }
+        }
         crate::cmd::connections::clear_active();
-        p.normalize();
+        p.normalize_opened();
         let mut report = Report::default();
 
         if let (Some(exchange), Some(raw)) = (exchange, raw) {
             exchange.retain(&self.project, &mut p, &raw);
         }
+        report.reconnect = p
+            .maps
+            .iter()
+            .chain(p.offline_areas.iter().map(|a| &a.data))
+            .flat_map(|m| &m.layers)
+            .filter(|l| l.source.as_ref().is_some_and(|s| s.reconnect_required()))
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX);
         let incoming = census(&p);
         report.lost = slots(&self.project)
             .into_iter()
@@ -483,5 +514,17 @@ mod tests {
             }
             assert_eq!(exchange.incoming(&p).len(), usize::from(change == "style"), "{change}");
         }
+        // Reading a raster in place changes its source selection, not just its drawing style.
+        let mut p = Project::default();
+        let mut raster = rustgis_map::raster::RasterLayer::unread_in_place("https://choice.invalid/scene.tif?token=RGSYNTH_raster_choice");
+        raster.in_place = false;
+        p.map_mut().add_raster("Scene", raster);
+        let mut s = Session::new(p);
+        let (public, _) = s.peer_text(Peer::Bridge).unwrap();
+        let exchange = s.exchange.as_ref().unwrap();
+        let mut incoming = Project::from_peer_raw(&public).unwrap();
+        assert_eq!(exchange.incoming(&incoming).len(), 1);
+        incoming.maps[0].layers[0].raster.as_mut().unwrap().in_place = true;
+        assert!(exchange.incoming(&incoming).is_empty(), "a changed raster read mode cannot retain credentials");
     }
 }

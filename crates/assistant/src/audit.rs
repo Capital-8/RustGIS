@@ -334,8 +334,12 @@ mod tests {
         assert!(!args.to_string().contains("RGSYNTH_comment"));
         assert!(!redact_script(comments).contains("RGSYNTH_comment"));
         assert!(redact_script(comments).starts_with("# clean comment\n"));
-        let nested = json!({"key":"abc", "source":{"url":"https://h.invalid/data"}});
-        assert_eq!(normalized_args("run_command", &json!({"command":"plugin.unknown", "params":nested}))["params"]["key"], "");
+        for url in
+            ["https://h.invalid/data", "pg:host=h dbname=gis", "mariadb://h/gis", "pmtiles:https://h.invalid/a", "cog:https://h.invalid/a"]
+        {
+            let nested = json!({"key":"abc", "source":{"url":url}});
+            assert_eq!(normalized_args("run_command", &json!({"command":"plugin.unknown", "params":nested}))["params"]["key"], "", "{url}");
+        }
         let document =
             json!({"type": "FeatureCollection", "features": [], "padding": "x".repeat(250), "token": "RGSYNTH_data_20261103"}).to_string();
         let arguments = json!({"command": "layer.addDataText", "params": {"text": document}});

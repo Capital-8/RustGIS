@@ -22,6 +22,7 @@ pub struct Report {
     pub(crate) lost: u32,
     pub(crate) not_retained: u32,
     pub(crate) executable_changes: u32,
+    pub(crate) reconnect: u32,
 }
 
 impl Report {
@@ -52,6 +53,7 @@ impl Report {
             (self.unchecked, "step(s) contain opaque parameters that may hold credentials and were kept unchecked"),
             (self.not_retained, "address(es) exceeded the bridge retention limit; their keys will not survive a round trip"),
             (self.lost, "address(es) lost their keys when a peer sent back its project; add them again in the receiving session"),
+            (self.reconnect, "database source(s) from a peer require an explicit reconnect before reading"),
             (
                 self.executable_changes,
                 "credential-bearing executable field(s) changed when a peer sent back its project; supply missing values before replay",
@@ -87,6 +89,7 @@ impl Report {
         self.lost = self.lost.saturating_add(other.lost);
         self.not_retained = self.not_retained.saturating_add(other.not_retained);
         self.executable_changes = self.executable_changes.saturating_add(other.executable_changes);
+        self.reconnect = self.reconnect.saturating_add(other.reconnect);
     }
 }
 
@@ -662,7 +665,8 @@ fn public_address_at(address: &str, depth: usize) -> Kept {
     }
 }
 
-/// Emits the report only after rollback, when the session is whole again.
+/// Emits preparation losses after the durable projection's journal has restored live fields.
+/// This does not confirm delivery or commit the enclosing command's notices.
 pub(crate) fn notify(s: &mut crate::Session, report: &Report) {
     for text in report.notices() {
         s.notify(format!("Prepared output: {text}"), false);

@@ -671,6 +671,9 @@ fn follow(s: &mut Session, wait: bool) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let mut errors = Vec::new();
+        // A worker may finish between layers of the same slice. Match every layer against
+        // one completion batch so the failure is reported once with all affected layers.
+        let failures = if wait { Vec::new() } else { failed_reads().lock().map(|f| f.clone()).unwrap_or_default() };
         let mut ahead: Vec<(ZarrTime, usize)> = Vec::new();
         let mut said_failed: Vec<String> = Vec::new();
         // The steps layers wait for off the frame: a failure kept for any other is dropped, so
@@ -707,7 +710,7 @@ fn follow(s: &mut Session, wait: bool) {
                             continue;
                         }
                         // Said for every layer on that step, then dropped (below).
-                        let failed = failed_reads().lock().ok().and_then(|f| f.iter().find(|(k, _)| *k == key).map(|(_, e)| e.clone()));
+                        let failed = failures.iter().find(|(k, _)| *k == key).map(|(_, e)| e.clone());
                         if failed.is_some() {
                             said_failed.push(key.clone());
                         }

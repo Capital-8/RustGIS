@@ -526,6 +526,13 @@ pub(crate) fn resolve_file_paths<'a>(dir: &str, paths: impl IntoIterator<Item = 
     }
 }
 
+/// Whether `path` is a plain `http://` or `https://` address: not a login or S3 wrapper, which a
+/// raster layer downloads whole.
+fn plain_web_address(path: &str) -> bool {
+    let scheme = path.get(..8).map(str::to_ascii_lowercase).unwrap_or_default();
+    scheme.starts_with("https://") || scheme.starts_with("http://")
+}
+
 /// Read only compatibility metadata before interpreting any saved payload.
 #[derive(Deserialize)]
 struct FileFormat {
@@ -726,6 +733,19 @@ impl Project {
 
     /// Repairs invariants after loading (at least one map; a valid active index).
     pub fn normalize(&mut self) {
+        self.repair(false);
+    }
+
+    /// [`Project::normalize`] for a project read from its file, which also opens its plain COG
+    /// tile layers (a project saved before GeoTIFFs read in place were raster layers, or with
+    /// those `map.addTiles` adds) as raster layers read in place: as the project opens only. A
+    /// later repair (a layer file added, maps imported) leaves a tile layer added this session
+    /// as it is.
+    pub(crate) fn normalize_opened(&mut self) {
+        self.repair(true);
+    }
+
+    fn repair(&mut self, opened: bool) {
         if self.maps.is_empty() {
             self.maps.push(Map::new("Map"));
         }
@@ -835,6 +855,28 @@ impl Project {
             }
             // Tile layers with an address that can't be fetched (a hand edit) are dropped.
             m.tiles.retain_mut(|t| t.repair().map_err(|e| log::warn!("{}: {e}", m.name)).is_ok());
+            // GeoTIFFs read in place are raster layers (a project from before saved tile layers),
+            // so they don't count toward the tile layers kept. As the project opens only: a tile
+            // layer added this session stays one until the project is opened again.
+            if opened {
+                crate::cmd::tiles::cog_tiles_to_rasters(m);
+                // A raster layer whose path is a plain web address, from no saved connection, is
+                // read in place, the one way such a path is read (a login or S3 wrapper is
+                // downloaded whole, as is a connection's address, plain here until its login is
+                // made again): one saved by an older RustGIS, which didn't know `in_place` (it
+                // showed the layer as missing and saved it again without the key), reads in
+                // place again here, losing a pending look at most.
+                for l in &mut m.layers {
+                    if l.connection.is_empty()
+                        && let Some(rl) = &mut l.raster
+                        && !rl.in_place
+                        && rl.embedded.is_none()
+                        && rl.path.as_deref().is_some_and(plain_web_address)
+                    {
+                        rl.in_place = true;
+                    }
+                }
+            }
             m.tiles.truncate(rustgis_map::tiles::MAX_TILE_LAYERS);
             #[cfg(not(target_arch = "wasm32"))]
             for t in &mut m.tiles {
@@ -864,8 +906,10 @@ impl Project {
                         src.error = Some(error);
                     }
                 }
+                // Read in place, read together below.
                 if let Some(rl) = &mut l.raster
                     && rl.data.is_none()
+                    && !rl.in_place
                     && !rl.path.as_deref().is_some_and(crate::s3_connections::is_s3_backed)
                     && unresolved.is_none()
                     && let Err(e) = rl.reload()
@@ -893,6 +937,7 @@ impl Project {
                 }
                 l.touch_geometry();
             }
+            read_in_place(m);
         }
     }
 
@@ -1036,7 +1081,7 @@ impl Project {
             p.resolve_paths(d);
         }
         if normalize {
-            p.normalize();
+            p.normalize_opened();
         }
         p.label_read_notices = label_losses::notices(text, &p)?;
         Ok(p)
@@ -1049,6 +1094,35 @@ impl Project {
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a RustGIS project", path.display()))?;
         let dir = std::path::absolute(path).ok().and_then(|p| p.parent().map(Path::to_path_buf));
         Self::read_json(&text, true, dir.as_deref(), true)
+    }
+}
+
+/// Starts reading the overviews of a map's raster layers read in place and not read yet, all at
+/// once (see [`rustgis_map::raster::read_together`]): a project or an import of several waits for
+/// the slowest, not for each in turn, where the session waits for them
+/// ([`crate::Session::wait_in_place_reads`]); elsewhere they land as the map draws. One read from
+/// an S3 bucket waits for its connection (see [`crate::s3_connections::resolve_project_s3`]). One
+/// that failed is left to [`crate::Session::read_in_place_again`], which reads it again once its
+/// wait is over, and one that couldn't start (an address the project keeps that can't be read)
+/// stays as it is, said once: a repair of the project (a layer file added, maps imported) doesn't
+/// start either over.
+pub(crate) fn read_in_place(m: &mut Map) {
+    let mut named: Vec<(String, &mut rustgis_map::raster::RasterLayer)> = m
+        .layers
+        .iter_mut()
+        .filter_map(|l| {
+            let name = l.name.clone();
+            let rl = l.raster.as_mut()?;
+            (rl.in_place && rl.error.is_none() && !rl.path.as_deref().is_some_and(crate::s3_connections::is_s3_backed))
+                .then_some((name, rl))
+        })
+        .collect();
+    let mut layers: Vec<&mut rustgis_map::raster::RasterLayer> = named.iter_mut().map(|(_, rl)| &mut **rl).collect();
+    let failed = rustgis_map::raster::read_together(&mut layers, false);
+    for (i, e) in failed {
+        if let Some((name, _)) = named.get(i) {
+            log::warn!("{name}: {e}");
+        }
     }
 }
 
@@ -1515,11 +1589,13 @@ mod login_binding_tests {
                 params: serde_json::json!({"url": bad}),
             }],
         });
-        let (saved, _) = project.saved_text(None).unwrap();
+        let (saved, report) = project.saved_text(None).unwrap();
         // Inspect the durable bytes: from_json may restore a credential edit from this
         // process's explicit-save cache, including an invalid address that still cannot run.
         let written: serde_json::Value = serde_json::from_str(&saved).unwrap();
         assert_eq!(written["tasks"][0]["steps"][0]["params"]["url"], rustgis_data::login_address::PREFIX);
+        assert_eq!((report.withheld, report.steps, report.layer_addresses()), (1, 1, 0));
+        assert_eq!(report.notices().len(), 2, "the withheld slot and affected executable step are distinct report dimensions");
         assert_eq!(project.tasks[0].steps[0].params["url"], bad, "the live project is restored");
         let mut address = bad.to_string();
         clear_login_bindings([&mut address]);

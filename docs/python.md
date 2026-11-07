@@ -303,7 +303,10 @@ of them.
 
 Open an existing project with `Session(project="atlas.rgis")` or `s.open("atlas.rgis")`.
 `s.project_json()` returns JSON with the same credential removal as Save, with notices available
-through `s.notices()`. It refuses unfinished imports instead of writing runtime reservations.
+through `s.notices()`. Like Save, this explicit serialization retains a bounded, process-local
+credential-restoration snapshot for reopening its exact text; repeated identical text replaces
+the same snapshot. It refuses unfinished imports instead of writing runtime reservations.
+The widget's private peer exchange uses a separate path that never fills this save cache.
 `s.run("project.openText", text=...)` opens project JSON without an intermediate file. `to_png()`
 returns PNG bytes even when it also writes a file; omit the path to keep the image in memory.
 

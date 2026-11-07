@@ -17,10 +17,11 @@
 //! | `{"rustgis": "project", "text": <project JSON>}` | the project changed here (an edit, a pan) |
 //! | `{"rustgis": "result", "id", "ok": true, "value"}` or `{…, "ok": false, "error"}` | a `run`'s outcome |
 //!
-//! Projects exchanged here contain public configuration without credentials. Incoming projects
-//! use peer/import semantics: no identical-save restore, item trust or earlier approvals. Parent
-//! origin checks identify the peer; they grant no user authority. The existing `ui.*` command
-//! policy is separate from this project-exchange contract.
+//! Exchanged projects remove recognized credentials from supported configuration fields.
+//! Preserved user data, foreign notebook source and opaque parameters may still contain secrets.
+//! Incoming projects use peer/import semantics: no identical-save restore, item trust or earlier
+//! approvals. Parent origin checks identify the peer; they grant no user authority. The existing
+//! `ui.*` command policy is separate from this project-exchange contract.
 //!
 //! Only messages from the parent window are taken, and the app answers only the origin that sent
 //! the first of them. Any page may frame the app, so `run` takes only the interface's commands

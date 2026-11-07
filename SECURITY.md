@@ -23,9 +23,11 @@ patches. Check that the problem still happens with the
 
 Saving removes credentials from supported address fields and recognized executable parameters,
 and reports counted removals. Feature data, user notes, foreign-language notebook code and opaque
-plugin content can still contain sensitive information. An unchecked-content notice means that
-content was preserved, not verified safe. Review it before sharing; saving is not a general
-secret scanner.
+plugin content can still contain sensitive information. Data-valued command parameters, such as
+imported feature text and expressions, are preserved too. Supplied service documents are kept
+opaque, with an unchecked-content notice when recognizable credential material is found.
+An unchecked-content notice means that content was preserved, not verified safe. Review it
+before sharing; saving is not a general secret scanner.
 
 For an older file or log that exposed a key, revoke or rotate it with its service. Saving again
 cleans only recognized fields and cannot recall shared copies. For a Jupyter notebook, also clear
