@@ -145,7 +145,8 @@ pub fn clear_fetcher() {
 /// on whichever thread is starting them already, so one test's fetch may run on another's thread,
 /// later. Tests that end a login take turns too, as that empties the cache ([`clear`]), and so do
 /// tests that wait for or plant what the cache holds (an archive read, a style resolved), which
-/// that would drop. The turn puts the native fetcher back when it ends.
+/// that would drop. Tests that inspect clean failure text also take turns: a concurrent login
+/// can redact even a single letter from that text. The turn puts the native fetcher back when it ends.
 #[cfg(test)]
 pub(crate) fn turn() -> Turn {
     static TURN: Mutex<()> = Mutex::new(());
@@ -692,7 +693,7 @@ fn fetch_tile(url: String, host: String, want: Want, omit: &'static [u16]) {
                     Entry::Ready(Arc::new(p), size)
                 }
                 Err(e) => {
-                    log::debug!("{}", crate::logins::scrub(&format!("{}: {e}", answer.key)));
+                    log::debug!("{}", crate::logins::scrub_error(&format!("{}: {e}", answer.key)));
                     // Refused until a time its server gave: the map draws again then.
                     if let Some(wait) = retry_after(&e) {
                         notify_at(Instant::now() + wait);
@@ -876,7 +877,7 @@ impl<'a> RequestDiagnostics<'a> {
         let url = crate::logins::inner(url);
         let url = if rustgis_data::login_address::is_wrapper(url) { "[address omitted]" } else { url };
         let clean = |text: &str| {
-            if carried || text.contains(rustgis_data::login_address::PREFIX) { crate::logins::scrub(text) } else { text.to_string() }
+            if carried || text.contains(rustgis_data::login_address::PREFIX) { crate::logins::scrub_error(text) } else { text.to_string() }
         };
         // A status the caller expects is an answer, not a failure for the history; a caller
         // that treats the refusal as an error says so itself. One bounded record per server says
@@ -1626,7 +1627,9 @@ mod native {
             }
             Err("too many redirects".into())
         })();
-        diagnostics.record(answer).map_err(|failure| if carried_login { crate::logins::scrub(&failure.message) } else { failure.message })
+        diagnostics
+            .record(answer)
+            .map_err(|failure| if carried_login { crate::logins::scrub_error(&failure.message) } else { failure.message })
     }
 
     /// POSTs a JSON document on a thread of its own.
@@ -1682,7 +1685,9 @@ mod native {
             crate::logins::check(url).map_err(str::to_string)?;
             Ok(buf)
         })();
-        diagnostics.record(answer).map_err(|failure| if carried_login { crate::logins::scrub(&failure.message) } else { failure.message })
+        diagnostics
+            .record(answer)
+            .map_err(|failure| if carried_login { crate::logins::scrub_error(&failure.message) } else { failure.message })
     }
 
     /// Downloads on a thread of its own, so a large file doesn't hold up the tiles.
@@ -1785,7 +1790,7 @@ mod native {
     /// [`get_detailed`], a status in `omit` not recorded as a failure.
     pub(super) fn get_detailed_omitting(agent: &ureq::Agent, url: &str, omit: &'static [u16]) -> Result<Vec<u8>, Failure> {
         fetch_answer(agent, url, true, omit).map_err(|f| Failure {
-            url: if url.contains(rustgis_data::login_address::PREFIX) { crate::logins::scrub(url) } else { url.to_string() },
+            url: if url.contains(rustgis_data::login_address::PREFIX) { crate::logins::scrub_error(url) } else { url.to_string() },
             ..f
         })
     }
@@ -2004,8 +2009,8 @@ mod native {
         let result = crate::logins::check(super::resource_of(url)).map_err(Failure::from).and(result);
         result.map_err(|mut f| {
             if carried_login {
-                f.message = crate::logins::scrub(&f.message);
-                f.url = crate::logins::scrub(&f.url);
+                f.message = crate::logins::scrub_error(&f.message);
+                f.url = crate::logins::scrub_error(&f.url);
             }
             f
         })
@@ -2052,6 +2057,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn network_diagnostics_capture_background_failures_once() {
+        let _turn = turn();
         use rustgis_data::diagnostics::{History, NetworkKind};
         let history = History::default();
         let _scope = history.enter();
@@ -2072,6 +2078,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn network_diagnostics_interleaved_sessions_keep_their_requests_private() {
+        let _turn = turn();
         use rustgis_data::diagnostics::History;
         use std::io::{BufRead, BufReader, Write};
         let first = History::default();
@@ -2132,6 +2139,7 @@ mod tests {
 
     #[test]
     fn network_diagnostics_explicit_capture_outlives_dispatch_scope_not_owner() {
+        let _turn = turn();
         use rustgis_data::diagnostics::History;
         let first = History::default();
         let second = History::default();
@@ -2158,6 +2166,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn network_diagnostics_redact_downloads_without_retaining_bodies() {
+        let _turn = turn();
         use rustgis_data::diagnostics::History;
         let history = History::default();
         let _scope = history.enter();
@@ -2208,6 +2217,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn network_diagnostics_skip_gone_map_tiles_and_keep_server_errors() {
+        let _turn = turn();
         let history = rustgis_data::diagnostics::History::default();
         let _scope = history.enter();
         let answer = |status: &str| format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -2229,6 +2239,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn network_diagnostics_keep_headers_after_a_credential_header() {
+        let _turn = turn();
         let history = rustgis_data::diagnostics::History::default();
         let _scope = history.enter();
         let base = serve(vec![
@@ -2251,6 +2262,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn network_diagnostics_skip_routine_tile_404s_and_keep_other_statuses() {
+        let _turn = turn();
         use rustgis_data::diagnostics::{History, Severity};
         let history = History::default();
         let _scope = history.enter();
@@ -2309,6 +2321,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn network_diagnostics_keep_observed_status_on_blocking_body_failure() {
+        let _turn = turn();
         use rustgis_data::diagnostics::{History, NetworkKind};
         let history = History::default();
         let _scope = history.enter();
@@ -2326,6 +2339,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn network_diagnostics_preserve_connection_and_timeout_causes() {
+        let _turn = turn();
         use rustgis_data::diagnostics::{History, NetworkKind};
         let history = History::default();
         let _scope = history.enter();
@@ -2360,6 +2374,7 @@ mod tests {
     /// history keeps no record of it.
     #[test]
     fn network_diagnostics_skip_failed_local_reads() {
+        let _turn = turn();
         let history = rustgis_data::diagnostics::History::default();
         let _scope = history.enter();
         native::get(&native::agent(), "local-file:/nonexistent-1155.pmtiles", &[]).unwrap_err();
@@ -2368,6 +2383,7 @@ mod tests {
 
     #[test]
     fn network_diagnostics_ignore_cancellation_and_keep_browser_causes_truthful() {
+        let _turn = turn();
         use rustgis_data::diagnostics::{History, NetworkKind};
         let history = History::default();
         let _scope = history.enter();
@@ -2395,6 +2411,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn public_downloads_refuse_names_that_resolve_locally() {
+        let _turn = turn();
         let err = download_public_within("http://localhost:9/doc.json", 1024, std::time::Duration::from_secs(5)).unwrap_err();
         assert!(err.contains("resolves to this computer or the local network"), "{err}");
     }
@@ -2422,6 +2439,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn downloads_stop_at_the_callers_budget() {
+        let _turn = turn();
         for framing in ["Content-Length: 4\r\n", "", "Transfer-Encoding: chunked\r\n"] {
             let body = if framing.starts_with("Transfer") { "4\r\ntile\r\n0\r\n\r\n" } else { "tile" };
             for (limit, ok) in [(0, false), (3, false), (4, true), (5, true)] {
@@ -2442,6 +2460,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn download_budget_also_bounds_decompressed_bytes() {
+        let _turn = turn();
         let data = vec![b'x'; 4096];
         // The ZIP writer supplies the CRC-32 for a valid, generated gzip trailer.
         let zip = rustgis_data::zip::write(&[("body".into(), data.clone())]).unwrap();
@@ -3080,6 +3099,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn the_length_asked_for_follows_redirects_and_keeps_refusals() {
+        let _turn = turn();
         let no_suffix = "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
         let agent = native::agent();
         let base = serve(vec![
@@ -3114,6 +3134,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_refused_download_says_who_refused_it() {
+        let _turn = turn();
         let page = "<html><head><title>Attention Required! | Cloudflare</title></head><body>Sorry, you have been blocked</body></html>";
         let blocked = format!(
             "HTTP/1.1 403 Forbidden\r\nServer: cloudflare\r\nCF-RAY: a4c9-BOG\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
@@ -3135,6 +3156,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn follows_only_allowed_redirects() {
+        let _turn = turn();
         let redirect = |to: &str| format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         let ok = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile".to_string();
         let agent = native::agent();

@@ -259,6 +259,15 @@ pub fn run(s: &mut Session, call: &ToolCall) -> Result<String, String> {
 
 /// Runs a call with a per-result token estimate, capped by the absolute ceiling.
 pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Result<String, String> {
+    // Script failures are structured JSON: clean their error field before serialization.
+    if call.name == "run" {
+        return run_script(s, &call.args, tokens);
+    }
+    run_with_budget_inner(s, call, tokens).map_err(|e| public_error(&e))
+}
+
+/// Assembles ordinary tool results; the public boundary cleans every early error too.
+fn run_with_budget_inner(s: &mut Session, call: &ToolCall, tokens: usize) -> Result<String, String> {
     let max_bytes = output_bytes(tokens);
     let a = &call.args;
     let v = match call.name.as_str() {
@@ -278,7 +287,7 @@ pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Resul
                 return Err(format!("unknown command '{id}'; find ids with search_commands"));
             }
             let (before, mark) = (layer_snap(s), s.notice_mark());
-            let r = s.run(&id, &params_arg(a)?).map_err(|e| public_text(error_with_notices(e, s, mark)))?;
+            let r = s.run(&id, &params_arg(a)?).map_err(|e| error_with_notices(e, s, mark))?;
             return Ok(command_result(s, r, &before, mark, tokens));
         }
         "run_tool" => {
@@ -286,12 +295,10 @@ pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Resul
             let (before, mark) = (layer_snap(s), s.notice_mark());
             let r = s
                 .run("gp.run", &json!({"tool": tool, "params": params_arg(a)?}))
-                .map_err(|e| public_text(error_with_notices(e, s, mark)))?;
+                .map_err(|e| error_with_notices(e, s, mark))?;
             return Ok(command_result(s, r, &before, mark, tokens));
         }
         "read_features" => read_features(s, a)?,
-        // MCP's `run` (not offered to the in-app assistant): a script in one call.
-        "run" => return run_script(s, a, tokens),
         "search_docs" => crate::docs::search(&str_arg(a, "query").unwrap_or_default(), limit_arg(a, 8, 30))?,
         "read_doc" => {
             return crate::docs::read_with_budget(
@@ -329,6 +336,11 @@ const MAX_DEPTH: usize = 16;
 /// to use a connection's login; the model and MCP clients get only the public ones.
 fn public_text(text: String) -> String {
     rustgis_engine::render::rustgis_tiles::logins::scrub(&text)
+}
+
+/// Generated errors may quote arbitrary addresses; successful values remain data.
+fn public_error(text: &str) -> String {
+    rustgis_engine::render::rustgis_tiles::logins::scrub_error(text)
 }
 
 /// Publishes a completed result, reporting withheld subtrees before enforcing the response budget.
@@ -570,6 +582,7 @@ fn run_script(s: &mut Session, a: &Value, tokens: usize) -> Result<String, Strin
             Ok(public_envelope(s, out, tokens))
         }
         Err(e) => {
+            let e = public_error(&e);
             // Nothing was kept, so no line ran and no layer was added.
             // The notice of the failure is the error redacted: compared as such, it isn't repeated.
             let told = rustgis_engine::data::diagnostics::redact(&e);
@@ -921,6 +934,69 @@ pub fn context(s: &Session) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// Returned tool and fetch errors are cleaned before active patterns can damage URLs;
+    /// successful values and the original call remain outside the generated-error projection.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn generated_tool_and_fetch_errors_clean_addresses_before_active_patterns() {
+        const TEST: &str = "tools::tests::generated_tool_and_fetch_errors_clean_addresses_before_active_patterns";
+        if std::env::var("RUSTGIS_ISOLATED_TOOL_ERRORS").as_deref() != Ok(TEST) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST])
+                .env("RUSTGIS_ISOLATED_TOOL_ERRORS", TEST)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use rustgis_engine::render::rustgis_tiles::{failure::Failure, logins};
+        let mut s = Session::new(rustgis_engine::Project::default());
+        let url = "https://returned-error.invalid/a?token=RGSYNTH_returned_error&layer=roads";
+        for active in [false, true] {
+            let binding = active.then(|| {
+                logins::activate(
+                    "https://returned-error.invalid",
+                    "synthetic-returned-error",
+                    logins::Method::Header("X-Key".into()),
+                    "https",
+                    false,
+                )
+                .unwrap()
+            });
+            for (name, args) in [
+                ("read_features", json!({"layer":url})),
+                ("describe_tool", json!({"tool":url})),
+                (url, json!({})),
+                ("run", json!({"script":url})),
+            ] {
+                let call = ToolCall { id: "error".into(), name: name.into(), args };
+                let original = call.clone();
+                let error = run_with_budget(&mut s, &call, DEFAULT_OUTPUT_TOKENS).unwrap_err();
+                assert!(!error.contains("RGSYNTH_returned_error"), "{name}, active={active}: {error}");
+                assert_eq!(call, original);
+                if name == "run" {
+                    let reply: Value = serde_json::from_str(&error).unwrap();
+                    assert_eq!(reply["success"], false);
+                    assert!(reply["error"].as_str().is_some());
+                }
+            }
+            let address = binding.as_ref().map_or_else(|| url.to_string(), |binding| logins::bind(binding, url).unwrap());
+            let failure = Failure::new(&address, format!("failed to fetch {address}"));
+            assert!(!failure.message.contains("RGSYNTH_returned_error"));
+            if let Some(binding) = binding {
+                assert!(logins::deactivate(&binding));
+            }
+        }
+        let clean = ToolCall { id: "clean".into(), name: "read_features".into(), args: json!({"layer":"ordinary missing layer"}) };
+        assert!(run_with_budget(&mut s, &clean, DEFAULT_OUTPUT_TOKENS).unwrap_err().contains("ordinary missing layer"));
+        assert_eq!(Failure::new("https://clean.invalid/a?layer=roads", "HTTP 403").message, "HTTP 403");
+        assert_eq!(logins::scrub_error("failed https://clean.invalid/a?layer=roads"), "failed https://clean.invalid/a?layer=roads");
+    }
     use super::*;
     use rustgis_engine::render::rustgis_tiles::logins;
 

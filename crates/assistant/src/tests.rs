@@ -1224,6 +1224,18 @@ fn mcp_protocol_errors() {
     assert_eq!(rpc(&server, &mut s, "tools/call", json!({"name": "no_such_tool"}))["error"]["code"], -32602);
     assert_eq!(rpc(&server, &mut s, "tools/call", json!({"name": "list_layers", "arguments": [1]}))["error"]["code"], -32602);
     assert_eq!(rpc(&server, &mut s, "resources/read", json!({"uri": "rustgis://docs/nope.md"}))["error"]["code"], -32002);
+    // Protocol validation fails before tool dispatch; its generated text is public too.
+    let private = "https://rpc-error.invalid/a?token=RGSYNTH_rpc_error&layer=roads";
+    for (method, params, code) in [
+        ("tools/call", json!({"name":private,"arguments":{}}), -32602),
+        ("resources/read", json!({"uri":private}), -32002),
+        (private, json!({}), -32601),
+    ] {
+        let reply = rpc(&server, &mut s, method, params);
+        assert_eq!(reply["error"]["code"], code);
+        assert!(!reply["error"]["message"].as_str().unwrap().contains("RGSYNTH_rpc_error"));
+    }
+    assert_eq!(rpc(&server, &mut s, "ping", json!({})), json!({}));
     // Batches: one reply per request, none for notifications only.
     let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":2,"method":"nope"}]"#;
     let r: Value = serde_json::from_str(&server.handle(&mut s, batch).unwrap()).unwrap();

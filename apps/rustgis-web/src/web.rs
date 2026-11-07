@@ -756,7 +756,7 @@ async fn fetch_bytes(url: &str, capture: Capture, omit: &'static [u16]) -> Resul
         }
         .await;
         logins::check(bound).map_err(str::to_string)?;
-        result.map_err(|error| if login.is_some() { logins::scrub(&format!("{url}: {error}")) } else { error })
+        result.map_err(|error| if login.is_some() { logins::scrub_error(&format!("{url}: {error}")) } else { error })
     }
     .await;
     diagnostics.record(answer.map_err(|e| Failure::new(url, e))).map_err(|failure| failure.message)
@@ -820,7 +820,7 @@ async fn post_json(url: &str, body: &str, capture: Capture) -> Result<Vec<u8>, S
         }
         .await;
         logins::check(url).map_err(str::to_string)?;
-        result.map_err(|error| if login.is_some() { logins::scrub(&format!("{url}: {error}")) } else { error })
+        result.map_err(|error| if login.is_some() { logins::scrub_error(&format!("{url}: {error}")) } else { error })
     }
     .await;
     diagnostics.record(answer.map_err(|e| Failure::new(url, e))).map_err(|failure| failure.message)
@@ -889,7 +889,7 @@ async fn head(url: &str, capture: Capture) -> Result<rustgis_ui_egui::rustgis_en
         }
         .await;
         logins::check(bound).map_err(str::to_string)?;
-        result.map_err(|error| if login.is_some() { logins::scrub(&format!("{url}: {error}")) } else { error })
+        result.map_err(|error| if login.is_some() { logins::scrub_error(&format!("{url}: {error}")) } else { error })
     }
     .await;
     diagnostics.record(answer.map_err(|e| Failure::new(url, e))).map_err(|failure| failure.message)
