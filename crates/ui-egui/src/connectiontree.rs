@@ -232,7 +232,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     // STAC assets that needed a token: signed and added when it lands.
     for signing in std::mem::take(&mut app.ui.connection_tree.tokens) {
-        if !app.service_read_current(signing.opened, &signing.href) {
+        if !app.service_read_current(signing.opened, &signing.href, None) {
             continue;
         }
         let Some(r) = signing.slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {

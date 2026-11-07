@@ -185,7 +185,7 @@ pub fn commands() -> Vec<C> {
             nb.cells.insert(at, Cell::new(kind, ps(p, "source").unwrap_or("")));
             Ok(json!({"cell": at, "cells": nb.cells.len()}))
         })
-        .roles(&[])
+        .roles(&[crate::ParamRole { key: "source", role: crate::Role::Opaque }])
         .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .when(need_notebook)
         .params(r#"{"notebook"?, "kind"?: "code"|"markdown", "source"?, "at"?: index}"#),
@@ -196,7 +196,7 @@ pub fn commands() -> Vec<C> {
             c.source = source.chars().take(MAX_SOURCE).collect();
             Ok(json!({"cell": k}))
         })
-        .roles(&[])
+        .roles(&[crate::ParamRole { key: "source", role: crate::Role::Opaque }])
         .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .when(need_notebook)
         .params(r#"{"notebook"?, "cell": index, "source": text}"#),

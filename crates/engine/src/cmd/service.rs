@@ -22,6 +22,12 @@ mod group;
 /// The total feature response bytes accepted by a grouped import or refresh.
 pub const MAX_GROUP_BYTES: usize = 64 << 20;
 
+const DOCUMENT_ROLES: &[crate::ParamRole] = &[
+    crate::ParamRole { key: "text", role: crate::Role::Opaque },
+    crate::ParamRole { key: "documents", role: crate::Role::Opaque },
+    crate::ParamRole { key: "describe", role: crate::Role::Opaque },
+];
+
 pub fn commands() -> Vec<C> {
     let mut commands = vec![
         C::new("service.layers", "Service Layers", "Home › Add", layers).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).view().params(
@@ -31,14 +37,14 @@ pub fn commands() -> Vec<C> {
             r#"{"url": "as service.layers", "type"?, "layer": "the layer's name (service.layers lists them)", "name"?: text, "time"?: "a time-enabled WMS or WMTS layer: by default (or \"slider\", true) it follows the time slider, turned on with the layer's times when it is off; or one of its dates (2024-06-01), or \"default\" (false): its service's default", "text"?: "the capabilities document, when already fetched", "documents"?: "additional fetched documents, as service.layers", "source_url"?: "the listed layer's source_url", "describe"?: "a WCS coverage's DescribeCoverage document, when already fetched", "tiles"?: "an OGC API layer's tile template, when already read from its tileset (the app's)", "bbox"?: [west, south, east, north] | "view" | "full": a WCS coverage's area (the view by default); for a WFS, OGC API or ArcGIS feature layer, only the features that cross it (the whole layer, "full", by default), "connection"?: "the id of the saved web-service connection it comes from (connection.browse gives it): the layer records it, and is read with its login"}"#,
         ),
         C::new("service.coverage", "WCS Coverage Request", "Home › Add", coverage).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).view().params(
-            r#"{"url": "a WCS address", "type"?: "wcs", "layer": "the coverage's name", "text"?: "the capabilities document, when already fetched", "documents"?: "additional fetched documents, as service.layers", "source_url"?: "the listed coverage's source_url", "describe"?: "its DescribeCoverage answer, when already fetched", "bbox"?: [west, south, east, north] | "view" (the default) | "full", "connection"?: "the saved web-service connection id whose login the request uses"} → the GetCoverage address of a GeoTIFF (layer.addUrl adds it)"#,
+            r#"{"url": "a WCS address", "type"?: "wcs", "layer": "the coverage's name", "text"?: "the capabilities document, when already fetched", "documents"?: "additional fetched documents, as service.layers", "source_url"?: "the listed coverage's source_url", "describe"?: "its DescribeCoverage answer, when already fetched", "bbox"?: [west, south, east, north] | "view" (the default) | "full", "connection"?: "the saved web-service connection id whose login the request uses", "anonymous"?: boolean (never use a saved login for the coverage or its description)} → the GetCoverage address of a GeoTIFF (layer.addUrl adds it)"#,
         ),
         C::new("catalog.search", "Search Catalogue", "Home › Add", catalog_search).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).view().params(
             r#"{"url": "a catalogue's CSW address", "query"?: "words anywhere in the records", "bbox"?: [west, south, east, north] | "view" (none by default), "start"?: "the first record's position (a page's next)", "text"?: "the GetRecords answer, when already fetched", "connection"?: "as service.layers"} → records with their service and download links (service.add or layer.addUrl add them)"#,
         ),
     ];
     commands.extend(group::commands());
-    commands
+    commands.into_iter().map(|command| command.roles(DOCUMENT_ROLES)).collect()
 }
 
 fn url_of(p: &Value) -> Result<&str, String> {
@@ -103,8 +109,9 @@ struct Discovery {
 }
 
 impl Discovery {
-    fn failed(mut self, error: String) -> Result<Self, String> {
+    fn failed(mut self, s: &mut Session, error: String) -> Result<Self, String> {
         if self.service.layers.is_empty() {
+            notify_withheld(s, self.service.withheld_addresses);
             Err(error)
         } else {
             self.error = Some(error.clone());
@@ -117,7 +124,7 @@ impl Discovery {
 
 const MAX_SERVICE_DOCUMENTS: usize = 4;
 
-fn capabilities(p: &Value) -> Result<Discovery, String> {
+fn capabilities(s: &mut Session, p: &Value) -> Result<Discovery, String> {
     let original = url_of(p)?;
     let mut address =
         crate::render::rustgis_tiles::logins::inherit(original, &rustgis_data::ogc::capabilities_url(original, ps(p, "type")));
@@ -140,13 +147,13 @@ fn capabilities(p: &Value) -> Result<Discovery, String> {
     loop {
         crossed_origin |= crosses_origin(&parent, &address);
         if let Err(e) = crate::render::rustgis_tiles::address::check(&address, Some(&parent)) {
-            return result.failed(e);
+            return result.failed(s, e);
         }
         if seen.contains(&address) {
-            return result.failed("the service's collections links form a loop".into());
+            return result.failed(s, "the service's collections links form a loop".into());
         }
         if seen.len() >= MAX_SERVICE_DOCUMENTS {
-            return result.failed("the service's collections discovery exceeds four documents".into());
+            return result.failed(s, "the service's collections discovery exceeds four documents".into());
         }
         let parsed = if let Some(root) = supplied {
             let text = if seen.is_empty() {
@@ -172,7 +179,7 @@ fn capabilities(p: &Value) -> Result<Discovery, String> {
                 result.excluded_layers |= vetted.layers.len() != before;
                 vetted
             }
-            Err(e) => return result.failed(e),
+            Err(e) => return result.failed(s, e),
         };
         seen.insert(address.clone());
         if result.service.kind.is_empty() {
@@ -258,9 +265,14 @@ pub(crate) fn mark_service_source(s: &mut Session, r: &Value, url: &str) {
         .filter_map(Value::as_u64)
         .filter_map(|i| u32::try_from(i).ok())
         .collect();
+    let anonymous = s.web_logins.is_anonymous();
     for id in ids {
         if let Some(l) = s.map_mut().layer_mut(id) {
             l.dataset.source = Some(url.to_string());
+            if anonymous {
+                l.anonymous = true;
+                l.connection.clear();
+            }
         }
     }
 }
@@ -518,18 +530,35 @@ pub(crate) fn layers(s: &mut Session, p: &Value) -> CmdResult {
     let p = owned.as_ref().unwrap_or(p);
     let bound = crate::service_logins::request_params(s, p)?;
     let p = bound.as_ref();
-    let found = capabilities(p)?;
+    let found = capabilities(s, p)?;
     notify_withheld(s, found.service.withheld_addresses);
     let mut out = service_json(&found.service);
     if let Some(layers) = out.get_mut("layers").and_then(Value::as_array_mut) {
         for (layer, source) in layers.iter_mut().zip(found.sources) {
-            layer["source_url"] = json!(source.address);
+            layer_source(layer, source);
         }
     }
     if let Some(next) = found.next {
         out["next"] = json!(next);
     }
     Ok(out)
+}
+
+/// Publishes the selected document and its already-resolved feature login provenance.
+fn layer_source(layer: &mut Value, source: CapabilitySource) {
+    let foreign_features = layer.get("offer").is_some_and(|offer| {
+        offer.get("type").and_then(Value::as_str) == Some("features")
+            && ps(offer, "url").is_some_and(|url| crosses_origin(&source.address, url))
+    });
+    layer["source_url"] = json!(source.address);
+    if source.crossed_origin || foreign_features {
+        layer["anonymous"] = json!(true);
+        if let Some(url) = layer.get_mut("offer").and_then(|o| o.get_mut("url"))
+            && let Some(value) = url.as_str()
+        {
+            *url = json!(crate::render::rustgis_tiles::logins::inner(value));
+        }
+    }
 }
 
 /// Counts destinations, not pairs; clean discovery emits no credential-forwarding notice.
@@ -546,7 +575,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     let p = bound.as_ref();
     let url = url_of(p)?.to_string();
     let want = ps(p, "layer").map(str::trim).filter(|l| !l.is_empty()).ok_or("layer is required")?;
-    let found = capabilities(p)?;
+    let found = capabilities(s, p)?;
     let mut withheld = found.service.withheld_addresses;
     let result = add_discovered(s, p, &url, want, &found, &mut withheld);
     notify_withheld(s, withheld);
@@ -745,7 +774,8 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
             Err(format!("{url}: '{want}' is a folder or service the directory lists: list its layers (service.layers with url {open})"))
         }
         Offer::Coverage(c) => {
-            let (get, _) = coverage_request(s, p, c)?;
+            let anonymous = capability_crossed || crosses_origin(source, &c.endpoint) || s.web_logins.is_anonymous();
+            let (get, _, _) = coverage_request(s, p, c, anonymous)?;
             #[cfg(target_arch = "wasm32")]
             {
                 let _ = get;
@@ -753,11 +783,14 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let bytes = crate::render::rustgis_tiles::cache::download_blocking(&get).map_err(|e| format!("{name}: {e}"))?;
-                coverage_check(&name, &bytes)?;
-                let r = super::raster::add_named_bytes(s, &json!({"name": name}), format!("{name}.tif"), bytes, None)?;
-                mark_service_source(s, &r, &get);
-                Ok(r)
+                crate::service_logins::anonymously(s, anonymous, |s| {
+                    let bytes = crate::render::rustgis_tiles::cache::download_blocking(&get).map_err(|e| format!("{name}: {e}"))?;
+                    coverage_check(&name, &bytes)?;
+                    let r = super::raster::add_named_bytes(s, &json!({"name": name}), format!("{name}.tif"), bytes, None)?;
+                    mark_service_source(s, &r, &get);
+                    Ok(r)
+                })
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))
             }
         }
         Offer::Features { url: items } => {
@@ -779,29 +812,35 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
                 }
                 let max = crate::render::rustgis_tiles::cache::MAX_DOWNLOAD;
                 let from = asked.as_deref().unwrap_or(items);
-                // An area request keeps the view until the requested box is applied below.
-                let keep_view = asked.is_some().then_some(false);
-                let mut r = match download_layer(s, &name, from, max, true).map_err(|e| slow_whole_layer(e, given))? {
-                    Downloaded::Bytes(bytes) => {
-                        let bytes = features_answer(s, &name, bytes, layer.bbox);
-                        super::raster::add_named_bytes(s, &json!({"name": name}), format!("{name}.geojson"), bytes, keep_view)?
+                let crossed = capability_crossed || crosses_origin(source, from);
+                let from = if crossed { crate::render::rustgis_tiles::logins::inner(from) } else { from };
+                let anonymous = crossed || s.web_logins.is_anonymous();
+                crate::service_logins::anonymously(s, anonymous, |s| {
+                    // An area request keeps the view until the requested box is applied below.
+                    let keep_view = asked.is_some().then_some(false);
+                    let mut r = match download_layer(s, &name, from, max, true).map_err(|e| slow_whole_layer(e, given))? {
+                        Downloaded::Bytes(bytes) => {
+                            let bytes = features_answer(s, &name, bytes, layer.bbox);
+                            super::raster::add_named_bytes(s, &json!({"name": name}), format!("{name}.geojson"), bytes, keep_view)?
+                        }
+                        // Read in protocol buffer pages: their positions as the service's system
+                        // places them, so there are no axes to check.
+                        Downloaded::Read(read) => super::layer::add_read(s, &json!({"name": name}), *read, keep_view)?,
+                    };
+                    mark_service_source(s, &r, from);
+                    // Over an area, the features crossing it: the view stays, or goes to a box given
+                    // (the whole layer's bounds would show a country to fill one state).
+                    match (asked.is_some(), area, p.get("bbox")) {
+                        (true, Some([w, so, e, n]), Some(Value::Array(_))) => s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n)),
+                        (true, ..) => {}
+                        _ => zoom(s),
                     }
-                    // Read in protocol buffer pages: their positions as the service's system
-                    // places them, so there are no axes to check.
-                    Downloaded::Read(read) => super::layer::add_read(s, &json!({"name": name}), *read, keep_view)?,
-                };
-                mark_service_source(s, &r, from);
-                // Over an area, the features crossing it: the view stays, or goes to a box given
-                // (the whole layer's bounds would show a country to fill one state).
-                match (asked.is_some(), area, p.get("bbox")) {
-                    (true, Some([w, so, e, n]), Some(Value::Array(_))) => s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n)),
-                    (true, ..) => {}
-                    _ => zoom(s),
-                }
-                if let (Some(_), Some(out)) = (&asked, r.as_object_mut()) {
-                    out.insert("area".into(), json!(area));
-                }
-                Ok(r)
+                    if let (Some(_), Some(out)) = (&asked, r.as_object_mut()) {
+                        out.insert("area".into(), json!(area));
+                    }
+                    Ok(r)
+                })
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))
             }
         }
     }
@@ -846,7 +885,15 @@ fn coverage_area(s: &Session, p: &Value, info: &rustgis_data::ogc::CoverageInfo,
 
 /// A coverage's GetCoverage address and the area it covers: its description from `"describe"`, or
 /// fetched (waiting for it).
-fn coverage_request(s: &Session, p: &Value, c: &Coverage) -> Result<(String, [f64; 4]), String> {
+fn coverage_request(s: &Session, p: &Value, c: &Coverage, anonymous: bool) -> Result<(String, [f64; 4], String), String> {
+    let c = if anonymous {
+        let mut plain = c.clone();
+        plain.endpoint = crate::render::rustgis_tiles::logins::inner(&c.endpoint).to_string();
+        std::borrow::Cow::Owned(plain)
+    } else {
+        std::borrow::Cow::Borrowed(c)
+    };
+    let c = c.as_ref();
     let describe = crate::render::rustgis_tiles::logins::inherit(&c.endpoint, &rustgis_data::ogc::describe_coverage_url(c));
     let info = match ps(p, "describe") {
         Some(text) => rustgis_data::ogc::parse_describe(c, text.as_bytes())?,
@@ -855,7 +902,7 @@ fn coverage_request(s: &Session, p: &Value, c: &Coverage) -> Result<(String, [f6
     let area = coverage_area(s, p, &info, &c.id)?;
     let get = crate::render::rustgis_tiles::logins::inherit(&c.endpoint, &rustgis_data::ogc::get_coverage_url(c, &info, area));
     crate::render::rustgis_tiles::address::check(&get, Some(&c.endpoint))?;
-    Ok((get, area))
+    Ok((get, area, describe))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -876,19 +923,27 @@ fn coverage(s: &mut Session, p: &Value) -> CmdResult {
     let p = bound.as_ref();
     let url = url_of(p)?.to_string();
     let want = ps(p, "layer").map(str::trim).filter(|l| !l.is_empty()).ok_or("layer is required")?;
-    let found = capabilities(p)?;
-    let layer = found
+    let found = capabilities(s, p)?;
+    notify_withheld(s, found.service.withheld_addresses);
+    let (layer, source) = found
         .service
         .layers
         .iter()
         .zip(&found.sources)
         .filter(|(_, source)| ps(p, "source_url").is_none_or(|s| same_address(s, &source.address)))
-        .map(|(layer, _)| layer)
-        .find(|l| l.name == want || l.name.eq_ignore_ascii_case(want))
+        .find(|(l, _)| l.name == want || l.name.eq_ignore_ascii_case(want))
         .ok_or_else(|| format!("{url}: no coverage '{want}' (service.layers lists them)"))?;
     let Offer::Coverage(c) = &layer.offer else { return Err(format!("{url}: '{want}' isn't a WCS coverage")) };
-    let (get, area) = coverage_request(s, p, c)?;
-    Ok(json!({"url": get, "name": layer.title, "bbox": area, "describe": rustgis_data::ogc::describe_coverage_url(c)}))
+    let anonymous = source.crossed_origin
+        || crosses_origin(&source.address, &c.endpoint)
+        || s.web_logins.is_anonymous()
+        || p.get("anonymous").and_then(Value::as_bool) == Some(true);
+    let (get, area, describe) = coverage_request(s, p, c, anonymous)?;
+    let mut out = json!({"url": get, "name": layer.title, "bbox": area, "describe": describe});
+    if anonymous {
+        out["anonymous"] = json!(true);
+    }
+    Ok(out)
 }
 
 /// The GetRecords request `catalog.search` makes of its parameters (the app fetches it first).

@@ -17,11 +17,11 @@ pub mod prefs;
 pub mod project;
 mod roles;
 pub use peer::Peer;
-pub use roles::{Document, ParamRole, Role};
+pub(crate) use roles::{Document, ParamRole, Role};
 mod parameters;
 pub mod project_log;
 pub use parameters::{params_envelope, script_line};
-pub use project_log::{LogCopy, log_params};
+pub use project_log::{LogCopy, log_identifier, log_params};
 pub mod s3_connections;
 pub mod s3_keys;
 #[cfg(test)]
@@ -81,8 +81,8 @@ pub struct CommandSpec {
     pub run: policy::Handler,
     /// Reviewed reach, independently consumed by the engine policy.
     pub effects: policy::Effects,
-    /// Durable-output parameter roles, separate from permission effects. None is unreviewed.
-    pub roles: Option<&'static [ParamRole]>,
+    /// Reviewed builtin durable-output roles. Extension parameters remain opaque.
+    pub(crate) roles: Option<&'static [ParamRole]>,
     /// Pure executor-owned resolution for commands whose inputs exceed the common layer selector.
     pub(crate) transition: Option<fn(&cmd::InputContext<'_>, &Value) -> Result<Option<cmd::Selection>, String>>,
     pub(crate) inputs: Option<fn(&cmd::InputContext<'_>, &Value) -> Result<cmd::Inputs, String>>,
@@ -125,8 +125,8 @@ impl CommandSpec {
         self.effects = effects;
         self
     }
-    /// Declares durable-output roles. An empty list adopts the reviewed common parameter rules.
-    pub const fn roles(mut self, roles: &'static [ParamRole]) -> Self {
+    /// Declares builtin durable-output roles; an empty list uses reviewed common parameter rules.
+    pub(crate) const fn roles(mut self, roles: &'static [ParamRole]) -> Self {
         self.roles = Some(roles);
         self
     }
@@ -330,6 +330,29 @@ fn param_entries<'a>(desc: &'a str, mut visit: impl FnMut(&'a str, bool)) -> Opt
 /// `s` cut to `n` characters, with `…` when cut.
 fn clip(s: &str, n: usize) -> String {
     if s.chars().count() > n { s.chars().take(n).chain(['…']).collect() } else { s.to_string() }
+}
+
+/// The most layer names a notice lists (the rest counted), each cut to 80 characters: the notice
+/// stays well within what a notice keeps.
+const NAMES_SAID: usize = 5;
+
+/// Layer names for a notice: the first [`NAMES_SAID`], each clipped, and how many more.
+fn names_said(names: &[String]) -> String {
+    let shown: Vec<String> = names.iter().take(NAMES_SAID).map(|n| clip(n, 80)).collect();
+    match names.len().saturating_sub(NAMES_SAID) {
+        0 => shown.join(", "),
+        more => format!("{} and {more} more", shown.join(", ")),
+    }
+}
+
+/// What a raster layer read in place holds for its statistics and tools, when it holds an
+/// overview of the image the map draws.
+pub(crate) fn in_place_overview(d: &rustgis_data::raster::Raster) -> Option<String> {
+    let (fw, fh) = d.overview?;
+    Some(format!(
+        "read in place: the map draws its {fw} × {fh} pixels as it needs them, while statistics, histograms and raster tools read a {} × {} overview",
+        d.width, d.height
+    ))
 }
 
 pub struct Registry {
@@ -664,6 +687,12 @@ pub struct Session {
     /// (`map.addTiles` with `"view": true`), or a PMTiles/MBTiles archive whose bounds it goes to, and the
     /// camera and owning map instance then: moved or switched since, the map stays.
     pub style_view: Option<(rustgis_map::TileLayer, Camera, u64)>,
+    /// Whether a command waits for the overview of a raster read in place (natively, at most two
+    /// minutes; the browser never waits): the command line, Python and tests do, so a result is
+    /// complete; the desktop app doesn't, as its commands run on the window's own thread, and the
+    /// layer lands as the map draws (failing is said then, and read again: see
+    /// [`Session::read_in_place_again`]).
+    pub in_place_wait: bool,
     pub notices: Vec<Notice>,
     /// Counted losses await the outermost guard's cleanup, including failed nested commands.
     /// Runtime-only: never in Project, undo or PutAside, so replacement cannot erase them.
@@ -841,6 +870,9 @@ pub struct Session {
     pub zarr_off_frame: bool,
     /// The Zarr steps landed that [`Session::follow_time_landed`] has seen.
     zarr_seen: u64,
+    /// Each off-frame Zarr step retains its initiating lifetime and private completion.
+    #[cfg(not(target_arch = "wasm32"))]
+    zarr_reads: cmd::zarr::ReadWaits,
     /// A read the app made on a thread of its own for the command it runs next, which takes it
     /// instead of reading again ([`cmd::reads`]).
     pub(crate) read_ahead: Option<cmd::reads::Ready>,
@@ -1022,8 +1054,10 @@ impl Session {
         rustgis_geolibre::register();
         rustgis_plugins::tools::register();
         let _ = rustgis_analysis::external_tools();
-        // FlatGeobuf and GeoParquet by their web address are read through the tile fetchers.
+        // FlatGeobuf and GeoParquet by their web address are read through the tile fetchers, and
+        // cloud-optimised GeoTIFFs' overviews for raster layers read in place.
         render::rustgis_tiles::remote::install();
+        map::raster::set_in_place_reader(render::rustgis_tiles::cog::raster::overview);
         rustgis_data::diagnostics::set_clock(|| {
             web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
         });
@@ -1055,6 +1089,7 @@ impl Session {
             layer_selection_of: None,
             view_size: (1200.0, 720.0),
             style_view: None,
+            in_place_wait: true,
             notices: Vec::new(),
             loss_notices: Vec::new(),
             loss_notice_overflow: 0,
@@ -1130,6 +1165,8 @@ impl Session {
             long_runs: None,
             zarr_off_frame: false,
             zarr_seen: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            zarr_reads: Default::default(),
             read_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
             tools_ahead: None,
@@ -1167,7 +1204,8 @@ impl Session {
         // A few at a time: past that many, the oldest are forgotten.
         if self.downloading.len() >= 64 {
             let retired = self.downloading.remove(0);
-            self.forget_download_claim(retired);
+            self.retire_download_claim(retired, "this download was retired because 64 downloads were already pending");
+            self.notify("1 pending download was retired because 64 downloads were already pending", true);
         }
         self.downloading.push(self.next_pending);
         self.next_pending
@@ -1197,6 +1235,9 @@ impl Session {
     /// Takes a download off those under way: `false` when it isn't one of them (another project
     /// was opened meanwhile).
     fn landed(&mut self, id: u64) -> bool {
+        if self.download_owner(id).is_err() {
+            return false;
+        }
         let pending = self.download_is_pending(id);
         if let Err(e) = self.download_continues(id) {
             if pending {
@@ -1211,15 +1252,22 @@ impl Session {
 
     /// Forgets a download that failed.
     pub fn download_failed(&mut self, id: u64) {
-        self.forget_download_claim(id);
+        if self.download_owner(id).is_err() {
+            return;
+        }
+        self.retire_download_claim(id, "this download failed before it completed");
         self.downloading.retain(|d| *d != id);
     }
 
     /// Forgets a download the front end opens itself (a project by its address), saying whether
     /// it still belongs to this project: `false` when another project was opened meanwhile.
     pub fn download_done(&mut self, id: u64) -> bool {
+        if self.download_owner(id).is_err() {
+            return false;
+        }
         let current = self.downloading.contains(&id);
-        self.download_failed(id);
+        self.forget_download_claim(id);
+        self.downloading.retain(|d| *d != id);
         current
     }
 
@@ -1306,9 +1354,10 @@ impl Session {
     }
 
     /// Shows the Zarr steps read off the frame ([`Session::zarr_off_frame`]) once they land: the
-    /// app asks each frame. True when one landed, so the map draws again.
+    /// app asks each frame. Named scopes leave the completion for its native owner. True when
+    /// one landed, so the map draws again.
     pub fn follow_time_landed(&mut self) -> bool {
-        if !cmd::zarr::landed_since(&mut self.zarr_seen) {
+        if !self.policy_ingress_idle() || !cmd::zarr::landed_since(&mut self.zarr_seen) {
             return false;
         }
         cmd::zarr::follow_time(self);
@@ -1338,7 +1387,16 @@ impl Session {
     /// panic restores it. A command run by itself (not as a part of another) that changes the
     /// project, or reaches a file or a service, goes into the session's log (#797).
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
-        self.command_epilogue(id, params, |s| s.run_command(id, params))
+        self.command_epilogue(id, params, |s| {
+            let native_maintenance = s.depth == 0 && s.policy_ingress_idle();
+            let result = s.run_command(id, params);
+            // Native sessions without a drawing loop recover their own failed overviews.
+            // Named callers and sealed completions do not initiate unrelated maintenance.
+            if native_maintenance && s.read_in_place_again() {
+                s.wait_in_place_reads();
+            }
+            result
+        })
     }
 
     /// Shared command bookkeeping for ordinary dispatch and execution of an already pinned retry.
@@ -1368,6 +1426,8 @@ impl Session {
             let joins = self.merge.is_some() && self.merge == self.merged && !self.undo.is_empty();
             let (at, start) = (project_log::now_ms(), web_time::Instant::now());
             let res = run(self);
+            // Pixels the command read in place (a project, an import) say what they lost.
+            self.notice_landed_rasters();
             // A plugin's command waiting for its fetches answers `pending` and runs again when they
             // land: logged then, once. (Another command's `pending`, a download the web app makes, is
             // logged as it is asked for: nothing runs it again.)
@@ -1416,7 +1476,12 @@ impl Session {
         }
     }
 
+    /// Cleans every returned error, including early refusal and plugin paths.
     fn run_command(&mut self, id: &str, params: &Value) -> CmdResult {
+        self.run_command_inner(id, params).map_err(|e| durable::generated_text(&e))
+    }
+
+    fn run_command_inner(&mut self, id: &str, params: &Value) -> CmdResult {
         // The merge key asked for ([`Session::merge_undo`]) goes to this command if it runs, and is
         // gone if it's refused first, so it can't merge a later command into the last step.
         let merge = if self.depth == 0 { self.merge.take() } else { None };
@@ -1429,7 +1494,7 @@ impl Session {
             self.merge = merge;
             return self.invoke(op, policy::Txn::Own);
         }
-        let Some(&spec) = self.registry.get(id) else { return Err(format!("unknown command '{id}'")) };
+        let Some(&spec) = self.registry.get(id) else { return Err(format!("unknown command '{}'", project_log::log_identifier(id))) };
         // Keys the command does not read: said, so a script or an agent can correct itself.
         if let (Value::Object(given), Some(known)) = (params, spec.param_keys()) {
             // Bounded: the keys come from the caller (the first few, each clipped).
@@ -1482,8 +1547,7 @@ impl Session {
         {
             self.sources.note(src);
         }
-        // An error never quotes a web-service connection's password or key.
-        res.map_err(|e| render::rustgis_tiles::logins::scrub(&e))
+        res
     }
 
     /// Retires only this consumed reservation, preserving unrelated pending imports in history.
@@ -1821,6 +1885,134 @@ impl Session {
         }
     }
 
+    /// Says what reading raster layers' pixels lost when it wasn't said as each was added (pixels
+    /// read in place land later: in the browser, a project, an import): what the file's header
+    /// left out (`Raster::lost`: a colour table missing or short, GDAL metadata that doesn't
+    /// decode), an overview statistics and tools read, a layer read in place that couldn't be
+    /// read, and why. Once for each layer's pixels or failure, one notice of each kind; the app
+    /// calls it each frame.
+    pub fn notice_landed_rasters(&mut self) {
+        let (mut lost, mut held, mut failed, mut dropped) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for m in &mut self.project.maps {
+            for l in &mut m.layers {
+                let Some(rl) = &mut l.raster else { continue };
+                if let Some(e) = rl.error_unsaid() {
+                    failed.push((l.name.clone(), e));
+                }
+                let dropped_here = rl.dropped_unsaid();
+                if !dropped_here.is_empty() {
+                    dropped.push((l.name.clone(), dropped_here));
+                }
+                let in_place = rl.in_place;
+                lost.extend(rl.lost_unsaid().into_iter().map(|what| (l.name.clone(), what)));
+                let Some(d) = rl.pixels_unsaid() else { continue };
+                if let Some(what) = in_place.then(|| in_place_overview(&d)).flatten() {
+                    held.push((l.name.clone(), what));
+                }
+            }
+        }
+        // What a header left out, as adding the layer says it (one notice a kind, with counts).
+        cmd::raster::say_losses(self, lost);
+        if !dropped.is_empty() {
+            let mut kinds: Vec<&str> = dropped.iter().flat_map(|(_, k)| k.iter().copied()).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            let names: Vec<String> = dropped.iter().map(|(n, _)| n.clone()).collect();
+            self.notify(
+                format!(
+                    "{} COG tile layer(s) opened as raster layers read in place, which have no {}: not kept for {}",
+                    dropped.len(),
+                    kinds.join(", "),
+                    names_said(&names)
+                ),
+                false,
+            );
+        }
+        match &failed[..] {
+            [] => {}
+            [(one, e)] => self.notify(format!("{}: couldn't be read in place: {e}", clip(one, 80)), true),
+            many => {
+                let names: Vec<String> = many.iter().map(|(n, _)| n.clone()).collect();
+                self.notify(format!("{} raster layers couldn't be read in place: {}", many.len(), names_said(&names)), true);
+            }
+        }
+        match &held[..] {
+            [] => {}
+            [(one, what)] => self.notify(format!("{}: {what}", clip(one, 80)), false),
+            many => {
+                let names: Vec<String> = many.iter().map(|(n, _)| n.clone()).collect();
+                self.notify(
+                    format!(
+                        "{} rasters are read in place: the map draws them at full resolution as it needs it, while statistics, histograms and raster tools read an overview of each: {}",
+                        many.len(),
+                        names_said(&names)
+                    ),
+                    false,
+                )
+            }
+        }
+    }
+
+    /// Waits for the overviews of the rasters read in place that a project, an import or a layer
+    /// file began reading together (see [`crate::project::read_in_place`]), where the session
+    /// waits for them ([`Session::in_place_wait`]: natively, two minutes at most for all); where
+    /// it doesn't, they land as the map draws. Failing is the layer's to say (see
+    /// [`Session::notice_landed_rasters`]).
+    pub(crate) fn wait_in_place_reads(&mut self) {
+        if !self.in_place_wait {
+            return;
+        }
+        // Every map's at once: one wait bounds them all, not each map's in turn.
+        let mut named: Vec<(String, &mut rustgis_map::raster::RasterLayer)> = self
+            .project
+            .maps
+            .iter_mut()
+            .flat_map(|m| m.layers.iter_mut())
+            .filter_map(|l| {
+                let name = l.name.clone();
+                let rl = l.raster.as_mut()?;
+                rl.in_place.then_some((name, rl))
+            })
+            .collect();
+        let mut layers: Vec<&mut rustgis_map::raster::RasterLayer> = named.iter_mut().map(|(_, rl)| &mut **rl).collect();
+        for (i, e) in rustgis_map::raster::wait_for_reads(&mut layers) {
+            if let Some((name, _)) = named.get(i) {
+                log::warn!("{name}: {e}");
+            }
+        }
+    }
+
+    /// Reads again the overview of a raster layer read in place whose read failed, once its wait
+    /// is over: a minute, or what its server's `Retry-After` said, as a tile or a file's header is
+    /// read again (see `rustgis_tiles::cache::retry_wait`), doubled each time it fails again,
+    /// within the hour (`cache::backoff`: a file that never reads isn't asked for every minute all
+    /// session); until then the map is asked to draw again when the wait is over. The app calls it
+    /// each frame, with [`Session::notice_landed_rasters`], and [`Session::run`] after each command
+    /// (a session that doesn't draw, the command line or Python, asks again that way); the pixels
+    /// land as the map draws, or are waited for where the session waits for reads in place
+    /// ([`Session::in_place_wait`]). Whether a read was started.
+    pub fn read_in_place_again(&mut self) -> bool {
+        use render::rustgis_tiles::cache;
+        if !self.policy_ingress_idle() || self.depth > 0 {
+            return false;
+        }
+        let mut started = false;
+        for m in &mut self.project.maps {
+            for l in &mut m.layers {
+                let Some(rl) = &mut l.raster else { continue };
+                let Some((e, at, failures)) = rl.read_failure() else { continue };
+                let wait = cache::backoff(cache::retry_wait(e, cache::RETRY), failures);
+                if at.elapsed() < wait {
+                    cache::notify_at(at + wait);
+                } else {
+                    rl.read_again();
+                    started = true;
+                }
+            }
+        }
+        started
+    }
+
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
         use rustgis_data::diagnostics::Severity;
         self.notice(text.into(), if error { Severity::Error } else { Severity::Info });
@@ -1845,7 +2037,7 @@ impl Session {
     /// redacted: what a notice or history record may show. Login values are known only here, so
     /// a failure redacted by [`Session::notify_redacted`]'s callers goes through this first.
     pub fn redacted(text: &str) -> rustgis_data::diagnostics::Redacted {
-        rustgis_data::diagnostics::Redacted::new(&render::rustgis_tiles::logins::scrub(text))
+        rustgis_data::diagnostics::Redacted::new(&durable::generated_text(text))
     }
 
     /// [`Session::notify`] for text already scrubbed and redacted by [`Session::redacted`] (a
@@ -2333,9 +2525,9 @@ impl durable::Durable for GpRecord {
         use durable::Leaf;
         let Self { tool, id, params, command, at: _, ok: _, messages, millis: _, outputs: _ } = self;
         let tool = if id.is_empty() { cmd::gp::tool_id(tool).unwrap_or("") } else { id };
-        p.tool(Leaf::HistoryParams, tool, params);
+        p.tool(Leaf::HistoryParams, Leaf::HistoryId, tool, params);
         if let Some((id, params)) = command {
-            p.command(Leaf::HistoryCommand, id, params);
+            p.command(Leaf::HistoryCommand, Leaf::HistoryCommandId, id, params);
         }
         for (i, message) in messages.iter().enumerate() {
             p.generated(Leaf::Message(i), message);
@@ -2348,7 +2540,9 @@ impl durable::Durable for GpRecord {
         }
         match leaf {
             Leaf::HistoryParams => Some(FieldMut::Json(&mut self.params)),
+            Leaf::HistoryId => Some(FieldMut::Text(&mut self.id)),
             Leaf::HistoryCommand => Some(FieldMut::Json(&mut self.command.as_mut()?.1)),
+            Leaf::HistoryCommandId => Some(FieldMut::Text(&mut self.command.as_mut()?.0)),
             Leaf::Message(i) => self.messages.get_mut(*i).map(FieldMut::Text),
             _ => None,
         }
@@ -2359,8 +2553,7 @@ impl Session {
     /// The single history production seam: retained generated messages never keep address keys.
     pub(crate) fn push_gp_record(&mut self, mut record: GpRecord) {
         for message in &mut record.messages {
-            let scrubbed = render::rustgis_tiles::logins::scrub(message);
-            *message = rustgis_data::address::scrub_addresses(&scrubbed).0.into_owned();
+            *message = durable::generated_text(message);
         }
         self.project.gp_history.push(record);
     }

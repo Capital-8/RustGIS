@@ -1244,6 +1244,59 @@ fn mcp_snapshot_draws_offscreen_and_saves_with_access() {
     assert!(tools::gate(&s, &plain).is_none());
 }
 
+/// Image adapters share map-render source reach and exact private routes with command exports.
+#[test]
+fn permission_render_adapters_require_and_bind_remote_tile_sources() {
+    use rustgis_engine::policy::{AgentAccess, Effect, Effects, Outcome, Revocation, Scope};
+    use std::sync::Arc;
+    struct LocalOnly;
+    impl Revocation for LocalOnly {
+        fn allows(&self, effects: Effects) -> bool {
+            !effects.contains(Effect::Network)
+        }
+    }
+    let local = Scope::agent(AgentAccess::Allow, false, "adapter-render-local", None, Arc::new(LocalOnly));
+    let mut missed = Vec::new();
+    for name in ["snapshot", "view_map"] {
+        let mut s = Session::new(Project::default());
+        let call = ToolCall { id: name.into(), name: name.into(), args: json!({}) };
+        let engine = tools::policy_call(&call).unwrap().unwrap();
+        assert!(matches!(s.review(&local, &engine), Outcome::Allowed), "an in-memory map stays offline");
+        s.map_mut().tiles.push(rustgis_engine::map::TileLayer::new(
+            "Remote image",
+            rustgis_engine::map::TileKind::Raster,
+            "https://adapter-render.invalid/{z}/{x}/{y}.png?token=RGSYNTH_adapter_first",
+        ));
+        if !matches!(s.review(&local, &engine), Outcome::Refused(_)) {
+            missed.push(name);
+        }
+        let scope = Scope::assistant(1521, Arc::new(tools::Live::default()));
+        if let Outcome::NeedsApproval(pending) = s.review(&scope, &engine) {
+            assert!(!format!("{:?}", pending.review()).contains("RGSYNTH_adapter_"));
+            let remembered = pending.remember().unwrap();
+            let permit = pending.allow();
+            s.map_mut().tiles[0].url = "https://adapter-render.invalid/{z}/{x}/{y}.png?token=RGSYNTH_adapter_changed".into();
+            let Outcome::NeedsApproval(changed) = s.review(&scope, &engine) else { panic!("changed render still needs approval") };
+            assert!(!changed.covered_by(&remembered), "redaction cannot hide a changed tile route");
+            assert!(s.defer(scope.clone(), &engine, Some(permit)).is_err(), "the changed route is refused before rendering");
+            let held = s.defer(scope, &engine, Some(changed.allow())).unwrap();
+            s.map_mut().tiles[0].url = "https://adapter-render.invalid/{z}/{x}/{y}.png?token=RGSYNTH_adapter_after_defer".into();
+            let mut called = false;
+            let error = s
+                .finish_deferred(held, |_| {
+                    called = true;
+                })
+                .unwrap_err();
+            assert!(!called && error.contains("changed"), "the live render callback never sees a route changed after admission: {error}");
+        } else {
+            missed.push(name);
+        }
+        s.map_mut().tiles[0].visible = false;
+        assert!(matches!(s.review(&local, &engine), Outcome::Allowed), "hidden remote tiles are not fetched");
+    }
+    assert!(missed.is_empty(), "image adapters omitted remote tile admission: {missed:?}");
+}
+
 /// Only the desktop relay, where the session is the user's open project, tells the agent the
 /// user is watching.
 #[test]
@@ -1340,6 +1393,18 @@ fn mcp_protocol_errors() {
     assert_eq!(rpc(&server, &mut s, "tools/call", json!({"name": "no_such_tool"}))["error"]["code"], -32602);
     assert_eq!(rpc(&server, &mut s, "tools/call", json!({"name": "list_layers", "arguments": [1]}))["error"]["code"], -32602);
     assert_eq!(rpc(&server, &mut s, "resources/read", json!({"uri": "rustgis://docs/nope.md"}))["error"]["code"], -32002);
+    // Protocol validation fails before tool dispatch; its generated text is public too.
+    let private = "https://rpc-error.invalid/a?token=RGSYNTH_rpc_error&layer=roads";
+    for (method, params, code) in [
+        ("tools/call", json!({"name":private,"arguments":{}}), -32602),
+        ("resources/read", json!({"uri":private}), -32002),
+        (private, json!({}), -32601),
+    ] {
+        let reply = rpc(&server, &mut s, method, params);
+        assert_eq!(reply["error"]["code"], code);
+        assert!(!reply["error"]["message"].as_str().unwrap().contains("RGSYNTH_rpc_error"));
+    }
+    assert_eq!(rpc(&server, &mut s, "ping", json!({})), json!({}));
     // Batches: one reply per request, none for notifications only.
     let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":2,"method":"nope"}]"#;
     let r: Value = serde_json::from_str(&server.handle(&mut s, batch).unwrap()).unwrap();
@@ -4559,6 +4624,13 @@ fn peer_replacement_cancels_approvals_and_stale_replies() {
     assert!(agent.transcript.len() >= transcript);
     let _ = agent.receive(generation, ok(say("stale")), &mut s);
     assert!(!agent.busy() && agent.pending(&s).is_none());
+    assert!(matches!(agent.ask("start a new request", &s), Step::Send(_)));
+    let current = agent.generation();
+    let transcript = agent.transcript.len();
+    let _ = agent.receive(generation, ok(say("stale while waiting")), &mut s);
+    assert_eq!(agent.generation(), current);
+    assert!(agent.waiting() && agent.pending(&s).is_none());
+    assert_eq!(agent.transcript.len(), transcript);
 }
 
 /// The existing real Wasm fixture crosses Agent pending/decide and MCP, by id and display name.

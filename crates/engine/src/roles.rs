@@ -12,18 +12,17 @@ use crate::durable::{self, Durable, Kept, Report};
 
 /// A replayable parameter's durable-output role. Permission policy does not consume roles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ParamRole {
+pub(crate) struct ParamRole {
     pub key: &'static str,
     pub role: Role,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role {
-    Address,
-    Path,
+pub(crate) enum Role {
     Secret,
     Dataset,
     Configuration,
     Sql,
+    Opaque,
     ToolParams,
     Script,
     TaskSteps,
@@ -32,7 +31,7 @@ pub enum Role {
     Document(Document),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Document {
+pub(crate) enum Document {
     Project,
     Map,
     Task,
@@ -77,7 +76,7 @@ const ADDRESS: &[&str] =
     &["url", "urls", "href", "source", "template", "tiles", "store", "endpoint", "address", "uri", "connection", "database"];
 const CONFIG: &[&str] = &["headers", "options", "auth", "connection", "source", "sources"];
 
-/// Durable output reads its own field from the immutable command registry. An explicit empty
+/// Durable output reads its own field from reviewed builtin registrations. An explicit empty
 /// declaration retains the reviewed common scalar/address/configuration rules below.
 fn metadata(id: &str) -> Option<&'static [ParamRole]> {
     static ROLES: OnceLock<HashMap<&'static str, &'static [ParamRole]>> = OnceLock::new();
@@ -120,6 +119,31 @@ pub(crate) fn tool(id: &str, params: &Value, depth: usize) -> (Option<Value>, Re
     (changed, report)
 }
 
+/// Identifiers are structural executable fields, not layer names or user data. Recognized
+/// addresses are cleaned; credential-bearing malformed payloads are withheld as a whole.
+pub(crate) fn identifier(id: &str, report: &mut Report) -> Option<String> {
+    // A colon-separated credential key/value is payload; a qualified plugin/tool id alone is not.
+    let colon_value = id
+        .split(':')
+        .zip(id.split(':').skip(1))
+        .take(65_536)
+        .any(|(key, value)| !value.is_empty() && rustgis_data::address::secret_key(key));
+    match durable::public_address(id) {
+        Kept::Changed(public) => Some(public),
+        Kept::Withheld(prefix) if prefix != id => {
+            report.withheld = report.withheld.saturating_add(1);
+            Some(prefix.into())
+        }
+        _ if (colon_value || id.contains(['=', '{', '[', '"']) || id.contains(char::is_whitespace))
+            && suspicious(&Value::String(id.into())) =>
+        {
+            report.withheld = report.withheld.saturating_add(1);
+            Some("[command withheld]".into())
+        }
+        _ => None,
+    }
+}
+
 /// Lazily copies only changed owning parameter objects. Configuration recursion is bounded.
 fn object(id: &str, value: &Value, depth: usize, config_depth: usize, registered: bool, report: &mut Report) -> Option<Value> {
     if value.is_null() {
@@ -149,6 +173,9 @@ fn object(id: &str, value: &Value, depth: usize, config_depth: usize, registered
             } else {
                 envelope(role, v, obj, depth + 1, report)
             }
+        } else if role == Some(Role::Opaque) {
+            unchecked |= suspicious(v);
+            None
         } else if (role == Some(Role::Secret) || rustgis_data::address::secret_key(key))
             && (k != "key"
                 || crate::sources::looks_like_a_key(v.as_str().unwrap_or(""))
@@ -175,7 +202,7 @@ fn object(id: &str, value: &Value, depth: usize, config_depth: usize, registered
                 let clean = crate::project_log::sql_secrets_removed(s);
                 (clean != s).then_some(Value::String(clean))
             })
-        } else if matches!(role, Some(Role::Address | Role::Path)) || ADDRESS.contains(&k.as_str()) || address_like(v) {
+        } else if ADDRESS.contains(&k.as_str()) || address_like(v) {
             if v.is_object() && registered && (role == Some(Role::Configuration) || CONFIG.contains(&k.as_str())) {
                 object("", v, depth, config_depth + 1, true, report)
             } else {
@@ -304,7 +331,7 @@ impl Durable for VecTask {
     /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut durable::Prepare<'_>) {
         for (i, st) in self.0.iter().enumerate() {
-            p.command(durable::Leaf::Task(i), &st.command, &st.params);
+            p.command(durable::Leaf::Task(i), durable::Leaf::TaskCommand(i), &st.command, &st.params);
         }
     }
 
@@ -313,8 +340,11 @@ impl Durable for VecTask {
         if !owners.is_empty() {
             return None;
         }
-        let durable::Leaf::Task(i) = leaf else { return None };
-        Some(durable::FieldMut::Json(&mut self.0.get_mut(*i)?.params))
+        match leaf {
+            durable::Leaf::Task(i) => Some(durable::FieldMut::Json(&mut self.0.get_mut(*i)?.params)),
+            durable::Leaf::TaskCommand(i) => Some(durable::FieldMut::Text(&mut self.0.get_mut(*i)?.command)),
+            _ => None,
+        }
     }
 }
 
@@ -326,7 +356,7 @@ impl Durable for VecSteps {
     /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut durable::Prepare<'_>) {
         for (i, st) in self.0.iter().enumerate() {
-            p.tool(durable::Leaf::ModelStep(i), &st.tool, &st.params);
+            p.tool(durable::Leaf::ModelStep(i), durable::Leaf::ModelStepTool(i), &st.tool, &st.params);
         }
     }
 
@@ -335,8 +365,11 @@ impl Durable for VecSteps {
         if !owners.is_empty() {
             return None;
         }
-        let durable::Leaf::ModelStep(i) = leaf else { return None };
-        Some(durable::FieldMut::Json(&mut self.0.get_mut(*i)?.params))
+        match leaf {
+            durable::Leaf::ModelStep(i) => Some(durable::FieldMut::Json(&mut self.0.get_mut(*i)?.params)),
+            durable::Leaf::ModelStepTool(i) => Some(durable::FieldMut::Text(&mut self.0.get_mut(*i)?.tool)),
+            _ => None,
+        }
     }
 }
 
@@ -416,14 +449,19 @@ pub(crate) fn script(source: &str, depth: usize) -> (Option<String>, Report) {
         let replacement = match crate::script_line(line) {
             None => None,
             Some(Ok((id, params))) => {
+                let public_id = identifier(&id, &mut report);
                 let (clean, r) = command(&id, &params, depth);
                 report.merge(&r);
-                clean.map(|params| format!("{id} {params}{ending}"))
+                match clean {
+                    Some(params) => Some(format!("{} {params}{ending}", public_id.as_deref().unwrap_or(&id))),
+                    None => public_id.map(|public| line.replacen(&id, &public, 1)),
+                }
             }
             Some(Err(_)) if suspicious(&Value::String(line.into())) => {
                 report.withheld = report.withheld.saturating_add(1);
                 let id = line.trim_start().split(char::is_whitespace).next().unwrap_or("");
-                Some(format!("{id} {WITHHELD}{ending}"))
+                let public_id = identifier(id, &mut report);
+                Some(format!("{} {WITHHELD}{ending}", public_id.as_deref().unwrap_or(id)))
             }
             Some(Err(_)) => None,
         };

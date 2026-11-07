@@ -180,7 +180,8 @@ impl Engine {
     }
 
     /// The project as `.rgis` JSON text, as `project.saveAs` writes it (what `project.openText`
-    /// opens).
+    /// opens). This save-equivalent output retains a bounded same-process restore snapshot;
+    /// repeated identical text replaces that snapshot. Unfinished imports are refused.
     fn project_json(&self, py: Python<'_>) -> PyResult<String> {
         let result = self.with_session(py, |session| {
             let (text, report) = session.project.saved_text(None)?;

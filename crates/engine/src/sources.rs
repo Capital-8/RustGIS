@@ -365,7 +365,8 @@ pub fn redact(address: &str) -> String {
     {
         return address.to_string();
     }
-    if let Some((public, _)) = rustgis_data::source::myconn::split_password(address) {
+    if let Some((mut public, _)) = rustgis_data::source::myconn::split_password(address) {
+        rustgis_data::address::redact_query(&mut public);
         return public;
     }
     if let Some((public, _)) = rustgis_data::source::msconn::split_password(address) {

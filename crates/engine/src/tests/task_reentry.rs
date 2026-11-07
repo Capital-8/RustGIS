@@ -177,7 +177,7 @@ fn task_reentry_guard_covers_notebook_paths() {
 #[test]
 fn permission_review_notebook_automation_asks_each_time() {
     #[cfg(not(target_arch = "wasm32"))]
-    if isolate_account_test("tests::task_reentry::permission_review_notebook_automation_asks_each_time") {
+    if isolate_process_test("tests::task_reentry::permission_review_notebook_automation_asks_each_time") {
         return;
     }
     let mut s = world();
@@ -196,7 +196,7 @@ fn permission_review_notebook_automation_asks_each_time() {
 #[test]
 fn permission_review_notebook_automation_is_refused_to_plugins() {
     #[cfg(not(target_arch = "wasm32"))]
-    if isolate_account_test("tests::task_reentry::permission_review_notebook_automation_is_refused_to_plugins") {
+    if isolate_process_test("tests::task_reentry::permission_review_notebook_automation_is_refused_to_plugins") {
         return;
     }
     let mut s = world();
@@ -288,7 +288,7 @@ fn permission_review_memory_views_and_offline_work_need_no_external_access() {
 #[test]
 fn permission_review_source_preferences_require_file_permission() {
     #[cfg(not(target_arch = "wasm32"))]
-    if isolate_account_test("tests::task_reentry::permission_review_source_preferences_require_file_permission") {
+    if isolate_process_test("tests::task_reentry::permission_review_source_preferences_require_file_permission") {
         return;
     }
     // A connection label carries no path-shaped text from which Files could be inferred.

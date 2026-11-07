@@ -6,23 +6,52 @@ use crate::{
     durable::{self, Report},
 };
 use durable::{At, Durable, FieldMut, Kept, Leaf, Owner};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum SlotKey {
-    Map { index: usize, name: String, at: rustgis_map::SlotAt },
-    Area { index: usize, at: rustgis_map::SlotAt },
+enum Position<'a> {
+    Layer { id: u32, role: rustgis_map::LayerRole },
+    Tile { id: Cow<'a, str>, role: rustgis_map::TileRole },
+    Group { id: u32, child: Option<u32> },
+    Terrain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SlotKey<'a> {
+    Map { index: usize, name: Cow<'a, str>, at: Position<'a> },
+    Area { index: usize, at: Position<'a> },
     Table(u32),
     Video { presentation: usize, page: usize },
 }
 
+impl SlotKey<'_> {
+    /// Only retained, budgeted identities own copies; raw censuses borrow hostile names.
+    fn owned(&self) -> SlotKey<'static> {
+        let position = |at: &Position<'_>| match at {
+            Position::Layer { id, role } => Position::Layer { id: *id, role: *role },
+            Position::Tile { id, role } => Position::Tile { id: Cow::Owned(id.to_string()), role: *role },
+            Position::Group { id, child } => Position::Group { id: *id, child: *child },
+            Position::Terrain => Position::Terrain,
+        };
+        match self {
+            Self::Map { index, name, at } => SlotKey::Map { index: *index, name: Cow::Owned(name.to_string()), at: position(at) },
+            Self::Area { index, at } => SlotKey::Area { index: *index, at: position(at) },
+            Self::Table(id) => SlotKey::Table(*id),
+            Self::Video { presentation, page } => SlotKey::Video { presentation: *presentation, page: *page },
+        }
+    }
+}
+
 struct Slot<'a> {
-    key: SlotKey,
+    key: SlotKey<'a>,
     at: At,
     value: &'a str,
+    layer: Option<&'a rustgis_map::Layer>,
 }
 struct Entry {
-    key: SlotKey,
+    key: SlotKey<'static>,
+    choice: Option<String>,
     public: String,
     full: String,
     ambiguous: bool,
@@ -40,29 +69,42 @@ fn slots(p: &Project) -> Vec<Slot<'_>> {
     let mut out = Vec::new();
     for (i, m) in p.maps.iter().enumerate() {
         for slot in m.slots().into_iter().filter(|s| s.address) {
-            if let Some(at) = m.slot_identity(&slot.at) {
+            if let Some(at) = position(m, &slot.at) {
                 out.push(Slot {
-                    key: SlotKey::Map { index: i, name: m.name.clone(), at },
-                    at: At { owners: vec![Owner::Map(i)], leaf: Leaf::Map(slot.at) },
+                    key: SlotKey::Map { index: i, name: Cow::Borrowed(&m.name), at },
+                    at: At { owners: vec![Owner::Map(i)], leaf: Leaf::Map(slot.at.clone()) },
                     value: slot.value,
+                    layer: match slot.at {
+                        rustgis_map::SlotPos::Layer { layer, .. } => m.layers.get(layer),
+                        _ => None,
+                    },
                 });
             }
         }
     }
     for (i, area) in p.offline_areas.iter().enumerate() {
         for slot in area.data.slots().into_iter().filter(|s| s.address) {
-            if let Some(at) = area.data.slot_identity(&slot.at) {
+            if let Some(at) = position(&area.data, &slot.at) {
                 out.push(Slot {
                     key: SlotKey::Area { index: i, at },
-                    at: At { owners: vec![Owner::Area(i)], leaf: Leaf::Map(slot.at) },
+                    at: At { owners: vec![Owner::Area(i)], leaf: Leaf::Map(slot.at.clone()) },
                     value: slot.value,
+                    layer: match slot.at {
+                        rustgis_map::SlotPos::Layer { layer, .. } => area.data.layers.get(layer),
+                        _ => None,
+                    },
                 });
             }
         }
     }
     for (i, table) in p.tables.iter().enumerate() {
         if let Some(value) = &table.source {
-            out.push(Slot { key: SlotKey::Table(table.id), at: At { owners: vec![Owner::Table(i)], leaf: Leaf::Table }, value });
+            out.push(Slot {
+                key: SlotKey::Table(table.id),
+                at: At { owners: vec![Owner::Table(i)], leaf: Leaf::Table },
+                value,
+                layer: None,
+            });
         }
     }
     for (i, pres) in p.presentations.iter().enumerate() {
@@ -72,11 +114,95 @@ fn slots(p: &Project) -> Vec<Slot<'_>> {
                     key: SlotKey::Video { presentation: i, page },
                     at: At { owners: vec![Owner::Presentation(i)], leaf: Leaf::Video(page) },
                     value: source,
+                    layer: None,
                 });
             }
         }
     }
     out
+}
+
+/// Resolves raw owner identity without copying untrusted map or tile names.
+fn position<'a>(map: &'a rustgis_map::Map, at: &rustgis_map::SlotPos) -> Option<Position<'a>> {
+    use rustgis_map::SlotPos;
+    Some(match at {
+        SlotPos::Layer { layer, role } => Position::Layer { id: map.layers.get(*layer)?.id, role: *role },
+        SlotPos::Tile { tile, role } => Position::Tile { id: Cow::Borrowed(&map.tiles.get(*tile)?.id), role: *role },
+        SlotPos::Group { group, child } => {
+            let group = map.service_groups.get(*group)?;
+            Position::Group {
+                id: group.id,
+                child: match child {
+                    Some(i) => Some(group.children.get(*i)?.layer),
+                    None => None,
+                },
+            }
+        }
+        SlotPos::Terrain => Position::Terrain,
+    })
+}
+
+/// Read selection, not drawing style or cached rows. The last exchange, live source and raw
+/// incoming source must agree before normalization or a full address can be retained.
+fn source_choice(layer: Option<&rustgis_map::Layer>) -> Result<Option<String>, ()> {
+    let Some(layer) = layer.filter(|l| l.source.is_some() || l.raster.is_some() || l.postgis.is_some()) else { return Ok(None) };
+    if layer.output_slots().iter().any(|(_, value, _, _)| value.len() > MAX_BYTES)
+        || layer.source.as_ref().and_then(|s| s.embedded.as_ref()).is_some_and(|b| b.len() > MAX_BYTES)
+        || layer.raster.as_ref().and_then(|r| r.embedded.as_ref()).is_some_and(|b| b.len() > MAX_BYTES)
+    {
+        return Err(());
+    }
+    let public = |s: &str| match durable::public_address(s) {
+        Kept::Unchanged | Kept::Withheld(_) => s.to_string(),
+        Kept::Changed(s) => s,
+    };
+    let source = layer.source.as_ref().map(|s| {
+        (
+            s.path.as_deref().map(public),
+            &s.file_name,
+            &s.table,
+            &s.shapefile_crs,
+            s.embedded.as_deref(),
+            s.gdal.as_ref().map(|g| (public(&g.path), &g.layer, g.family, &g.crs)),
+            s.duckdb.as_ref().map(|d| (&d.sql, d.database.as_deref().map(public), &d.table, &d.crs, d.family)),
+            s.postgis.as_ref().map(|d| (public(&d.database), &d.table, d.family, &d.crs)),
+            s.mysql.as_ref().map(|d| (public(&d.database), &d.table, d.family, &d.crs)),
+            s.sqlserver.as_ref().map(|d| (public(&d.database), &d.table, d.family, &d.crs)),
+        )
+    });
+    let raster = layer.raster.as_ref().map(|r| {
+        (
+            r.path.as_deref().map(public),
+            r.in_place,
+            &r.file_name,
+            r.embedded.as_deref(),
+            &r.subdataset,
+            &r.crs,
+            r.placement,
+            r.time_zarr.as_ref().map(|z| (public(&z.store), &z.variable, &z.index, &z.dim, z.offset, &z.dates, &z.crs)),
+        )
+    });
+    let edit = layer.postgis.as_ref().map(|p| {
+        (public(&p.origin.database), &p.origin.table, p.origin.family, &p.origin.crs, &p.key, p.srid, p.writable, &p.condition, p.limit)
+    });
+    struct Bounded(Vec<u8>);
+    impl std::io::Write for Bounded {
+        /// Stops at the retention budget before allocating another chunk.
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0.len().saturating_add(bytes.len()) > MAX_BYTES {
+                return Err(std::io::Error::other("peer source identity exceeds retention limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        /// The bounded buffer has no pending I/O.
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Bounded(Vec::new());
+    serde_json::to_writer(&mut out, &(source, raster, edit)).map_err(|_| ())?;
+    String::from_utf8(out.0).map(Some).map_err(|_| ())
 }
 
 /// A wrapper's binding belongs to S3 connection resolution, never exchange retention.
@@ -86,16 +212,16 @@ fn wrapped(value: &str) -> bool {
 }
 
 /// Charges both forms and the complete identity payload, bounded before copying either form.
-fn key_bytes(key: &SlotKey) -> usize {
+fn key_bytes(key: &SlotKey<'_>) -> usize {
     let extra = match key {
         SlotKey::Map { name, at, .. } => name.len().saturating_add(match at {
-            rustgis_map::SlotAt::Tile { id, .. } => id.len(),
+            Position::Tile { id, .. } => id.len(),
             _ => 0,
         }),
-        SlotKey::Area { at: rustgis_map::SlotAt::Tile { id, .. }, .. } => id.len(),
+        SlotKey::Area { at: Position::Tile { id, .. }, .. } => id.len(),
         _ => 0,
     };
-    std::mem::size_of::<SlotKey>().saturating_add(extra)
+    std::mem::size_of::<SlotKey<'_>>().saturating_add(extra)
 }
 
 impl Exchange {
@@ -107,10 +233,16 @@ impl Exchange {
         let mut held = 0usize;
         let mut omitted = 0u32;
         for slot in slots(p) {
-            if wrapped(slot.value) {
+            if wrapped(slot.value) || slot.layer.and_then(|l| l.source.as_ref()).is_some_and(|s| s.reconnect_required()) {
                 continue;
             }
+            // A clean database address may still use a typed password held by its driver.
+            let database = slot
+                .layer
+                .and_then(|l| l.source.as_ref())
+                .is_some_and(|s| s.postgis.is_some() || s.mysql.is_some() || s.sqlserver.is_some() || s.duckdb.is_some());
             let public = match durable::public_address(slot.value) {
+                Kept::Unchanged if database => slot.value.to_string(),
                 Kept::Unchanged => continue,
                 Kept::Changed(s) => s,
                 Kept::Withheld(prefix) => prefix.into(),
@@ -120,7 +252,16 @@ impl Exchange {
             if let Some((first, ambiguous)) = forms.get_mut(&public) {
                 *ambiguous |= entries.get(*first).is_none_or(|e| e.full != slot.value);
             }
-            let bytes = slot.value.len().saturating_add(public.len()).saturating_add(key_bytes(&slot.key));
+            let Ok(choice) = source_choice(slot.layer) else {
+                omitted = omitted.saturating_add(1);
+                continue;
+            };
+            let bytes = slot
+                .value
+                .len()
+                .saturating_add(public.len())
+                .saturating_add(key_bytes(&slot.key))
+                .saturating_add(choice.as_ref().map_or(0, String::len));
             if !recording || entries.len() >= MAX_ENTRIES || held.saturating_add(bytes) > MAX_BYTES {
                 recording = false;
                 omitted = omitted.saturating_add(1);
@@ -128,7 +269,7 @@ impl Exchange {
             }
             held += bytes;
             forms.entry(public.clone()).or_insert((entries.len(), false));
-            entries.push(Entry { key: slot.key, public, full: slot.value.into(), ambiguous: false });
+            entries.push(Entry { key: slot.key.owned(), choice, public, full: slot.value.into(), ambiguous: false });
         }
         for entry in &mut entries {
             entry.ambiguous = forms.get(&entry.public).is_none_or(|(_, ambiguous)| *ambiguous);
@@ -137,24 +278,28 @@ impl Exchange {
     }
 
     /// The pre-normalization census must contain exactly one byte-equal public slot.
-    fn incoming(&self, p: &Project) -> HashSet<SlotKey> {
+    fn incoming(&self, p: &Project) -> HashSet<SlotKey<'static>> {
         let census = census(p);
         self.entries
             .iter()
-            .filter(|e| census.get(&e.key).is_some_and(|(n, value)| *n == 1 && *value == e.public))
+            .filter(|e| {
+                census.get(&e.key).is_some_and(|(n, value, layer)| {
+                    *n == 1 && *value == e.public && source_choice(*layer).ok().as_ref() == Some(&e.choice)
+                })
+            })
             .map(|e| e.key.clone())
             .collect()
     }
 
     /// Checks last exchange, both incoming censuses, unique account and the exact current live
     /// value in one synchronous replacement. Public URL or incoming id alone grants nothing.
-    fn retain(&self, live: &Project, incoming: &mut Project, raw: &HashSet<SlotKey>) {
+    fn retain(&self, live: &Project, incoming: &mut Project, raw: &HashSet<SlotKey<'static>>) {
         let current = census(live);
         let normalized = census(incoming);
-        let mut records: HashMap<&SlotKey, (usize, &Entry)> = HashMap::new();
+        let mut records: HashMap<SlotKey<'_>, (usize, &Entry)> = HashMap::new();
         let mut accounts: HashMap<&str, Option<&str>> = HashMap::new();
         for e in &self.entries {
-            records.entry(&e.key).or_insert((0, e)).0 += 1;
+            records.entry(e.key.clone()).or_insert((0, e)).0 += 1;
             let account = accounts.entry(&e.public).or_insert(Some(&e.full));
             if *account != Some(e.full.as_str()) {
                 *account = None;
@@ -164,11 +309,16 @@ impl Exchange {
             .into_iter()
             .filter_map(|slot| {
                 let (count, e) = records.get(&slot.key)?;
-                let unique = |census: &HashMap<SlotKey, (usize, &str)>, expected: &str| {
-                    census.get(&slot.key).is_some_and(|(n, value)| *n == 1 && *value == expected)
+                let unique = |census: &Census<'_>, expected: &str| {
+                    census.get(&slot.key).is_some_and(|(n, value, layer)| {
+                        *n == 1 && *value == expected && source_choice(*layer).ok().as_ref() == Some(&e.choice)
+                    })
                 };
                 (!e.ambiguous
-                    && raw.contains(&slot.key)
+                    && raw.contains(&e.key)
+                    && !current
+                        .get(&slot.key)
+                        .is_some_and(|(_, _, layer)| layer.and_then(|l| l.source.as_ref()).is_some_and(|s| s.reconnect_required()))
                     && *count == 1
                     && accounts.get(e.public.as_str()) == Some(&Some(e.full.as_str()))
                     && unique(&current, &e.full)
@@ -202,11 +352,14 @@ fn reopen(p: &mut Project, at: &At) {
         rustgis_map::LayerRole::Streamed
         | rustgis_map::LayerRole::PostgisDatabase
         | rustgis_map::LayerRole::MysqlDatabase
-        | rustgis_map::LayerRole::SqlServerDatabase => {
-            if let Some(source) = &mut layer.source
-                && let Err(e) = source.reopen()
-            {
-                source.error = Some(rustgis_data::diagnostics::Redacted::new(&e).into_string());
+        | rustgis_map::LayerRole::SqlServerDatabase
+        | rustgis_map::LayerRole::DuckDbDatabase
+        | rustgis_map::LayerRole::GdalPath => {
+            if let Some(source) = &mut layer.source {
+                source.allow_reconnect();
+                if let Err(e) = source.reopen() {
+                    source.error = Some(rustgis_data::diagnostics::Redacted::new(&e).into_string());
+                }
             }
         }
         rustgis_map::LayerRole::Raster => {
@@ -221,10 +374,13 @@ fn reopen(p: &mut Project, at: &At) {
 }
 
 /// Values borrow the project, but identities include all duplicates; no normalization runs here.
-fn census(p: &Project) -> HashMap<SlotKey, (usize, &str)> {
+type Census<'a> = HashMap<SlotKey<'a>, (usize, &'a str, Option<&'a rustgis_map::Layer>)>;
+
+/// Counts raw duplicates while borrowing all untrusted identity text.
+fn census(p: &Project) -> Census<'_> {
     let mut out = HashMap::new();
     for slot in slots(p) {
-        let entry = out.entry(slot.key).or_insert((0usize, slot.value));
+        let entry = out.entry(slot.key).or_insert((0usize, slot.value, slot.layer));
         entry.0 = entry.0.saturating_add(1);
     }
     out
@@ -240,6 +396,7 @@ impl Session {
     /// Writes a credential-free project for a peer, without evicting explicit-save restoration.
     /// Pending downloads require a structural draft; settled projects use the live journal.
     pub fn peer_text(&mut self, peer: Peer) -> Result<(String, Report), String> {
+        let runtime = self.project.bound_address_losses(true);
         let (text, mut report) = if self.project.ensure_imports_complete().is_err() {
             let mut draft = self.project.clone();
             draft.omit_pending_imports();
@@ -247,6 +404,7 @@ impl Session {
         } else {
             durable::output(&mut self.project, None, text)
         }?;
+        report.addresses = report.addresses.saturating_add(u32::try_from(runtime).unwrap_or(u32::MAX));
         self.exchange = if peer == Peer::Bridge {
             let (record, omitted) = Exchange::record(&self.project, self.opened);
             report.not_retained = omitted;
@@ -268,24 +426,43 @@ impl Session {
         let mut p = Project::from_peer_raw(text)?;
         let exchange = self.exchange.as_ref().filter(|e| peer == Peer::Bridge && e.generation == self.opened);
         let raw = exchange.map(|e| e.incoming(&p));
+        // Normalization may open a database with a typed process-local password. Keep every
+        // incoming database source closed until last/live/raw/normalized selection agrees.
+        for map in p.maps.iter_mut().chain(p.offline_areas.iter_mut().map(|a| &mut a.data)) {
+            for source in map.layers.iter_mut().filter_map(|l| l.source.as_mut()) {
+                if source.postgis.is_some() || source.mysql.is_some() || source.sqlserver.is_some() || source.duckdb.is_some() {
+                    source.require_reconnect();
+                }
+            }
+        }
         crate::cmd::connections::clear_active();
-        p.normalize();
+        p.normalize_opened();
         let mut report = Report::default();
 
         if let (Some(exchange), Some(raw)) = (exchange, raw) {
             exchange.retain(&self.project, &mut p, &raw);
         }
+        report.reconnect = p
+            .maps
+            .iter()
+            .chain(p.offline_areas.iter().map(|a| &a.data))
+            .flat_map(|m| &m.layers)
+            .filter(|l| l.source.as_ref().is_some_and(|s| s.reconnect_required()))
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX);
         let incoming = census(&p);
         report.lost = slots(&self.project)
             .into_iter()
             .filter(|slot| {
                 !matches!(durable::public_address(slot.value), Kept::Unchanged)
-                    && !incoming.get(&slot.key).is_some_and(|(count, value)| *count == 1 && *value == slot.value)
+                    && !incoming.get(&slot.key).is_some_and(|(count, value, _)| *count == 1 && *value == slot.value)
             })
             .count()
             .try_into()
             .unwrap_or(u32::MAX);
         drop(incoming);
+        report.executable_changes = durable::changed_executables(&mut self.project, &mut p)?;
         crate::cmd::project::reset_to(self, p);
         self.path = None;
         crate::cmd::connections::resolve_project(self);
@@ -307,4 +484,52 @@ fn text(p: &Project) -> Result<String, String> {
         return Err("the project is too large to exchange".into());
     }
     Ok(text)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Table/family/CRS are part of a retained reader, even before normalization opens it.
+    #[test]
+    fn bridge_census_binds_the_full_source_choice_before_normalization() {
+        let mut p = Project::default();
+        let id = p.map_mut().add_dataset(rustgis_data::Dataset::new("Database", rustgis_data::GeometryType::None, vec![]));
+        let mut source = rustgis_map::source::SourceLayer::default();
+        source.postgis = Some(rustgis_map::source::PostgisOrigin {
+            database: "postgresql://reader:RGSYNTH_peer_choice@db.invalid/gis".into(),
+            table: "approved".into(),
+            family: None,
+            crs: None,
+        });
+        p.map_mut().layer_mut(id).unwrap().source = Some(source);
+        let mut s = Session::new(p);
+        let (public, _) = s.peer_text(Peer::Bridge).unwrap();
+        let exchange = s.exchange.as_ref().unwrap();
+        for change in ["style", "table", "family", "crs"] {
+            let mut p = Project::from_peer_raw(&public).unwrap();
+            let layer = &mut p.maps[0].layers[0];
+            let pg = layer.source.as_mut().unwrap().postgis.as_mut().unwrap();
+            match change {
+                "table" => pg.table = "different".into(),
+                "family" => pg.family = Some(rustgis_data::source::Family::Points),
+                "crs" => pg.crs = Some("EPSG:4326".into()),
+                _ => layer.visible = false,
+            }
+            assert_eq!(exchange.incoming(&p).len(), usize::from(change == "style"), "{change}");
+        }
+        // Reading a raster in place changes its source selection, not just its drawing style.
+        let mut p = Project::default();
+        let mut raster = rustgis_map::raster::RasterLayer::unread_in_place("https://choice.invalid/scene.tif?token=RGSYNTH_raster_choice");
+        raster.in_place = false;
+        p.map_mut().add_raster("Scene", raster);
+        let mut s = Session::new(p);
+        let (public, _) = s.peer_text(Peer::Bridge).unwrap();
+        let exchange = s.exchange.as_ref().unwrap();
+        let mut incoming = Project::from_peer_raw(&public).unwrap();
+        assert_eq!(exchange.incoming(&incoming).len(), 1);
+        incoming.maps[0].layers[0].raster.as_mut().unwrap().in_place = true;
+        assert!(exchange.incoming(&incoming).is_empty(), "a changed raster read mode cannot retain credentials");
+    }
 }

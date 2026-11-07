@@ -21,6 +21,8 @@ pub struct Report {
     pub(crate) not_remembered: bool,
     pub(crate) lost: u32,
     pub(crate) not_retained: u32,
+    pub(crate) executable_changes: u32,
+    pub(crate) reconnect: u32,
 }
 
 impl Report {
@@ -51,6 +53,11 @@ impl Report {
             (self.unchecked, "step(s) contain opaque parameters that may hold credentials and were kept unchecked"),
             (self.not_retained, "address(es) exceeded the bridge retention limit; their keys will not survive a round trip"),
             (self.lost, "address(es) lost their keys when a peer sent back its project; add them again in the receiving session"),
+            (self.reconnect, "database source(s) from a peer require an explicit reconnect before reading"),
+            (
+                self.executable_changes,
+                "credential-bearing executable field(s) changed when a peer sent back its project; supply missing values before replay",
+            ),
         ] {
             if n > 0 {
                 out.push(format!("{n} {text}"));
@@ -81,6 +88,8 @@ impl Report {
         self.not_remembered |= other.not_remembered;
         self.lost = self.lost.saturating_add(other.lost);
         self.not_retained = self.not_retained.saturating_add(other.not_retained);
+        self.executable_changes = self.executable_changes.saturating_add(other.executable_changes);
+        self.reconnect = self.reconnect.saturating_add(other.reconnect);
     }
 }
 
@@ -104,11 +113,15 @@ pub(crate) enum Leaf {
     Layer(rustgis_map::LayerRole),
     Table,
     Task(usize),
+    TaskCommand(usize),
     ModelStep(usize),
+    ModelStepTool(usize),
     ModelNode(usize),
-    ModelLayer(usize),
+    ModelNodeTool(usize),
     HistoryParams,
+    HistoryId,
     HistoryCommand,
+    HistoryCommandId,
     Message(usize),
     CellSource(usize),
     CellOutput(usize),
@@ -192,10 +205,8 @@ fn json_bytes(v: &Value) -> usize {
 
 pub(crate) trait Durable {
     /// Preparation is read-only, exhaustive over owning fields, and offers each leaf once.
-    /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut Prepare<'_>);
     /// Resolves recorded indices only, through plain owned fields, without allocation or policy.
-    /// Resolves a prepared location through owned fields, without allocation or policy.
     fn field_mut(&mut self, owners: &[Owner], leaf: &Leaf) -> Option<FieldMut<'_>>;
 }
 
@@ -259,7 +270,7 @@ impl<'a> Prepare<'a> {
                 if binding_only {
                     kind = Kind::Runtime;
                 }
-                if !binding_only {
+                if !binding_only || matches!(leaf, Leaf::Video(_)) {
                     if matches!(leaf, Leaf::Video(_)) {
                         self.report.videos = self.report.videos.saturating_add(1);
                     } else {
@@ -281,31 +292,32 @@ impl<'a> Prepare<'a> {
         }
     }
 
-    /// Prepares a command's replayable parameters using explicit data/configuration roles.
-    pub(crate) fn command(&mut self, leaf: Leaf, id: &str, value: &Value) {
-        let (clean, report) = crate::roles::command(id, value, self.depth);
-        let clean = match clean {
-            Some(clean) => Some(crate::project::public_login_params(&clean).unwrap_or(clean)),
-            None => crate::project::public_login_params(value),
-        };
-        self.report.merge(&report);
-        if let Some(clean) = clean {
-            self.report.steps = self.report.steps.saturating_add(1);
-            self.edit(leaf, Payload::Json(clean), Kind::Credential);
-        }
+    /// Prepares both fields of one replayable command, counting the owning step once.
+    pub(crate) fn command(&mut self, leaf: Leaf, id_leaf: Leaf, id: &str, value: &Value) {
+        self.executable((leaf, id_leaf), id, value, crate::roles::command(id, value, self.depth));
     }
 
-    /// Model and history tool params have the same roles as the corresponding `gp.run` params.
-    pub(crate) fn tool(&mut self, leaf: Leaf, id: &str, value: &Value) {
-        let (clean, report) = crate::roles::tool(id, value, self.depth);
+    /// Model and history tool params use the same common roles as `gp.run` params.
+    pub(crate) fn tool(&mut self, leaf: Leaf, id_leaf: Leaf, id: &str, value: &Value) {
+        self.executable((leaf, id_leaf), id, value, crate::roles::tool(id, value, self.depth));
+    }
+
+    /// Journals the identifier and params independently while reporting their shared owner.
+    fn executable(&mut self, (leaf, id_leaf): (Leaf, Leaf), id: &str, value: &Value, (clean, report): (Option<Value>, Report)) {
         let clean = match clean {
             Some(clean) => Some(crate::project::public_login_params(&clean).unwrap_or(clean)),
             None => crate::project::public_login_params(value),
         };
         self.report.merge(&report);
-        if let Some(clean) = clean {
+        let clean_id = crate::roles::identifier(id, &mut self.report);
+        if clean.is_some() || clean_id.is_some() {
             self.report.steps = self.report.steps.saturating_add(1);
+        }
+        if let Some(clean) = clean {
             self.edit(leaf, Payload::Json(clean), Kind::Credential);
+        }
+        if let Some(clean) = clean_id {
+            self.edit(id_leaf, Payload::Text(clean), Kind::Credential);
         }
     }
 
@@ -565,7 +577,8 @@ fn public_address_at(address: &str, depth: usize) -> Kept {
         address::{Public, public_web_address},
         s3_address,
     };
-    if let Some((public, _)) = rustgis_data::source::myconn::split_password(address) {
+    if let Some((mut public, _)) = rustgis_data::source::myconn::split_password(address) {
+        rustgis_data::address::redact_query(&mut public);
         return if public == address { Kept::Unchanged } else { Kept::Changed(public) };
     }
     if let Some((public, _)) = rustgis_data::source::msconn::split_password(address) {
@@ -621,13 +634,25 @@ fn public_address_at(address: &str, depth: usize) -> Kept {
         let file = crate::render::rustgis_tiles::cog::split(text).0;
         let look = text.get(file.len()..).unwrap_or("");
         let Ok(Some(b)) = s3_address::parse(file) else { return Kept::Withheld(prefix) };
-        return match public_address_at(b.url, depth + 1) {
-            Kept::Unchanged => Kept::Unchanged,
-            Kept::Changed(s) => match s3_address::bind(b.binding, b.endpoint, &s) {
-                Ok(s) => Kept::Changed(format!("{s}{look}")),
-                Err(_) => Kept::Withheld(prefix),
-            },
-            Kept::Withheld(_) => Kept::Withheld(prefix),
+        let endpoint = public_address_at(b.endpoint, depth + 1);
+        let url = public_address_at(b.url, depth + 1);
+        if matches!(endpoint, Kept::Withheld(_)) || matches!(url, Kept::Withheld(_)) {
+            return Kept::Withheld(prefix);
+        }
+        if matches!((&endpoint, &url), (Kept::Unchanged, Kept::Unchanged)) {
+            return Kept::Unchanged;
+        }
+        let endpoint = match &endpoint {
+            Kept::Changed(s) => s.as_str(),
+            _ => b.endpoint,
+        };
+        let url = match &url {
+            Kept::Changed(s) => s.as_str(),
+            _ => b.url,
+        };
+        return match s3_address::bind(b.binding, endpoint, url) {
+            Ok(s) => Kept::Changed(format!("{s}{look}")),
+            Err(_) => Kept::Withheld(prefix),
         };
     }
     if matches!(prefix, "postgresql:" | "postgres:" | "pg:") {
@@ -644,11 +669,46 @@ fn public_address_at(address: &str, depth: usize) -> Kept {
     }
 }
 
-/// Emits the report only after rollback, when the session is whole again.
+/// Emits preparation losses after the durable projection's journal has restored live fields.
+/// This does not confirm delivery or commit the enclosing command's notices.
 pub(crate) fn notify(s: &mut crate::Session, report: &Report) {
     for text in report.notices() {
-        s.notify(text, false);
+        s.notify(format!("Prepared output: {text}"), false);
     }
+}
+
+/// Compares credential-bearing executable leaves through the same typed output inventory.
+/// Peer input never restores these credentials; a changed or removed field is reported once.
+pub(crate) fn changed_executables(old: &mut crate::Project, incoming: &mut crate::Project) -> Result<u32, String> {
+    let prepared = prepared(old, None, 0)?;
+    let mut count = 0u32;
+    for edit in prepared.edits {
+        if edit.kind != Kind::Credential
+            || !matches!(
+                edit.at.leaf,
+                Leaf::Task(_)
+                    | Leaf::TaskCommand(_)
+                    | Leaf::ModelStep(_)
+                    | Leaf::ModelStepTool(_)
+                    | Leaf::ModelNode(_)
+                    | Leaf::ModelNodeTool(_)
+                    | Leaf::HistoryParams
+                    | Leaf::HistoryId
+                    | Leaf::HistoryCommand
+                    | Leaf::HistoryCommandId
+                    | Leaf::CellSource(_)
+            )
+        {
+            continue;
+        }
+        let same = match (old.field_mut(&edit.at.owners, &edit.at.leaf), incoming.field_mut(&edit.at.owners, &edit.at.leaf)) {
+            (Some(FieldMut::Text(a)), Some(FieldMut::Text(b))) => a == b,
+            (Some(FieldMut::Json(a)), Some(FieldMut::Json(b))) => a == b,
+            _ => false,
+        };
+        count = count.saturating_add(u32::from(!same));
+    }
+    Ok(count)
 }
 
 impl<T: Durable> Durable for Vec<T> {

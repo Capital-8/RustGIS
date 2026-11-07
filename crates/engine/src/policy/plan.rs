@@ -542,7 +542,12 @@ impl<'a> Builder<'a> {
             }
             CallKind::Adapter { what, effects, params } => {
                 self.charge(params)?;
-                let mut node = self.adapter(what, *effects, params.clone());
+                let effects = if matches!(*what, "snapshot" | "view_map") {
+                    effects.union(crate::cmd::tiles::render_reach(self.context().map()))
+                } else {
+                    *effects
+                };
+                let mut node = self.adapter(what, effects, params.clone());
                 self.bind(&mut node, params, None)?;
                 node
             }
@@ -797,10 +802,16 @@ impl<'a> Builder<'a> {
                 }
             }
         } else {
-            if let Op::Command(spec) = &n.op
-                && let Some(inputs) = spec.inputs
-            {
-                let inputs = match inputs(&self.context(), params) {
+            // Image adapters consume the same map and raw tile routes as registered exports.
+            // Their caller-supplied effects can add reach, but cannot remove these owner inputs.
+            let selected = match &n.op {
+                Op::Command(spec) => spec.inputs.map(|select| select(&self.context(), params)),
+                Op::Adapter("snapshot" | "view_map") => Some(Ok(crate::cmd::tiles::render_inputs(self.context().map()))),
+                _ => None,
+            };
+            let owner_selected = selected.is_some();
+            if let Some(inputs) = selected {
+                let inputs = match inputs {
                     Ok(inputs) => inputs,
                     Err(_) if !self.strict => crate::cmd::Inputs::unresolved(),
                     Err(e) => return Err(e),
@@ -879,9 +890,7 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
-            if !matches!(&n.op, Op::Command(spec) if spec.inputs.is_some())
-                && matches!(params.get("table"), Some(Value::String(_) | Value::Number(_)))
-            {
+            if !owner_selected && matches!(params.get("table"), Some(Value::String(_) | Value::Number(_))) {
                 match self.s.table_index(params) {
                     Ok(i) => {
                         if let Some(t) = self.s.project.tables.get(i) {

@@ -418,7 +418,7 @@ impl Embed {
                         app.session.notify(notice, false);
                     }
                 }
-                Err(e) => log::error!("couldn't send the project: {e}"),
+                Err(e) => app.session.notify(e, true),
             },
             (false, Some(wait)) => ctx.request_repaint_after(wait),
             (false, None) => {}
@@ -575,6 +575,17 @@ async fn unless_stalled(
     Some(raced)
 }
 
+/// A refusal's text (`HTTP 503`), with how long the server asked to be left when it says so in a
+/// `Retry-After` header the browser lets the page read (its CORS rules must expose it).
+fn refused(resp: &web_sys::Response) -> String {
+    let wait = resp.headers().get("retry-after").ok().flatten();
+    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::failure::with_retry_after(
+        format!("HTTP {}", resp.status()),
+        resp.status(),
+        wait.as_deref(),
+    )
+}
+
 /// Downloads `url`, or the byte range it asks for (a PMTiles archive's part: see
 /// `rustgis_tiles::cache::split_range`). A status in `omit` is an expected answer (a tile past a
 /// map's edge): its failure isn't recorded, only noted once per server, as on the desktop. A
@@ -694,7 +705,7 @@ async fn fetch_bytes(
                 .map_err(err)?;
             diagnostics.answered(resp.status());
             if !resp.ok() {
-                return Err(format!("HTTP {}", resp.status()));
+                return Err(refused(&resp));
             }
             // The last bytes asked for and the whole file answered: fine when it is no longer.
             let whole_tail = tail.filter(|_| resp.status() != 206);
@@ -765,7 +776,7 @@ async fn fetch_bytes(
         .await;
         cache::check_still(&still)?;
         logins::check(&bound).map_err(str::to_string)?;
-        result.map_err(|error| if authenticated { logins::scrub(&format!("{url}: {error}")) } else { error })
+        result.map_err(|error| if authenticated { logins::scrub_error(&format!("{url}: {error}")) } else { error })
     }
     .await;
     diagnostics.record(answer.map_err(|e| Failure::new(url, e))).map_err(|failure| failure.message)
@@ -834,7 +845,7 @@ async fn post_json(
                 .map_err(err)?;
             diagnostics.answered(resp.status());
             if !resp.ok() {
-                return Err(format!("HTTP {}", resp.status()));
+                return Err(refused(&resp));
             }
             let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(err)?).await.map_err(err)?;
             let bytes = js_sys::Uint8Array::new(&buf);
@@ -846,7 +857,7 @@ async fn post_json(
         .await;
         cache::check_still(&still)?;
         logins::check(url).map_err(str::to_string)?;
-        result.map_err(|error| if authenticated { logins::scrub(&format!("{url}: {error}")) } else { error })
+        result.map_err(|error| if authenticated { logins::scrub_error(&format!("{url}: {error}")) } else { error })
     }
     .await;
     diagnostics.record(answer.map_err(|e| Failure::new(url, e))).map_err(|failure| failure.message)
@@ -923,7 +934,7 @@ async fn head(
                 .map_err(err)?;
             diagnostics.answered(resp.status());
             if !resp.ok() {
-                return Err(format!("HTTP {}", resp.status()));
+                return Err(refused(&resp));
             }
             let header = |k: &str| resp.headers().get(k).ok().flatten();
             Ok(cache::Head {
@@ -936,7 +947,7 @@ async fn head(
         .await;
         cache::check_still(&still)?;
         logins::check(url).map_err(str::to_string)?;
-        result.map_err(|error| if authenticated { logins::scrub(&format!("{reached}: {error}")) } else { error })
+        result.map_err(|error| if authenticated { logins::scrub_error(&format!("{reached}: {error}")) } else { error })
     }
     .await;
     diagnostics.record(answer.map_err(|e| Failure::new(url, e))).map_err(|failure| failure.message)

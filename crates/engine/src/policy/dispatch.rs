@@ -243,7 +243,7 @@ impl Session {
         self.with_node(op.node, |s| s.request_import_url(p))
     }
     /// Native completion helpers may resume an owner only at a root ingress.
-    pub(super) fn policy_ingress_idle(&self) -> bool {
+    pub(crate) fn policy_ingress_idle(&self) -> bool {
         self.policy.scopes.is_empty()
     }
     /// Only the native user scope may record executable-content provenance.
@@ -383,6 +383,13 @@ impl Session {
     /// Consumes a stored completion at its real landing; root UI delivery may resume its owner.
     pub fn finish_deferred<T>(&mut self, completion: super::Deferred, f: impl FnOnce(&mut Session) -> T) -> Result<T, String> {
         self.check_delivery(&completion.0)?;
+        if let Op::Adapter(what @ ("snapshot" | "view_map")) = &completion.0.node.op {
+            // These callbacks render the live map, rather than an owned export snapshot.
+            let call = Call::adapter(what, completion.0.node.effects, completion.0.node.params.clone());
+            if *completion.0.node != self.call_node(&completion.0.scope, &call)? {
+                return Err("the map sources changed since this image request was approved".into());
+            }
+        }
         self.resume(&completion.0, f)
     }
     /// Executes a call already admitted by its ingress scope; Ask at dispatch still refuses.
@@ -796,7 +803,7 @@ impl Session {
                                 && params.get("anonymous").and_then(Value::as_bool) == Some(true));
                         let result = crate::service_logins::anonymously(s, anonymous, add)
                             .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.label)))
-                            .map_err(|e| crate::render::rustgis_tiles::logins::scrub(&e));
+                            .map_err(|e| crate::durable::generated_text(&e));
                         if let Ok(value) = &result {
                             s.trust_after(spec.id, &params, value, editor);
                         }

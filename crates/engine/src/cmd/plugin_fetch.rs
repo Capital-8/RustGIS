@@ -1106,6 +1106,57 @@ mod tests {
         assert!(!s.url_waits.holds(n, p));
     }
 
+    /// The ordinary pending-download cap can retire a plugin-owned claim below the claim cap.
+    #[test]
+    fn retiring_a_download_claim_settles_only_its_own_wait() {
+        let mut s = Session::new(crate::project::Project::default());
+        let mut requests = Vec::new();
+        for url in ["https://retired.invalid/first.geojson", "https://retired.invalid/second.geojson"] {
+            s.request_url(&json!({"url":url})).unwrap();
+            let request = s.take_url_requests().pop().unwrap();
+            let n = request.params()["request"].as_u64().unwrap();
+            s.url_waits.wait(n, without_request(request.params()));
+            let id = s.download_started_for(&request).unwrap();
+            requests.push((id, n, request));
+        }
+        let (first, number, request) = &requests[0];
+        let still = s.download_still(*first).unwrap();
+        struct Live;
+        impl crate::policy::Revocation for Live {
+            fn allows(&self, _: crate::policy::Effects) -> bool {
+                true
+            }
+        }
+        let foreign = crate::policy::Scope::assistant(1521, std::sync::Arc::new(Live));
+        s.with_scope(foreign, |s| {
+            s.download_failed(*first);
+            assert!(!s.download_done(*first));
+            assert!(s.download_continues(*first).is_err());
+            assert!(!s.download_landed(*first, Vec::new()));
+        })
+        .unwrap();
+        assert!(still() && s.url_waits.holds(*number, request.params()), "foreign callbacks cannot consume the owner's claim or wait");
+        for _ in 0..62 {
+            s.download_started();
+        }
+        assert_eq!(
+            requests.iter().filter(|(id, ..)| s.download_still(*id).is_some()).count(),
+            2,
+            "both original claims remain below the cap"
+        );
+        let mark = s.notice_mark();
+        s.download_started();
+        assert!(!still(), "retirement revokes its transport predicate");
+        assert!(!s.url_waits.holds(*number, request.params()), "the retired request no longer blocks its plugin");
+        let (_, other, request) = &requests[1];
+        assert!(s.url_waits.holds(*other, request.params()), "the other wait is untouched");
+        assert!(s.url_waits.landed.iter().any(|(n, _, answer, _)| n == number && answer.is_err()));
+        assert_eq!(s.notices_since(mark).len(), 1, "retirement is reported once");
+        s.download_failed(requests[1].0);
+        assert!(!s.url_waits.holds(*other, request.params()), "an explicit failure also settles its exact wait");
+        assert!(s.url_waits.landed.iter().any(|(n, _, answer, _)| n == other && answer.is_err()));
+    }
+
     #[test]
     fn checks_addresses() {
         assert_eq!(checked(" https://example.com/a?b=1#frag ").unwrap(), "https://example.com/a?b=1");

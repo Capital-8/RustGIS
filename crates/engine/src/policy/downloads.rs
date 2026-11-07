@@ -353,6 +353,7 @@ impl Session {
     }
     /// Rechecks every new stage, including a probe's fallback and later pages or keys.
     pub fn download_continues(&mut self, id: u64) -> Result<(), String> {
+        self.download_owner(id)?;
         if !self.download_is_pending(id)
             && !self.downloaded.iter().any(|(n, _)| *n == id)
             && !self.landed_reads.iter().any(|(n, _)| *n == id)
@@ -448,7 +449,28 @@ impl Session {
     pub(crate) fn restore_policy_work(&mut self, work: Work) {
         self.policy.work = work;
     }
-    /// Retires a failed or consumed claim and invalidates every captured predicate.
+    /// Named callbacks own their claim; the native root retains its documented delivery role.
+    pub(crate) fn download_owner(&self, id: u64) -> Result<(), String> {
+        if let Some(claim) = self.policy.work.claims.get(&id) {
+            self.check_delivery_owner(&claim.c)?;
+        }
+        Ok(())
+    }
+    /// A native queue retirement settles only the exact wait held by its sealed claim.
+    /// No public request number or current caller can select another wait here.
+    pub(crate) fn retire_download_claim(&mut self, id: u64, error: &str) {
+        let Some(claim) = self.policy.work.claims.remove(&id) else { return };
+        claim.live.store(false, Ordering::SeqCst);
+        if let Some(number) = claim.params.get("request").and_then(Value::as_u64)
+            && self.url_waits.holds(number, &claim.params)
+        {
+            self.url_waits.land(number, Err(crate::sources::redact_text(error)), crate::cmd::plugins::fetch::Added::default());
+        }
+        if claim.import {
+            crate::cmd::geolibre::discard_pending(self, &claim.params);
+        }
+    }
+    /// Consumes a completed claim and invalidates every captured predicate.
     pub(crate) fn forget_download_claim(&mut self, id: u64) {
         self.policy.work.claims.remove(&id);
     }

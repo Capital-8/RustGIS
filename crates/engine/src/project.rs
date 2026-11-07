@@ -526,6 +526,13 @@ pub(crate) fn resolve_file_paths<'a>(dir: &str, paths: impl IntoIterator<Item = 
     }
 }
 
+/// Whether `path` is a plain `http://` or `https://` address: not a login or S3 wrapper, which a
+/// raster layer downloads whole.
+fn plain_web_address(path: &str) -> bool {
+    let scheme = path.get(..8).map(str::to_ascii_lowercase).unwrap_or_default();
+    scheme.starts_with("https://") || scheme.starts_with("http://")
+}
+
 /// Read only compatibility metadata before interpreting any saved payload.
 #[derive(Deserialize)]
 struct FileFormat {
@@ -643,40 +650,42 @@ impl Project {
             if let Some(graph) = &mut model.graph {
                 for node in &mut graph.nodes {
                     recorded_addresses(&mut node.params, &mut addresses);
-                    // A node's input may be an address rather than a layer's name.
-                    if let Some(layer) = &mut node.layer {
-                        addresses.push(layer);
-                    }
+                    // node.layer selects a name, including names that resemble runtime URLs.
                 }
             }
         }
         addresses
     }
 
-    /// How many layers and tile layers read through a login binding but record no connection:
-    /// nothing would tell the opened project which login they need. One whose address also holds
-    /// a token isn't counted here: the durable address projection counts it already.
-    fn unrecorded_bound(&mut self) -> usize {
+    /// Runtime bindings that this output cannot restore: peer receivers never share a login;
+    /// explicit files can resolve layers and tile owners with a recorded saved connection.
+    pub(crate) fn bound_address_losses(&self, include_recorded: bool) -> usize {
         let only_bound = |a: &str| {
             without_login_binding(a)
                 .is_some_and(|public| matches!(crate::durable::public_address(&public), crate::durable::Kept::Unchanged))
         };
-        let mut n = 0;
-        for map in self.maps.iter_mut().chain(self.offline_areas.iter_mut().map(|area| &mut area.data)) {
-            let tiles: std::collections::BTreeSet<_> = map
-                .slots()
-                .into_iter()
-                .filter_map(|slot| {
-                    let rustgis_map::SlotPos::Tile { tile, .. } = slot.at else { return None };
-                    map.tiles.get(tile).filter(|t| t.connection.is_empty() && only_bound(slot.value)).map(|_| tile)
-                })
-                .collect();
-            n += tiles.len();
-            for layer in map.layers.iter_mut().filter(|l| l.connection.is_empty()) {
-                n += usize::from(layer.addresses_mut().any(|a| only_bound(a)));
+        let mut n = 0usize;
+        for map in self.maps.iter().chain(self.offline_areas.iter().map(|area| &area.data)) {
+            let mut layers = std::collections::BTreeSet::new();
+            let mut tiles = std::collections::BTreeSet::new();
+            for slot in map.slots().into_iter().filter(|slot| slot.address && only_bound(slot.value)) {
+                match slot.at {
+                    rustgis_map::SlotPos::Layer { layer, .. } => {
+                        if map.layers.get(layer).is_some_and(|l| include_recorded || l.connection.is_empty()) {
+                            layers.insert(layer);
+                        }
+                    }
+                    rustgis_map::SlotPos::Tile { tile, .. } => {
+                        if map.tiles.get(tile).is_some_and(|t| include_recorded || t.connection.is_empty()) {
+                            tiles.insert(tile);
+                        }
+                    }
+                    rustgis_map::SlotPos::Group { .. } | rustgis_map::SlotPos::Terrain => n = n.saturating_add(1),
+                }
             }
+            n = n.saturating_add(layers.len()).saturating_add(tiles.len());
         }
-        n
+        n.saturating_add(self.tables.iter().filter(|table| table.source.as_deref().is_some_and(only_bound)).count())
     }
 
     /// The standalone table of an id.
@@ -721,6 +730,19 @@ impl Project {
 
     /// Repairs invariants after loading (at least one map; a valid active index).
     pub fn normalize(&mut self) {
+        self.repair(false);
+    }
+
+    /// [`Project::normalize`] for a project read from its file, which also opens its plain COG
+    /// tile layers (a project saved before GeoTIFFs read in place were raster layers, or with
+    /// those `map.addTiles` adds) as raster layers read in place: as the project opens only. A
+    /// later repair (a layer file added, maps imported) leaves a tile layer added this session
+    /// as it is.
+    pub(crate) fn normalize_opened(&mut self) {
+        self.repair(true);
+    }
+
+    fn repair(&mut self, opened: bool) {
         if self.maps.is_empty() {
             self.maps.push(Map::new("Map"));
         }
@@ -830,6 +852,28 @@ impl Project {
             }
             // Tile layers with an address that can't be fetched (a hand edit) are dropped.
             m.tiles.retain_mut(|t| t.repair().map_err(|e| log::warn!("{}: {e}", m.name)).is_ok());
+            // GeoTIFFs read in place are raster layers (a project from before saved tile layers),
+            // so they don't count toward the tile layers kept. As the project opens only: a tile
+            // layer added this session stays one until the project is opened again.
+            if opened {
+                crate::cmd::tiles::cog_tiles_to_rasters(m);
+                // A raster layer whose path is a plain web address, from no saved connection, is
+                // read in place, the one way such a path is read (a login or S3 wrapper is
+                // downloaded whole, as is a connection's address, plain here until its login is
+                // made again): one saved by an older RustGIS, which didn't know `in_place` (it
+                // showed the layer as missing and saved it again without the key), reads in
+                // place again here, losing a pending look at most.
+                for l in &mut m.layers {
+                    if l.connection.is_empty()
+                        && let Some(rl) = &mut l.raster
+                        && !rl.in_place
+                        && rl.embedded.is_none()
+                        && rl.path.as_deref().is_some_and(plain_web_address)
+                    {
+                        rl.in_place = true;
+                    }
+                }
+            }
             m.tiles.truncate(rustgis_map::tiles::MAX_TILE_LAYERS);
             #[cfg(not(target_arch = "wasm32"))]
             for t in &mut m.tiles {
@@ -859,8 +903,10 @@ impl Project {
                         src.error = Some(error);
                     }
                 }
+                // Read in place, read together below.
                 if let Some(rl) = &mut l.raster
                     && rl.data.is_none()
+                    && !rl.in_place
                     && !rl.path.as_deref().is_some_and(crate::s3_connections::is_s3_backed)
                     && unresolved.is_none()
                     && let Err(e) = rl.reload()
@@ -888,6 +934,7 @@ impl Project {
                 }
                 l.touch_geometry();
             }
+            read_in_place(m);
         }
     }
 
@@ -948,7 +995,7 @@ impl Project {
     /// fields are restored on every return and native unwind; only explicit saves are remembered.
     pub fn saved_text(&mut self, dir: Option<&Path>) -> Result<(String, crate::durable::Report), String> {
         self.ensure_imports_complete()?;
-        let unrecorded = self.unrecorded_bound();
+        let unrecorded = self.bound_address_losses(false);
         let (text, mut report) = crate::durable::output_remembered(self, dir.and_then(Path::to_str), project_text)?;
         report.addresses = report.addresses.saturating_add(u32::try_from(unrecorded).unwrap_or(u32::MAX));
         Ok((text, report))
@@ -970,7 +1017,9 @@ impl Project {
     /// Text too large to open again is refused. Returns the text and its counted output notices.
     pub fn recovery_text_with_report(mut self) -> Result<(String, crate::durable::Report), String> {
         self.omit_pending_imports();
-        let (text, report) = crate::durable::output_owned(self, project_text)?;
+        let unrecorded = self.bound_address_losses(false);
+        let (text, mut report) = crate::durable::output_owned(self, project_text)?;
+        report.addresses = report.addresses.saturating_add(u32::try_from(unrecorded).unwrap_or(u32::MAX));
         if text.len() as u64 > MAX_BYTES {
             return Err("the project is too large to keep a recovery copy".into());
         }
@@ -1029,7 +1078,7 @@ impl Project {
             p.resolve_paths(d);
         }
         if normalize {
-            p.normalize();
+            p.normalize_opened();
         }
         p.label_read_notices = label_losses::notices(text, &p)?;
         Ok(p)
@@ -1042,6 +1091,35 @@ impl Project {
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a RustGIS project", path.display()))?;
         let dir = std::path::absolute(path).ok().and_then(|p| p.parent().map(Path::to_path_buf));
         Self::read_json(&text, true, dir.as_deref(), true)
+    }
+}
+
+/// Starts reading the overviews of a map's raster layers read in place and not read yet, all at
+/// once (see [`rustgis_map::raster::read_together`]): a project or an import of several waits for
+/// the slowest, not for each in turn, where the session waits for them
+/// ([`crate::Session::wait_in_place_reads`]); elsewhere they land as the map draws. One read from
+/// an S3 bucket waits for its connection (see [`crate::s3_connections::resolve_project_s3`]). One
+/// that failed is left to [`crate::Session::read_in_place_again`], which reads it again once its
+/// wait is over, and one that couldn't start (an address the project keeps that can't be read)
+/// stays as it is, said once: a repair of the project (a layer file added, maps imported) doesn't
+/// start either over.
+pub(crate) fn read_in_place(m: &mut Map) {
+    let mut named: Vec<(String, &mut rustgis_map::raster::RasterLayer)> = m
+        .layers
+        .iter_mut()
+        .filter_map(|l| {
+            let name = l.name.clone();
+            let rl = l.raster.as_mut()?;
+            (rl.in_place && rl.error.is_none() && !rl.path.as_deref().is_some_and(crate::s3_connections::is_s3_backed))
+                .then_some((name, rl))
+        })
+        .collect();
+    let mut layers: Vec<&mut rustgis_map::raster::RasterLayer> = named.iter_mut().map(|(_, rl)| &mut **rl).collect();
+    let failed = rustgis_map::raster::read_together(&mut layers, false);
+    for (i, e) in failed {
+        if let Some((name, _)) = named.get(i) {
+            log::warn!("{name}: {e}");
+        }
     }
 }
 
@@ -1206,7 +1284,7 @@ impl Durable for Task {
     fn prepare(&self, p: &mut Prepare<'_>) {
         let Self { name: _, description: _, steps } = self;
         for (i, TaskStep { title: _, instructions: _, command, params }) in steps.iter().enumerate() {
-            p.command(Leaf::Task(i), command, params);
+            p.command(Leaf::Task(i), Leaf::TaskCommand(i), command, params);
         }
     }
 
@@ -1215,8 +1293,11 @@ impl Durable for Task {
         if !owners.is_empty() {
             return None;
         }
-        let Leaf::Task(i) = leaf else { return None };
-        Some(FieldMut::Json(&mut self.steps.get_mut(*i)?.params))
+        match leaf {
+            Leaf::Task(i) => Some(FieldMut::Json(&mut self.steps.get_mut(*i)?.params)),
+            Leaf::TaskCommand(i) => Some(FieldMut::Text(&mut self.steps.get_mut(*i)?.command)),
+            _ => None,
+        }
     }
 }
 
@@ -1225,7 +1306,7 @@ impl Durable for Model {
     fn prepare(&self, p: &mut Prepare<'_>) {
         let Self { name: _, steps, graph } = self;
         for (i, ModelStep { tool, params }) in steps.iter().enumerate() {
-            p.tool(Leaf::ModelStep(i), tool, params);
+            p.tool(Leaf::ModelStep(i), Leaf::ModelStepTool(i), tool, params);
         }
         if let Some(g) = graph {
             p.child(Owner::Graph, g);
@@ -1240,8 +1321,11 @@ impl Durable for Model {
         if !owners.is_empty() {
             return None;
         }
-        let Leaf::ModelStep(i) = leaf else { return None };
-        Some(FieldMut::Json(&mut self.steps.get_mut(*i)?.params))
+        match leaf {
+            Leaf::ModelStep(i) => Some(FieldMut::Json(&mut self.steps.get_mut(*i)?.params)),
+            Leaf::ModelStepTool(i) => Some(FieldMut::Text(&mut self.steps.get_mut(*i)?.tool)),
+            _ => None,
+        }
     }
 }
 
@@ -1249,11 +1333,8 @@ impl Durable for ModelGraph {
     /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut Prepare<'_>) {
         let Self { nodes, edges: _ } = self;
-        for (i, ModelNode { id: _, kind: _, x: _, y: _, layer, tool, params, name: _ }) in nodes.iter().enumerate() {
-            p.tool(Leaf::ModelNode(i), tool.as_deref().unwrap_or(""), params);
-            if let Some(layer) = layer {
-                p.string(Leaf::ModelLayer(i), layer, true, false);
-            }
+        for (i, ModelNode { id: _, kind: _, x: _, y: _, layer: _, tool, params, name: _ }) in nodes.iter().enumerate() {
+            p.tool(Leaf::ModelNode(i), Leaf::ModelNodeTool(i), tool.as_deref().unwrap_or(""), params);
         }
     }
 
@@ -1264,7 +1345,7 @@ impl Durable for ModelGraph {
         }
         match leaf {
             Leaf::ModelNode(i) => Some(FieldMut::Json(&mut self.nodes.get_mut(*i)?.params)),
-            Leaf::ModelLayer(i) => self.nodes.get_mut(*i)?.layer.as_mut().map(FieldMut::Text),
+            Leaf::ModelNodeTool(i) => self.nodes.get_mut(*i)?.tool.as_mut().map(FieldMut::Text),
             _ => None,
         }
     }
@@ -1508,11 +1589,13 @@ mod login_binding_tests {
                 params: serde_json::json!({"url": bad}),
             }],
         });
-        let (saved, _) = project.saved_text(None).unwrap();
+        let (saved, report) = project.saved_text(None).unwrap();
         // Inspect the durable bytes: from_json may restore a credential edit from this
         // process's explicit-save cache, including an invalid address that still cannot run.
         let written: serde_json::Value = serde_json::from_str(&saved).unwrap();
         assert_eq!(written["tasks"][0]["steps"][0]["params"]["url"], rustgis_data::login_address::PREFIX);
+        assert_eq!((report.withheld, report.steps, report.layer_addresses()), (1, 1, 0));
+        assert_eq!(report.notices().len(), 2, "the withheld slot and affected executable step are distinct report dimensions");
         assert_eq!(project.tasks[0].steps[0].params["url"], bad, "the live project is restored");
         let mut address = bad.to_string();
         clear_login_bindings([&mut address]);

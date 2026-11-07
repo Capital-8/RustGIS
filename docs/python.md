@@ -139,9 +139,11 @@ The project, with the data that travels with it, goes to that app through the br
 (`postMessage`); nothing goes to a server. The app runs in your browser, so with the default
 address your data stays on your machine. Point `url=` only at a copy of the app you trust.
 
-The widget receives public addresses and cleaned executable parameters. Credentials held by
-Python are not sent to it, so protected layers can remain empty there; a warning counts affected
-layer addresses. When the widget sends a project back, Python can retain credentials only for
+The widget receives public addresses and cleaned executable parameters. Recognized credentials
+in supported fields are removed, so protected layers can remain empty there; a warning counts
+affected layer addresses. User data, foreign notebook source and opaque parameters are kept
+unchanged and may contain credentials: review them before sharing the project with a widget.
+When the widget sends a project back, Python can retain credentials only for
 unchanged, uniquely matched sources from its last exchange that still match its current project.
 Changing or replacing a source can require signing in again in Python. Exchange notices are
 available through `m.notices()` on the `Map` or `MapWidget`.
@@ -301,7 +303,10 @@ of them.
 
 Open an existing project with `Session(project="atlas.rgis")` or `s.open("atlas.rgis")`.
 `s.project_json()` returns JSON with the same credential removal as Save, with notices available
-through `s.notices()`. It refuses unfinished imports instead of writing runtime reservations.
+through `s.notices()`. Like Save, this explicit serialization retains a bounded, process-local
+credential-restoration snapshot for reopening its exact text; repeated identical text replaces
+the same snapshot. It refuses unfinished imports instead of writing runtime reservations.
+The widget's private peer exchange uses a separate path that never fills this save cache.
 `s.run("project.openText", text=...)` opens project JSON without an intermediate file. `to_png()`
 returns PNG bytes even when it also writes a file; omit the path to keep the image in memory.
 

@@ -47,8 +47,8 @@ Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
 - **Command ingress**: root `Session::run` is trusted native User dispatch. Assistant, MCP,
   plugin, imported-item and continuation adapters carry their named opaque policy scope;
   scopes inherit or narrow, and `with_scope` rejects nested ingress. Peer project text uses
-  `open_peer_text`. The authority of `ui.*` RUN messages from embedding pages remains a
-  separate, unresolved boundary.
+  `open_peer_text`. See [embedding-page limitations](SECURITY.md#embedding-page-command-boundary)
+  when changing web message handlers.
 - **Ribbon placement** follows the
   [ribbon guidelines](docs/contributing.md#ribbon-guidelines): the tab's purpose, one button per
   destination, labels that say what happens, and what a ribbon pull request states.

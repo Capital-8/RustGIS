@@ -310,8 +310,24 @@ fn append_percent_encoded(result: &mut String, value: &str) {
 /// text in another session's output. Revoked credentials are not retained for redaction.
 pub fn scrub(text: &str) -> String {
     let entries = entries();
+    if entries.is_empty() && !text.contains(rustgis_data::login_address::PREFIX) {
+        return text.to_string();
+    }
     let mut patterns: Vec<_> = entries.values().flat_map(|entry| &entry.redactions).collect();
     patterns.sort_unstable_by_key(|pattern| std::cmp::Reverse(pattern.value.expose().len()));
+    scrub_patterns(text, &patterns)
+}
+
+/// Cleans generated error text before active values can obscure its address syntax.
+/// Runtime request bindings and successful data values must not use this output projection.
+pub fn scrub_error(text: &str) -> String {
+    let unbound = scrub_patterns(text, &[]);
+    let (public, _) = rustgis_data::address::scrub_addresses(&unbound);
+    scrub(&public)
+}
+
+/// Removes runtime capability headers and the supplied active patterns in one pass.
+fn scrub_patterns(text: &str, patterns: &[&Redaction]) -> String {
     // Strip capabilities even after revocation, when there are no active credential patterns.
     let mut result = String::with_capacity(text.len());
     let mut rest = text;

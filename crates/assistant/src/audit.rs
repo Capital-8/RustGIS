@@ -150,7 +150,11 @@ fn normalized_args(tool: &str, arguments: &Value) -> Value {
             };
             let key = if tool == "run_command" { "command" } else { "tool" };
             let mut out = serde_json::Map::new();
-            out.insert(key.into(), redact(arguments.get(key).cloned().unwrap_or(Value::Null), 0));
+            let id = match arguments.get(key) {
+                Some(Value::String(id)) => json!(rustgis_engine::log_identifier(id)),
+                other => redact(other.cloned().unwrap_or(Value::Null), 0),
+            };
+            out.insert(key.into(), id);
             out.insert("params".into(), params);
             Value::Object(out)
         }
@@ -233,15 +237,22 @@ fn redact_script(script: &str) -> String {
     let output = script
         .lines()
         .take(rustgis_engine::cmd::workflows::MAX_SCRIPT_LINES)
-        .map(|line| match rustgis_engine::script_line(line) {
-            None => line.trim().to_string(),
-            Some(Ok((id, params))) => {
-                let id = redact_string(&id);
-                if params.is_null() { id } else { format!("{id} {}", rustgis_engine::log_params(&params).into_log_value()) }
-            }
-            Some(Err(_)) => {
-                let id = line.trim().split_once(char::is_whitespace).map_or(line.trim(), |(id, _)| id).trim_end_matches('=');
-                format!("{} [parameters not JSON; withheld]", redact_string(id))
+        .map(|line| {
+            let line = line.trim();
+            // Display only: a malformed identifier may carry JSON glued after `=`. It must
+            // not be copied as an id; execution still uses the shared parser unchanged.
+            let head = line.split(|c: char| c.is_whitespace() || c == '=').next().unwrap_or(line);
+            let glued = line
+                .get(head.len()..)
+                .and_then(|r| r.strip_prefix('='))
+                .is_some_and(|r| !r.is_empty() && !r.starts_with(char::is_whitespace));
+            match rustgis_engine::script_line(line) {
+                None => redact_string(line),
+                Some(Ok((id, params))) if !glued => {
+                    let id = rustgis_engine::log_identifier(&id);
+                    if params.is_null() { id } else { format!("{id} {}", rustgis_engine::log_params(&params).into_log_value()) }
+                }
+                Some(_) => format!("{} [parameters not JSON; withheld]", rustgis_engine::log_identifier(head)),
             }
         })
         .collect::<Vec<_>>()
@@ -308,6 +319,30 @@ mod tests {
 
     #[test]
     fn audit_logs_the_executed_envelope_and_shared_script_grammar() {
+        for line in [
+            "sql.connect={\"password\":\"RGSYNTH_glued_audit\"}",
+            "sql.connect={\"password\":\"RGSYNTH_glued_audit\"} junk",
+            "sql.connect={\"password\":\"RGSYNTH_glued_audit\"",
+        ] {
+            let output = redact_script(line);
+            assert!(!output.contains("RGSYNTH_glued_audit"), "{output}");
+        }
+        for id in [
+            "sql.connect={\"password\":\"RGSYNTH_glued_audit\"}",
+            "sql.connect {\"password\":\"RGSYNTH_glued_audit\"}",
+            "sql.connect:{\"password\":\"RGSYNTH_glued_audit\"}",
+            "sql.connect:password:RGSYNTH_glued_audit",
+            "sql.connect:token:RGSYNTH_glued_audit",
+            "password:RGSYNTH_glued_audit",
+        ] {
+            for tool in ["run_command", "run_tool"] {
+                let key = if tool == "run_command" { "command" } else { "tool" };
+                let mut args = json!({"params":null});
+                args[key] = json!(id);
+                let logged = normalized_args(tool, &args);
+                assert!(!logged.to_string().contains("RGSYNTH_glued_audit"), "{tool}: {logged}");
+            }
+        }
         let params =
             json!({"url": "https://h.invalid/a?%74oken=RGSYNTH_audit_20261103", "pass%77ord": "RGSYNTH_option_20261103", "layer": "roads"});
         for tool in ["run_command", "run_tool"] {
@@ -329,6 +364,17 @@ mod tests {
         let logged = redact_script(script);
         assert!(logged.starts_with("map.zoomIn {}\nlayer.addUrl [parameters not JSON; withheld]\nmap.zoomOut {}"));
         assert!(!logged.contains("RGSYNTH_"));
+        let comments = "# clean comment\n# https://h.invalid/a?token=RGSYNTH_comment_20261106";
+        let args = normalized_args("run", &json!({"script": comments}));
+        assert!(!args.to_string().contains("RGSYNTH_comment"));
+        assert!(!redact_script(comments).contains("RGSYNTH_comment"));
+        assert!(redact_script(comments).starts_with("# clean comment\n"));
+        for url in
+            ["https://h.invalid/data", "pg:host=h dbname=gis", "mariadb://h/gis", "pmtiles:https://h.invalid/a", "cog:https://h.invalid/a"]
+        {
+            let nested = json!({"key":"abc", "source":{"url":url}});
+            assert_eq!(normalized_args("run_command", &json!({"command":"plugin.unknown", "params":nested}))["params"]["key"], "", "{url}");
+        }
         let document =
             json!({"type": "FeatureCollection", "features": [], "padding": "x".repeat(250), "token": "RGSYNTH_data_20261103"}).to_string();
         let arguments = json!({"command": "layer.addDataText", "params": {"text": document}});

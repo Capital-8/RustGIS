@@ -22,6 +22,13 @@ pub fn log_params(params: &Value) -> LogCopy {
     LogCopy(kept_params(params))
 }
 
+/// Cleans a structural command/tool identifier for display and audit output only.
+/// The original identifier remains the sole input to lookup, execution and approval.
+pub fn log_identifier(id: &str) -> String {
+    let public = crate::roles::identifier(id, &mut crate::durable::Report::default());
+    crate::durable::generated_text(public.as_deref().unwrap_or(id))
+}
+
 /// Now, in milliseconds since 1970 (UTC).
 pub(crate) fn now_ms() -> u64 {
     web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -192,6 +199,40 @@ fn review_value(v: &Value, depth: usize) -> Result<Value, String> {
 
 fn redacted(v: &Value) -> Value {
     crate::cmd::history::redacted(&embedded_redacted(v, 0))
+}
+
+/// A bounded log-only context check for a short key beside nested connection settings.
+/// User data/documents do not make an ordinary join or lookup key a credential.
+pub(crate) fn address_context(key: &str, v: &Value, depth: usize) -> bool {
+    if depth >= 8 || matches!(key, "data" | "text" | "values" | "attributes" | "properties" | "features" | "geometry") {
+        return false;
+    }
+    match v {
+        Value::String(s) => {
+            let s = s.trim_start();
+            [
+                "http://",
+                "https://",
+                "s3://",
+                "rustgis-login:",
+                "rustgis-anonymous:",
+                "rustgis-s3:",
+                "postgres:",
+                "postgresql:",
+                "pg:",
+                "mysql:",
+                "mariadb:",
+                "mssql:",
+                "pmtiles:",
+                "cog:",
+            ]
+            .iter()
+            .any(|prefix| s.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
+        }
+        Value::Array(values) => values.iter().take(LOG_LIST_ITEMS).any(|v| address_context("", v, depth + 1)),
+        Value::Object(values) => values.iter().any(|(key, v)| address_context(key, v, depth + 1)),
+        _ => false,
+    }
 }
 
 /// Scrubs bounded nested log parameters and JSON embedded in text before the log retains them.

@@ -1,9 +1,12 @@
 //! L2: geoprocessing tools.
 //!
 //! Each tool is a [`ToolSpec`]: an id, a toolbox, parameters for the Tools pane, and a
-//! pure `run` function over datasets. Inputs refer to layers by name through [`Inputs`]. Work is
-//! done in Web Mercator metres, except buffers, which are geodesic: drawn in a projection centred
-//! on each feature (see [`geodesic`]) so a 100 km buffer is 100 km on the ground.
+//! pure `run` function over datasets. Inputs refer to layers by name through [`Inputs`].
+//! The geometry tools and topology checks work in the analysis plane
+//! ([`rustgis_geom::lonlat_to_plane`]: Web Mercator meters within ±85.05°, continued beyond to
+//! the poles), radius searches in Web Mercator meters, and buffers are geodesic: drawn in a
+//! projection centered on each feature (see [`geodesic`]) so a 100 km buffer is 100 km on the
+//! ground.
 //!
 //! Tools from external suites (the GeoLibre/Whitebox tools in `rustgis-geolibre`, and plugins
 //! in `rustgis-plugins`) join the built-in ones through [`register_external`]: they're listed by [`tools`], found by
@@ -269,7 +272,10 @@ pub fn external_tools_of(key: &str) -> &'static [ToolSpec] {
     match SOURCES.write() {
         Ok(mut v) => match v.iter_mut().find(|s| s.key == key && s.generation == generation) {
             Some(s) => s.tools.get_or_insert_with(|| Box::leak(tools.into_boxed_slice())),
-            None => &[],
+            None => {
+                log::info!("{} external tool schema(s) from '{key}' discarded after its registration changed during loading", tools.len());
+                &[]
+            }
         },
         Err(_) => &[],
     }

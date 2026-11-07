@@ -104,7 +104,7 @@ const SAS_KEYS: &[&str] =
 
 /// Exact and containment rules over canonical names, plus query-wide context.
 fn credential(k: &str, query: &QueryNames) -> bool {
-    matches!(k, "key" | "pwd" | "sig" | "signature" | "sas" | "authorization" | "proxyauthorization" | "cookie" | "setcookie" | "bearer")
+    matches!(k, "key" | "appid" | "subscriptionkey" | "clientkey" | "saskey" | "pwd" | "sig" | "signature" | "sas" | "authorization" | "proxyauthorization" | "cookie" | "setcookie" | "bearer")
         // These public refusal and tracing headers share the signing family's prefix.
         || (k.starts_with("xamz") && !matches!(k, "xamznrequestid" | "xamznwafaction" | "xamzcfid"))
         || k.starts_with("xgoog")
@@ -331,6 +331,11 @@ pub fn public_web_address(address: &str) -> Public {
     if public == text { Public::Unchanged } else { Public::Changed { address: public, removed } }
 }
 
+/// A bare supported scheme is a prose example with no authority or credential to remove.
+pub(crate) fn scheme_example(text: &str) -> bool {
+    ["http://", "https://", "s3://"].iter().any(|scheme| text.eq_ignore_ascii_case(scheme))
+}
+
 /// Cleans addresses in generated text and counts changed addresses. All spacing and all other
 /// text stay byte-for-byte. Never apply this to user-authored text or dataset values.
 pub fn scrub_addresses(text: &str) -> (Cow<'_, str>, u32) {
@@ -365,6 +370,10 @@ pub fn scrub_addresses(text: &str) -> (Cow<'_, str>, u32) {
                 .len()
                 .max(scheme_at + 1);
             let address = word.get(begin..end).unwrap_or("");
+            // A bare scheme in diagnostic prose has no address or credentials to remove.
+            if scheme_example(address) {
+                continue;
+            }
             let public = public_web_address(address);
             if matches!(public, Public::Unchanged) {
                 continue;
@@ -462,6 +471,8 @@ pub struct ReviewedScope {
     pub directory: &'static str,
     pub whole_origin: bool,
 }
+/// No deployment has been authorized for full-query inheritance. Keep this list empty until
+/// that review exists; the explicit-list tests exercise the same deny boundary.
 pub const F2_SCOPES: &[ReviewedScope] = &[];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -527,6 +538,7 @@ mod tests {
     #[test]
     fn canonical_names_remove_encoded_and_unresolved_pairs_without_touching_values() {
         let over = "a".repeat(MAX_NAME_BYTES + 1);
+        let mut unredacted = Vec::new();
         for key in [
             "%74oken",
             "%2574oken",
@@ -544,16 +556,31 @@ mod tests {
             "sig=M&%73v",
             "\\u0074oken",
             "accessKeyId",
+            "appid",
+            "APP_ID",
+            "%2561ppid",
+            "subscription-key",
+            "Subscription_Key",
+            "%73ubscription%2Dkey",
+            "client-key",
+            "clientKey",
+            "sas-key",
+            "SAS_Key",
             "%2525252574oken",
             over.as_str(),
         ] {
             let address = format!("https://h.invalid/a?{key}=RGSYNTH_name_20261103&layer=a%20b&f=json&%zz=1");
-            let Public::Changed { address: public, removed, .. } = public_web_address(&address) else { panic!("{key}") };
+            let Public::Changed { address: public, removed, .. } = public_web_address(&address) else {
+                unredacted.push(key.to_string());
+                continue;
+            };
             assert!(!public.contains("RGSYNTH_name_20261103"), "{key}: {public}");
             assert!(public.ends_with("layer=a%20b&f=json&%zz=1"), "{public}");
             assert!(removed > 0);
         }
+        assert!(unredacted.is_empty(), "credential names left unchanged: {unredacted:?}");
         for query in [
+            "client_id=public&application_id=public&map=1",
             "layer=a%20b&f=json&%zz=1",
             "layer=token%3DM",
             "code=EPSG:4326",
@@ -604,6 +631,9 @@ mod tests {
             ("[s3:bucket/x?token=RGSYNTH_0]", "[s3:]", 1),
             ("https:x", "https:", 1),
             ("s3:", "s3:", 1),
+            ("plain http://, confirm before sending", "plain http://, confirm before sending", 0),
+            ("use https:// for encryption", "use https:// for encryption", 0),
+            ("an S3:// address", "an S3:// address", 0),
             ("read https:/h.invalid/x then https://h.invalid/b?layer=a%20b", "read https: then https://h.invalid/b?layer=a%20b", 1),
             (
                 "http://h.invalid/a https://h.invalid/b?layer=a%20b s3://bucket/x",

@@ -107,7 +107,7 @@ fn permission_review_url_claim_rejects_another_sessions_request() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn permission_review_non_s3_download_survives_an_unrelated_storage_login() {
-    if isolate_account_test("tests::review_boundaries::permission_review_non_s3_download_survives_an_unrelated_storage_login") {
+    if isolate_process_test("tests::review_boundaries::permission_review_non_s3_download_survives_an_unrelated_storage_login") {
         return;
     }
     use crate::render::rustgis_tiles::s3;

@@ -639,6 +639,12 @@ pub fn redact(text: &str) -> String {
             if after.starts_with("://") {
                 let url_end = rest.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`')).unwrap_or(rest.len());
                 let address = rest.get(..url_end).unwrap_or("");
+                if crate::address::scheme_example(address.trim_end_matches([':', ',', ';', '.', ')', ']'])) {
+                    out.push_str(address);
+                    i += url_end;
+                    field_before = false;
+                    continue;
+                }
                 match url::Url::parse(address) {
                     // Nothing to take out: the address stays as written, its punctuation too
                     // ("https://example.org: timeout"), unless it holds control characters.
@@ -1148,6 +1154,12 @@ mod tests {
     fn addresses_without_anything_to_take_out_stay_as_written() {
         assert_eq!(redact("Could not reach https://example.org: timeout"), "Could not reach https://example.org: timeout");
         assert_eq!(redact("failed https://example.org/a/b, retrying"), "failed https://example.org/a/b, retrying");
+        for text in ["plain http://, confirm before sending", "use https:// for encryption", "an S3:// address"] {
+            assert_eq!(redact(text), text);
+        }
+        for address in ["https://?token=RGSYNTH_example", "s3://#RGSYNTH_example", "https://u:RGSYNTH_example@"] {
+            assert!(!redact(address).contains("RGSYNTH_example"), "an incomplete address with content is still withheld");
+        }
     }
 
     /// Taking user information out rewrites the address, and the punctuation that ended it in the

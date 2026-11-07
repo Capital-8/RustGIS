@@ -9,6 +9,183 @@ use rustgis_map::presentation::{Page, PageKind, Presentation};
 const SECRET: &str = "RGSYNTH_output_20261103";
 const DATA: &str = "RGSYNTH_data_20261103";
 
+/// Database labels and durable addresses share query-key classification, without changing
+/// the executable connection string or dropping clean connection options.
+#[test]
+fn durable_database_query_aliases_match_public_labels() {
+    for scheme in ["mysql", "mariadb", "mssql", "postgresql"] {
+        for key in ["access_token", "subscription-key", "api_key"] {
+            let public = format!("{scheme}://reader@db.invalid/gis?ssl=true");
+            let private = format!("{public}&{key}={SECRET}");
+            let kept = match durable::public_address(&private) {
+                durable::Kept::Changed(s) => s,
+                _ => private.clone(),
+            };
+            assert_eq!(kept, public, "durable {scheme}/{key}");
+            assert_eq!(crate::sources::redact(&private), public, "public label {scheme}/{key}");
+            assert!(matches!(durable::public_address(&public), durable::Kept::Unchanged));
+            assert_eq!(crate::sources::redact(&public), public);
+        }
+    }
+}
+
+/// Graph input fields select existing names; source-address cleaning must not rename those
+/// references when saved text is opened without this process's credential restore memory.
+#[test]
+fn durable_model_input_names_survive_a_cold_round_trip() {
+    let bound = rustgis_data::login_address::bind("0123456789abcdef", "https://example.invalid", "https://example.invalid/roads").unwrap();
+    for name in ["https://example.invalid/roads#north", bound.as_str()] {
+        let mut s = world();
+        s.map_mut().layers[0].name = name.into();
+        let graph = ModelGraph {
+            nodes: vec![ModelNode {
+                id: "input1".into(),
+                kind: crate::project::ModelNodeKind::Input,
+                layer: Some(name.into()),
+                ..Default::default()
+            }],
+            edges: Vec::new(),
+        };
+        s.project.models.push(Model { name: "Names".into(), steps: Vec::new(), graph: Some(graph) });
+        let (text, _) = s.project.saved_text(None).unwrap();
+        for cold in [Project::from_json(&text).unwrap(), Project::from_import_json(&text, None).unwrap()] {
+            let model = cold.models.last().unwrap().graph.as_ref().unwrap();
+            let selector = model.nodes[0].layer.as_deref().unwrap();
+            assert_eq!(selector, name, "a graph input selects a name, even when it resembles an address or runtime wrapper");
+            assert!(cold.map().layer_by_name(selector).is_some(), "the opened graph still resolves its real input");
+        }
+    }
+}
+
+/// Address parsing must precede active-pattern masking at every generated history/error
+/// boundary, even when the active key is part of the URL scheme itself.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn generated_errors_and_history_clean_addresses_before_active_patterns() {
+    if isolate_process_test("tests::credential_output::generated_errors_and_history_clean_addresses_before_active_patterns") {
+        return;
+    }
+    use crate::render::rustgis_tiles::logins;
+    let binding = logins::activate(
+        "https://history-collision.invalid",
+        "synthetic-history-collision",
+        logins::Method::Header("X-Key".into()),
+        "https",
+        false,
+    )
+    .unwrap();
+    let raw = format!("failed at https://h.invalid/a?token={SECRET}&layer=roads");
+    let mut s = world();
+    s.push_gp_record(GpRecord {
+        tool: "Unknown".into(),
+        id: "unknown".into(),
+        params: Value::Null,
+        command: None,
+        at: 0,
+        ok: false,
+        messages: vec![raw.clone()],
+        millis: 0,
+        outputs: Vec::new(),
+    });
+    s.notify(&raw, true);
+    let error = s.run("layer.rename", &json!({"layer":format!("https://h.invalid/a?token={SECRET}"),"name":"unused"})).unwrap_err();
+    let history = s.project.gp_history.last().unwrap().messages[0].clone();
+    let notice = s.notices.last().unwrap().text.clone();
+    assert!(logins::deactivate(&binding));
+    assert!(!history.contains(SECRET), "history: {history}");
+    assert!(!notice.contains(SECRET), "notice: {notice}");
+    assert!(!error.contains(SECRET), "command error: {error}");
+    for id in [
+        format!("https://h.invalid/a?token={SECRET}"),
+        format!("sql.connect={{\"password\":\"{SECRET}\"}}"),
+        format!("sql.connect {{\"password\":\"{SECRET}\"}}"),
+    ] {
+        let error = s.run(&id, &Value::Null).unwrap_err();
+        assert!(!error.contains(SECRET), "unknown command error: {error}");
+    }
+    assert!(!s.project.saved_text(None).unwrap().0.contains(SECRET));
+}
+
+/// Invalid command/tool identifiers are executable slots too: an address there must not
+/// bypass cleaning through a null parameter or a malformed script line.
+#[test]
+fn durable_identifier_addresses_are_cleaned_and_counted() {
+    let url = format!("https://identifier.invalid/a?token={SECRET}&layer=roads");
+    let source = format!(
+        "# clean comment\r\n{url}\r\n{url} {{broken\nsql.connect={{\"password\":\"{SECRET}\"}}\nsql.connect={{\"password\":\"{SECRET}\"}} junk\nmap.zoomIn {{}}\n"
+    );
+    let mut project = Project::default();
+    project.notebooks.push(Notebook {
+        name: "Identifiers".into(),
+        jupyter: None,
+        cells: vec![Cell { kind: CellKind::Code, source, output: None, error: false, jupyter: None }],
+    });
+    project.tasks.push(Task {
+        name: "Identifiers".into(),
+        description: String::new(),
+        steps: [
+            url.clone(),
+            format!("sql.connect {{\"password\":\"{SECRET}\"}}"),
+            format!("sql.connect:{{\"password\":\"{SECRET}\"}}"),
+            format!("sql.connect:password:{SECRET}"),
+            format!("sql.connect:token:{SECRET}"),
+        ]
+        .into_iter()
+        .map(|command| TaskStep { title: String::new(), instructions: String::new(), command, params: Value::Null })
+        .collect(),
+    });
+    project.models.push(Model {
+        name: "Identifiers".into(),
+        steps: vec![ModelStep { tool: url.clone(), params: Value::Null }],
+        graph: Some(ModelGraph {
+            nodes: vec![ModelNode { id: "tool1".into(), tool: Some(url.clone()), ..Default::default() }],
+            edges: Vec::new(),
+        }),
+    });
+    let mut s = Session::new(project);
+    s.project.gp_history.push(GpRecord {
+        tool: "Unknown".into(),
+        id: url.clone(),
+        params: Value::Null,
+        command: Some((url, Value::Null)),
+        at: 0,
+        ok: false,
+        messages: Vec::new(),
+        millis: 0,
+        outputs: Vec::new(),
+    });
+    let original = serde_json::to_value(&s.project).unwrap();
+    let (text, report) = s.project.saved_text(None).unwrap();
+    assert!(!text.contains(SECRET), "an identifier bypassed durable projection: {text}");
+    assert!(report.lines >= 2, "{report:?}");
+    assert_eq!(report.steps, 9, "each changed executable is counted once");
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), original, "live identifiers are restored exactly");
+    let (clean, report) = crate::roles::script(
+        "# clean comment\r\nmap.zoomIn {}\r\nmap.zoomOut\nplugin:token-tools/read\nplugin:demo/token\ngeolibre:token\n",
+        0,
+    );
+    assert!(clean.is_none() && report.notices().is_empty(), "ordinary ids and formatting stay exact");
+}
+
+/// Cleaning both fields of one operation still affects one executable step.
+#[test]
+fn durable_executable_count_is_per_step() {
+    let mut project = Project::default();
+    project.tasks.push(Task {
+        name: "One step".into(),
+        description: String::new(),
+        steps: vec![TaskStep {
+            title: String::new(),
+            instructions: String::new(),
+            command: format!("https://identifier.invalid/?token={SECRET}"),
+            params: json!({"password":SECRET}),
+        }],
+    });
+    let (text, report) = project.saved_text(None).unwrap();
+    assert!(!text.contains(SECRET));
+    assert_eq!(report.steps, 1, "identifier and params belong to the same step: {report:?}");
+}
+
 /// Inline synthetic state exercises owning fields without contacting any service.
 fn marked() -> Session {
     let mut s = world();
@@ -123,6 +300,12 @@ fn durable_empty_query_pairs_preserve_clean_urls_and_report_real_loss() {
         ("layer=1&", "layer=1&", 0),
         ("layer=1 \t", "layer=1 \t", 0),
         ("layer=1&&token=RGSYNTH_empty_query&", "layer=1", 1),
+        ("layer=1&appid=RGSYNTH_empty_query", "layer=1", 1),
+        ("layer=1&%61ppid=RGSYNTH_empty_query", "layer=1", 1),
+        ("layer=1&subscription-key=RGSYNTH_empty_query", "layer=1", 1),
+        ("layer=1&client_key=RGSYNTH_empty_query", "layer=1", 1),
+        ("layer=1&sas-key=RGSYNTH_empty_query", "layer=1", 1),
+        ("client_id=public&application_id=public&map=1", "client_id=public&application_id=public&map=1", 0),
     ] {
         let url = format!("https://h.invalid/tiles/{{z}}/{{x}}/{{y}}.png?{query}");
         let mut project = Project::default();
@@ -524,7 +707,7 @@ fn peer_video_credential_losses_are_counted() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn short_basic_passwords_are_scrubbed_only_from_output_while_active() {
-    if isolate_account_test("tests::credential_output::short_basic_passwords_are_scrubbed_only_from_output_while_active") {
+    if isolate_process_test("tests::credential_output::short_basic_passwords_are_scrubbed_only_from_output_while_active") {
         return;
     }
     use crate::render::rustgis_tiles::logins;
@@ -565,6 +748,8 @@ fn durable_database_origins_clean_each_owned_field_without_opening_a_database() 
         ("postgis", "postgresql", "/source/postgis/database"),
         ("mysql", "mysql", "/source/mysql/database"),
         ("sqlserver", "mssql", "/source/sqlserver/database"),
+        ("duckdb", "postgresql", "/source/duckdb/database"),
+        ("gdal+duckdb", "postgresql", "/source/duckdb/database"),
     ] {
         for private in [false, true] {
             let public = format!("{scheme}://reader@db-origin.invalid/gis");
@@ -572,12 +757,18 @@ fn durable_database_origins_clean_each_owned_field_without_opening_a_database() 
                 if private { format!("{scheme}://reader:RGSYNTH_db_origin_20261106@db-origin.invalid/gis") } else { public.clone() };
             let dataset = rustgis_data::Dataset::new("Origin", rustgis_data::GeometryType::None, Vec::new());
             let mut layer = serde_json::to_value(rustgis_map::Layer::new(1, dataset)).unwrap();
-            let origin = json!({"database":address, "table":"rows"});
+            let mut origin = json!({"database":address, "table":"rows"});
+            if matches!(role, "duckdb" | "gdal+duckdb") {
+                origin["family"] = json!("Points");
+            }
             if role == "edit" {
                 layer["postgis"] = json!({"origin":origin, "key":"id", "srid":4326, "writable":false});
             } else {
                 layer["source"] = json!({});
-                layer["source"][role] = origin;
+                layer["source"][if role == "gdal+duckdb" { "duckdb" } else { role }] = origin;
+                if role == "gdal+duckdb" {
+                    layer["source"]["gdal"] = json!({"path":"unused.geojson", "layer":"rows"});
+                }
             }
             let mut project = Project::default();
             project.map_mut().layers.push(serde_json::from_value(layer).unwrap());
@@ -608,7 +799,180 @@ fn durable_database_origins_clean_each_owned_field_without_opening_a_database() 
                 };
                 assert_eq!(report.notices(), notices, "{kind}: {role}");
             }
+            if role == "gdal+duckdb" {
+                let mark = s.notice_mark();
+                let (_, bytes) = crate::cmd::items::item_bytes(&mut s, "layer", &json!({"layer":1})).unwrap();
+                let written: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(written, expected["maps"][0]["layers"][0]);
+                assert_eq!(s.notices_since(mark).len(), usize::from(private), "layer export has one aggregate notice or none");
+            }
             assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "{role}: all output rolls back live fields");
+        }
+    }
+}
+
+/// Runtime-only login omissions and executable replacement losses use different notice kinds.
+#[test]
+fn peer_output_counts_runtime_logins_and_changed_executable_fields() {
+    let public = "https://peer-runtime.invalid/data";
+    let bound = rustgis_data::login_address::bind("0123456789abcdef", "https://peer-runtime.invalid", public).unwrap();
+    let mut s = Session::new(Project::default());
+    let mut dataset = rustgis_data::Dataset::new("Bound", rustgis_data::GeometryType::None, Vec::new());
+    dataset.source = Some(bound.clone());
+    let id = s.map_mut().add_dataset(dataset);
+    s.map_mut().layer_mut(id).unwrap().connection = "saved-connection".into();
+    s.project.tasks.push(Task {
+        name: "Login".into(),
+        description: String::new(),
+        steps: vec![TaskStep {
+            title: String::new(),
+            instructions: String::new(),
+            command: "connection.login".into(),
+            params: json!({"apiKey":SECRET}),
+        }],
+    });
+    let (text, report) = s.peer_text(Peer::Embedder).unwrap();
+    assert_eq!(report.layer_addresses(), 1, "a foreign receiver cannot use the recorded connection's live binding");
+    assert!(!text.contains("rustgis-login:") && !text.contains(SECRET));
+    assert_eq!(s.map().layer(id).unwrap().dataset.source.as_deref(), Some(bound.as_str()));
+    let report = s.open_peer_text(Peer::Embedder, &text).unwrap();
+    assert_eq!(report.executable_changes, 1);
+    assert!(report.notices().iter().any(|n| n.contains("executable field(s) changed")));
+    assert_eq!(s.project.tasks[0].steps[0].params["apiKey"], "");
+}
+
+/// A valid S3 wrapper's endpoint is also an address, not an opaque place to store a password.
+#[test]
+fn durable_s3_endpoints_clean_recognized_credentials_and_keep_provenance() {
+    for (endpoint, expected, count) in [
+        ("https://reader:RGSYNTH_endpoint@h.invalid", "https://h.invalid", 1),
+        ("https://h.invalid?token=RGSYNTH_endpoint", "https://h.invalid", 1),
+        ("https://h.invalid", "https://h.invalid", 0),
+        ("", "", 0),
+    ] {
+        let address = rustgis_data::s3_address::bind("0123456789abcdef", endpoint, "s3://bucket/data").unwrap();
+        let mut p = Project::default();
+        let mut table = rustgis_data::Dataset::new("S3", rustgis_data::GeometryType::None, Vec::new());
+        table.source = Some(address.clone());
+        p.add_table(table);
+        let (text, report) = p.saved_text(None).unwrap();
+        assert!(!text.contains("RGSYNTH_endpoint"));
+        assert_eq!(report.layer_addresses(), count);
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let parsed = rustgis_data::s3_address::parse(value["tables"][0]["source"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!((parsed.binding, parsed.endpoint, parsed.url), ("0123456789abcdef", expected, "s3://bucket/data"));
+        assert_eq!(p.tables[0].source.as_deref(), Some(address.as_str()));
+    }
+}
+
+#[test]
+fn nested_notebook_source_stays_opaque_but_is_reported_unchecked() {
+    for command in ["notebook.addCell", "notebook.editCell"] {
+        for source in ["layer.addUrl {\"url\":\"https://h.invalid/?token=RGSYNTH_nested\"}", "print('RGSYNTH_nested token')", "clean prose"]
+        {
+            let mut p = Project::default();
+            p.tasks.push(Task {
+                name: "Nested".into(),
+                description: String::new(),
+                steps: vec![TaskStep {
+                    title: String::new(),
+                    instructions: String::new(),
+                    command: command.into(),
+                    params: json!({"source":source}),
+                }],
+            });
+            let (text, report) = p.saved_text(None).unwrap();
+            let written: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(written["tasks"][0]["steps"][0]["params"]["source"], source);
+            assert_eq!(report.unchecked, u32::from(source != "clean prose"));
+            assert_eq!(report.steps, 0);
+        }
+    }
+    for url in ["https://h.invalid/a", "pg:host=h dbname=gis", "mariadb://h/gis", "pmtiles:https://h.invalid/a", "cog:https://h.invalid/a"]
+    {
+        assert_eq!(crate::log_params(&json!({"key":"abc", "source":{"url":url}})).into_log_value()["key"], "", "{url}");
+    }
+    assert_eq!(crate::log_params(&json!({"key":"abc", "data":{"url":"https://h.invalid/a"}})).into_log_value()["key"], "abc");
+}
+
+/// A retained address must actually reopen its protected reader, not merely survive as text.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn bridge_round_trip_reopens_its_protected_reader() {
+    if super::isolate_process_test("tests::credential_output::bridge_round_trip_reopens_its_protected_reader") {
+        return;
+    }
+    use rustgis_data::source::{fgb, remote};
+    let (dataset, _) = rustgis_data::io::read_geojson(r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"value":7}}]}"#, "Protected").unwrap();
+    let bytes = fgb::write(&dataset).unwrap();
+    let original = fgb::FgbSource::open_bytes(bytes.clone(), "Protected").unwrap();
+    let full = "https://protected-reader.invalid/data.fgb?token=RGSYNTH_reader";
+    // Session construction installs the native fetcher; replace it only after that setup.
+    let mut s = Session::new(Project::default());
+    remote::set_fetcher(move |url, want, done| {
+        if url != full {
+            done(Err(remote::Failed::Other("protected reader needs its token".into())));
+        } else if matches!(want, remote::Want::Whole) {
+            done(Ok(bytes.clone()));
+        } else {
+            done(Err(remote::Failed::NoRanges));
+        }
+    });
+    let id = s.map_mut().add_dataset(dataset);
+    s.map_mut().layer_mut(id).unwrap().source = Some(rustgis_map::source::SourceLayer::from_path(full, None, Box::new(original)));
+    let (text, _) = s.peer_text(Peer::Bridge).unwrap();
+    assert!(!text.contains("RGSYNTH_reader"));
+    let report = s.open_peer_text(Peer::Bridge, &text).unwrap();
+    assert_eq!(report.lost, 0, "the unchanged streamed source retains its address");
+    let source = s.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap();
+    assert_eq!(source.path.as_deref(), Some(full), "the exact source keeps its protected address");
+    source.wait_open(std::time::Duration::from_secs(5));
+    assert!(source.is_open(), "retained reader failed to open: {:?}", source.error);
+    let (read, _) = source.read_all().unwrap();
+    assert_eq!(read.features.len(), 1);
+    assert_eq!(read.features[0].attrs[0], rustgis_data::Value::Int(7));
+}
+
+/// Discovery must announce omitted settings even when the following supplied document is invalid.
+#[test]
+fn failed_collections_discovery_retains_its_counted_query_notice() {
+    for (query, count) in [("", 0), ("?token=RGSYNTH_discovery", 1)] {
+        let mut s = Session::new(Project::default());
+        let p = json!({"url":format!("https://discovery.invalid/root{query}"), "type":"ogcapi",
+            "text":json!({"links":[{"rel":"data", "type":"application/json", "href":"/catalog"}]}).to_string(),
+            "documents":[{"url":"https://discovery.invalid/catalog", "text":"invalid capabilities"}]});
+        assert!(s.run("service.layers", &p).is_err());
+        let messages: Vec<_> = s.notices.iter().filter(|n| n.text.contains("address(es) the service listed")).collect();
+        assert_eq!(messages.len(), count);
+        if count > 0 {
+            assert!(messages[0].text.starts_with("1 address(es)"));
+        }
+    }
+}
+
+/// Coverage reports discovery omissions even when the selected coverage is missing.
+#[test]
+fn coverage_discovery_retains_its_counted_query_notice() {
+    for (query, count) in [("", 0), ("?token=RGSYNTH_coverage", 1)] {
+        let mut s = Session::new(Project::default());
+        let p = json!({"url":format!("https://coverage.invalid/root{query}"), "type":"ogcapi", "layer":"missing",
+            "text":json!({"links":[{"rel":"data", "type":"application/json", "href":"/catalog"}]}).to_string(),
+            "documents":[{"url":"https://coverage.invalid/catalog", "text":"{\"collections\":[]}"}]});
+        assert!(s.run("service.coverage", &p).unwrap_err().contains("no coverage"));
+        assert_eq!(s.notices.iter().filter(|n| n.text.contains("address(es) the service listed")).count(), count);
+    }
+}
+
+/// Capabilities are opaque protocol documents, distinct from user feature data and expressions.
+#[test]
+fn supplied_service_documents_are_preserved_with_counted_unchecked_notices() {
+    for command in ["service.layers", "service.add", "service.coverage", "service.import", "service.groupPlan"] {
+        for private in [false, true] {
+            let text = if private { "<href>https://h.invalid/a?token=RGSYNTH_document</href>" } else { "<href>https://h.invalid/a</href>" };
+            let (clean, report) = crate::roles::command(command, &json!({"text":text}), 0);
+            assert!(clean.is_none(), "{command}: protocol documents keep exact bytes");
+            assert_eq!(report.unchecked, u32::from(private), "{command}: {report:?}");
+            assert_eq!(report.notices().len(), usize::from(private));
         }
     }
 }
