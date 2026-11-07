@@ -21,6 +21,7 @@ pub struct Report {
     pub(crate) not_remembered: bool,
     pub(crate) lost: u32,
     pub(crate) not_retained: u32,
+    pub(crate) executable_changes: u32,
 }
 
 impl Report {
@@ -51,6 +52,10 @@ impl Report {
             (self.unchecked, "step(s) contain opaque parameters that may hold credentials and were kept unchecked"),
             (self.not_retained, "address(es) exceeded the bridge retention limit; their keys will not survive a round trip"),
             (self.lost, "address(es) lost their keys when a peer sent back its project; add them again in the receiving session"),
+            (
+                self.executable_changes,
+                "credential-bearing executable field(s) changed when a peer sent back its project; supply missing values before replay",
+            ),
         ] {
             if n > 0 {
                 out.push(format!("{n} {text}"));
@@ -81,6 +86,7 @@ impl Report {
         self.not_remembered |= other.not_remembered;
         self.lost = self.lost.saturating_add(other.lost);
         self.not_retained = self.not_retained.saturating_add(other.not_retained);
+        self.executable_changes = self.executable_changes.saturating_add(other.executable_changes);
     }
 }
 
@@ -259,7 +265,7 @@ impl<'a> Prepare<'a> {
                 if binding_only {
                     kind = Kind::Runtime;
                 }
-                if !binding_only {
+                if !binding_only || matches!(leaf, Leaf::Video(_)) {
                     if matches!(leaf, Leaf::Video(_)) {
                         self.report.videos = self.report.videos.saturating_add(1);
                     } else {
@@ -621,13 +627,25 @@ fn public_address_at(address: &str, depth: usize) -> Kept {
         let file = crate::render::rustgis_tiles::cog::split(text).0;
         let look = text.get(file.len()..).unwrap_or("");
         let Ok(Some(b)) = s3_address::parse(file) else { return Kept::Withheld(prefix) };
-        return match public_address_at(b.url, depth + 1) {
-            Kept::Unchanged => Kept::Unchanged,
-            Kept::Changed(s) => match s3_address::bind(b.binding, b.endpoint, &s) {
-                Ok(s) => Kept::Changed(format!("{s}{look}")),
-                Err(_) => Kept::Withheld(prefix),
-            },
-            Kept::Withheld(_) => Kept::Withheld(prefix),
+        let endpoint = public_address_at(b.endpoint, depth + 1);
+        let url = public_address_at(b.url, depth + 1);
+        if matches!(endpoint, Kept::Withheld(_)) || matches!(url, Kept::Withheld(_)) {
+            return Kept::Withheld(prefix);
+        }
+        if matches!((&endpoint, &url), (Kept::Unchanged, Kept::Unchanged)) {
+            return Kept::Unchanged;
+        }
+        let endpoint = match &endpoint {
+            Kept::Changed(s) => s.as_str(),
+            _ => b.endpoint,
+        };
+        let url = match &url {
+            Kept::Changed(s) => s.as_str(),
+            _ => b.url,
+        };
+        return match s3_address::bind(b.binding, endpoint, url) {
+            Ok(s) => Kept::Changed(format!("{s}{look}")),
+            Err(_) => Kept::Withheld(prefix),
         };
     }
     if matches!(prefix, "postgresql:" | "postgres:" | "pg:") {
@@ -647,8 +665,38 @@ fn public_address_at(address: &str, depth: usize) -> Kept {
 /// Emits the report only after rollback, when the session is whole again.
 pub(crate) fn notify(s: &mut crate::Session, report: &Report) {
     for text in report.notices() {
-        s.notify(text, false);
+        s.notify(format!("Prepared output: {text}"), false);
     }
+}
+
+/// Compares credential-bearing executable leaves through the same typed output inventory.
+/// Peer input never restores these credentials; a changed or removed field is reported once.
+pub(crate) fn changed_executables(old: &mut crate::Project, incoming: &mut crate::Project) -> Result<u32, String> {
+    let prepared = prepared(old, None, 0)?;
+    let mut count = 0u32;
+    for edit in prepared.edits {
+        if edit.kind != Kind::Credential
+            || !matches!(
+                edit.at.leaf,
+                Leaf::Task(_)
+                    | Leaf::ModelStep(_)
+                    | Leaf::ModelNode(_)
+                    | Leaf::ModelLayer(_)
+                    | Leaf::HistoryParams
+                    | Leaf::HistoryCommand
+                    | Leaf::CellSource(_)
+            )
+        {
+            continue;
+        }
+        let same = match (old.field_mut(&edit.at.owners, &edit.at.leaf), incoming.field_mut(&edit.at.owners, &edit.at.leaf)) {
+            (Some(FieldMut::Text(a)), Some(FieldMut::Text(b))) => a == b,
+            (Some(FieldMut::Json(a)), Some(FieldMut::Json(b))) => a == b,
+            _ => false,
+        };
+        count = count.saturating_add(u32::from(!same));
+    }
+    Ok(count)
 }
 
 impl<T: Durable> Durable for Vec<T> {

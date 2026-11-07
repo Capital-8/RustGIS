@@ -1209,7 +1209,7 @@ impl SourceLayer {
         } else if let Some(d) = duckdb
             && let Some(p) = &d.database
         {
-            out.push((R::DuckDbDatabase, p.as_str(), false, paths::is_local(p)));
+            out.push((R::DuckDbDatabase, p.as_str(), true, paths::is_local(p)));
         }
         if let Some(pg) = postgis {
             out.push((R::PostgisDatabase, pg.database.as_str(), true, false));

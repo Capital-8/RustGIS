@@ -139,9 +139,11 @@ The project, with the data that travels with it, goes to that app through the br
 (`postMessage`); nothing goes to a server. The app runs in your browser, so with the default
 address your data stays on your machine. Point `url=` only at a copy of the app you trust.
 
-The widget receives public addresses and cleaned executable parameters. Credentials held by
-Python are not sent to it, so protected layers can remain empty there; a warning counts affected
-layer addresses. When the widget sends a project back, Python can retain credentials only for
+The widget receives public addresses and cleaned executable parameters. Recognized credentials
+in supported fields are removed, so protected layers can remain empty there; a warning counts
+affected layer addresses. User data, foreign notebook source and opaque parameters are kept
+unchanged and may contain credentials: review them before sharing the project with a widget.
+When the widget sends a project back, Python can retain credentials only for
 unchanged, uniquely matched sources from its last exchange that still match its current project.
 Changing or replacing a source can require signing in again in Python. Exchange notices are
 available through `m.notices()` on the `Map` or `MapWidget`.

@@ -138,8 +138,7 @@ pub(crate) fn redacted(v: &Value) -> Value {
         Value::String(t) => Value::String(redacted_text(t)),
         Value::Array(a) => Value::Array(a.iter().map(redacted).collect()),
         Value::Object(o) => {
-            let web = |v: &Value| v.as_str().is_some_and(|t| t.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("http")));
-            let beside_address = |k: &str| o.iter().any(|(sibling, v)| sibling != k && web(v));
+            let beside_address = |k: &str| o.iter().any(|(sibling, v)| sibling != k && crate::project_log::address_context(sibling, v, 0));
             let secret = |k: &str, v: &Value| {
                 secret_key(k)
                     && !matches!(v, Value::Bool(_) | Value::Null)

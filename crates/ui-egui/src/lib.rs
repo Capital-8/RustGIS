@@ -4390,12 +4390,15 @@ impl RustGisApp {
     }
 
     /// Refuses answers from a replaced project and reports the retired read without starting follow-up work.
-    fn service_read_current(&mut self, opened: u64, address: &str) -> bool {
+    fn service_read_current(&mut self, opened: u64, address: &str, pending: Option<&str>) -> bool {
         if opened == self.session.opened {
             return true;
         }
         let url = serviceui::address_in_message(address);
         let why = i18n::fmt("{url}: its project was closed while it was read, so it wasn't added", &[("url", &url)]);
+        if pending.is_some() && self.dialogs.info.as_deref() == pending {
+            self.dialogs.info = None;
+        }
         self.session.notify(why, false);
         false
     }
@@ -4409,7 +4412,13 @@ impl RustGisApp {
         for step in std::mem::take(&mut self.ui.service_steps) {
             match step {
                 ServiceStep::Tiles { mut resolve, dialog, origin, opened } => {
-                    if !self.service_read_current(opened, &resolve.doc) {
+                    let pending = dialog.then(|| {
+                        i18n::fmt(
+                            "Reading the tileset of {name}",
+                            &[("name", resolve.params.get("name").and_then(Value::as_str).unwrap_or(""))],
+                        )
+                    });
+                    if !self.service_read_current(opened, &resolve.doc, pending.as_deref()) {
                         continue;
                     }
                     let Some(r) = resolve.slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
@@ -4468,7 +4477,9 @@ impl RustGisApp {
                     self.map.invalidate();
                 }
                 ServiceStep::Coverage { mut params, slot, dialog, origin, opened } => {
-                    if !self.service_read_current(opened, params.get("url").and_then(Value::as_str).unwrap_or("")) {
+                    let pending = dialog
+                        .then(|| i18n::fmt("Describing {name}", &[("name", params.get("name").and_then(Value::as_str).unwrap_or(""))]));
+                    if !self.service_read_current(opened, params.get("url").and_then(Value::as_str).unwrap_or(""), pending.as_deref()) {
                         continue;
                     }
                     let Some(r) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
@@ -5581,8 +5592,51 @@ mod download_service_tests {
             assert!(app.ui.service_steps.is_empty());
             let notices = app.session.notices.iter().filter(|n| n.text.contains("address(es) the service listed")).count();
             assert_eq!(notices, count);
-            assert!(app.session.map().tiles.iter().all(|t| !t.url.contains("RGSYNTH_")));
+            assert_eq!(app.session.map().tiles.len(), 1);
+            assert_eq!(app.session.map().tiles[0].url, "https://elsewhere.invalid/{z}/{y}/{x}?collections=roads");
             assert!(app.dialogs.error.is_none(), "{:?}", app.dialogs.error);
+        }
+    }
+
+    #[test]
+    fn retired_service_steps_clear_only_their_own_pending_dialog() {
+        for coverage in [false, true] {
+            for newer in [false, true] {
+                let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+                let opened = app.session.opened;
+                let params = json!({"url":"https://retired.invalid/service", "name":"Old read"});
+                let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let step = if coverage {
+                    super::ServiceStep::Coverage { params, slot: slot.clone(), dialog: true, origin: None, opened }
+                } else {
+                    super::ServiceStep::Tiles {
+                        resolve: super::TilesResolve {
+                            params,
+                            list: "https://retired.invalid/list".into(),
+                            doc: "https://retired.invalid/list".into(),
+                            crossed_origin: false,
+                            read: 0,
+                            withheld_addresses: 0,
+                            vector: false,
+                            fallback: "https://retired.invalid/{z}/{y}/{x}".into(),
+                            slot: slot.clone(),
+                        },
+                        dialog: true,
+                        origin: None,
+                        opened,
+                    }
+                };
+                app.ui.service_steps.push(step);
+                app.session.run("project.new", &json!({})).unwrap();
+                let pending = if coverage { "Describing Old read" } else { "Reading the tileset of Old read" };
+                app.dialogs.info = Some(if newer { "New operation" } else { pending }.into());
+                *slot.lock().unwrap() = Some(Ok(b"late completion".to_vec()));
+                app.poll_service_steps();
+                assert!(app.ui.service_steps.is_empty());
+                assert!(app.session.map().tiles.is_empty() && app.session.map().layers.is_empty());
+                assert!(app.session.notices.iter().any(|n| n.text.contains("its project was closed while it was read")));
+                assert_eq!(app.dialogs.info.as_deref(), if newer { Some("New operation") } else { None });
+            }
         }
     }
 

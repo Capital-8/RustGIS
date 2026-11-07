@@ -279,7 +279,7 @@ pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Resul
             }
             let (before, mark) = (layer_snap(s), s.notice_mark());
             let r = s.run(&id, &params_arg(a)?).map_err(|e| public_text(error_with_notices(e, s, mark)))?;
-            with_notices(with_new_layers(r, s, &before), s, mark)
+            return Ok(command_result(s, r, &before, mark, tokens));
         }
         "run_tool" => {
             let tool = str_arg(a, "tool").ok_or("tool is required")?;
@@ -287,7 +287,7 @@ pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Resul
             let r = s
                 .run("gp.run", &json!({"tool": tool, "params": params_arg(a)?}))
                 .map_err(|e| public_text(error_with_notices(e, s, mark)))?;
-            with_notices(with_new_layers(r, s, &before), s, mark)
+            return Ok(command_result(s, r, &before, mark, tokens));
         }
         "read_features" => read_features(s, a)?,
         // MCP's `run` (not offered to the in-app assistant): a script in one call.
@@ -312,7 +312,13 @@ pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Resul
         "test_panic" => panic!("a test tool panicked"),
         other => return Err(format!("unknown tool '{other}'")),
     };
-    Ok(public_result(s, v, tokens))
+    if call.name == "read_features" {
+        Ok(public_envelope(s, v, tokens))
+    } else {
+        let mut withheld = Withheld::default();
+        let v = public_metadata(v, 0, &mut withheld);
+        Ok(finish_result(s, v, tokens, withheld))
+    }
 }
 
 /// How deep a result is searched for runtime login addresses; what is deeper is withheld.
@@ -326,9 +332,51 @@ fn public_text(text: String) -> String {
 }
 
 /// Publishes a completed result, reporting withheld subtrees before enforcing the response budget.
+#[cfg(test)]
 fn public_result(s: &mut Session, value: Value, tokens: usize) -> String {
     let mut withheld = Withheld::default();
-    let mut value = public_addresses(value, 0, &mut withheld);
+    let value = public_addresses(value, 0, &mut withheld);
+    finish_result(s, value, tokens, withheld)
+}
+
+/// These fields belong to the adapter's response schema; only their values contain data.
+fn public_envelope(s: &mut Session, value: Value, tokens: usize) -> String {
+    let mut withheld = Withheld::default();
+    let value = match value {
+        Value::Object(o) => Value::Object(o.into_iter().map(|(key, value)| (key, public_addresses(value, 1, &mut withheld))).collect()),
+        value => public_addresses(value, 0, &mut withheld),
+    };
+    finish_result(s, value, tokens, withheld)
+}
+
+/// Generated search, tool and project metadata has a fixed schema at every level. Its
+/// strings may hold private data, but its keys cannot be login values. Row/property maps
+/// and arbitrary command results use `public_addresses` instead.
+fn public_metadata(value: Value, depth: usize, withheld: &mut Withheld) -> Value {
+    match value {
+        Value::String(text) => Value::String(public_text(text)),
+        Value::Array(a) if depth < MAX_DEPTH => Value::Array(a.into_iter().map(|v| public_metadata(v, depth + 1, withheld)).collect()),
+        Value::Object(o) if depth < MAX_DEPTH => {
+            Value::Object(o.into_iter().map(|(key, v)| (key, public_metadata(v, depth + 1, withheld))).collect())
+        }
+        Value::Array(_) | Value::Object(_) => {
+            withheld.depth = withheld.depth.saturating_add(1);
+            json!("[too deep]")
+        }
+        other => other,
+    }
+}
+
+/// Cleans the arbitrary command payload before adding adapter-owned notices/layer metadata.
+fn command_result(s: &mut Session, value: Value, before: &[(String, Vec<u32>)], mark: u64, tokens: usize) -> String {
+    let mut withheld = Withheld::default();
+    let value = public_addresses(value, 0, &mut withheld);
+    let value = with_notices(with_new_layers(value, s, before), s, mark);
+    finish_result(s, value, tokens, withheld)
+}
+
+/// Publishes counted projection losses without sending the completed envelope through a second redactor.
+fn finish_result(s: &mut Session, mut value: Value, tokens: usize, withheld: Withheld) -> String {
     if withheld.depth > 0 || withheld.keys > 0 {
         let mark = s.notice_mark();
         if withheld.depth > 0 {
@@ -488,7 +536,7 @@ fn with_new_layers(r: Value, s: &Session, before: &[(String, Vec<u32>)]) -> Valu
     let same =
         before.iter().find(|(name, _)| name.eq_ignore_ascii_case(&m.name)).or_else(|| if renamed { before.get(active) } else { None });
     let had = same.map_or(&[][..], |(_, ids)| ids.as_slice());
-    let added: Vec<String> = m.layers.iter().filter(|l| !had.contains(&l.id)).map(|l| l.name.clone()).collect();
+    let added: Vec<String> = m.layers.iter().filter(|l| !had.contains(&l.id)).map(|l| public_text(l.name.clone())).collect();
     if added.is_empty() {
         return if r.is_null() { json!({"ok": true}) } else { r };
     }
@@ -519,7 +567,7 @@ fn run_script(s: &mut Session, a: &Value, tokens: usize) -> Result<String, Strin
             let added = with_new_layers(json!({}), s, &before).get("layersAdded").cloned().unwrap_or_else(|| json!([]));
             let out = json!({"success": true, "result": last, "lines": ran.map_or(0, Vec::len), "layersAdded": added,
                 "notices": notices, "error": null, "duration_s": secs});
-            Ok(public_result(s, out, tokens))
+            Ok(public_envelope(s, out, tokens))
         }
         Err(e) => {
             // Nothing was kept, so no line ran and no layer was added.
@@ -528,7 +576,7 @@ fn run_script(s: &mut Session, a: &Value, tokens: usize) -> Result<String, Strin
             let said: Vec<&&str> = notices.iter().filter(|t| **t != e && **t != told).collect();
             let out = json!({"success": false, "result": null, "lines": 0, "layersAdded": [], "notices": said,
                 "error": clip(&e, 8000), "duration_s": secs});
-            Err(public_result(s, out, tokens))
+            Err(public_envelope(s, out, tokens))
         }
     }
 }
@@ -536,7 +584,7 @@ fn run_script(s: &mut Session, a: &Value, tokens: usize) -> Result<String, Strin
 /// A run's result with what it said beside it (a notice that only the first tables of a GeoPackage
 /// were added, a file's warnings), which the status bar shows in the app.
 fn with_notices(r: Value, s: &Session, mark: u64) -> Value {
-    let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| public_text(n.text.clone())).collect();
     if said.is_empty() {
         return r;
     }
@@ -899,6 +947,54 @@ mod tests {
             assert!(!text.contains("rustgis-login:") && !text.contains("assistant-secret-757"), "{text}");
         }
         assert!(listed.contains(&plain), "the model still learns the layer's address: {listed}");
+    }
+
+    /// The known response schema survives a secret that happens to name one of its fields.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn run_envelope_keys_are_not_data_derived_login_values() {
+        if std::env::var_os("RUSTGIS_TEST_RUN_ENVELOPE").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tools::tests::run_envelope_keys_are_not_data_derived_login_values"])
+                .env("RUSTGIS_TEST_RUN_ENVELOPE", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut s = Session::new(rustgis_engine::Project::default());
+        let id = s
+            .run("connection.new", &json!({"kind":"wms", "address":"https://envelope.invalid/wms", "auth":"basic", "user":"reader"}))
+            .unwrap()["id"]
+            .clone();
+        s.run("connection.login", &json!({"id":id, "password":"success"})).unwrap();
+        for (script, success) in [("map.zoomIn {}", true), ("not.a.command {}", false)] {
+            let call = ToolCall { id: "envelope".into(), name: "run".into(), args: json!({"script":script}) };
+            let text = run(&mut s, &call).unwrap_or_else(|e| e);
+            let out: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(out.get("success"), Some(&json!(success)), "{text}");
+            assert!(out.get("result").is_some() && out.get("notices").is_some() && out.get("duration_s").is_some());
+        }
+        let data = public_addresses(json!({"success":"private field"}), 0, &mut Withheld::default());
+        assert_eq!(data["[redacted]"], "private field", "the same spelling in dynamic data is still scrubbed");
+        s.run("connection.login", &json!({"id":id, "password":"id"})).unwrap();
+        for (name, args, array) in
+            [("search_commands", json!({"query":"zoom"}), "commands"), ("search_tools", json!({"query":"buffer"}), "tools")]
+        {
+            let call = ToolCall { id: "metadata".into(), name: name.into(), args };
+            let text = run(&mut s, &call).unwrap();
+            let out: Value = serde_json::from_str(&text).unwrap();
+            let entries = out.get(array).and_then(Value::as_array).unwrap();
+            assert!(!entries.is_empty(), "{text}");
+            assert!(entries.iter().all(|entry| entry.get("id").is_some()), "fixed nested schema keys survive: {text}");
+        }
+        let data = public_addresses(json!({"id":"private field"}), 0, &mut Withheld::default());
+        assert_eq!(data["[redacted]"], "private field");
     }
 
     #[test]

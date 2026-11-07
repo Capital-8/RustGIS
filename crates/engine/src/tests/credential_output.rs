@@ -123,6 +123,12 @@ fn durable_empty_query_pairs_preserve_clean_urls_and_report_real_loss() {
         ("layer=1&", "layer=1&", 0),
         ("layer=1 \t", "layer=1 \t", 0),
         ("layer=1&&token=RGSYNTH_empty_query&", "layer=1", 1),
+        ("layer=1&appid=RGSYNTH_empty_query", "layer=1", 1),
+        ("layer=1&%61ppid=RGSYNTH_empty_query", "layer=1", 1),
+        ("layer=1&subscription-key=RGSYNTH_empty_query", "layer=1", 1),
+        ("layer=1&client_key=RGSYNTH_empty_query", "layer=1", 1),
+        ("layer=1&sas-key=RGSYNTH_empty_query", "layer=1", 1),
+        ("client_id=public&application_id=public&map=1", "client_id=public&application_id=public&map=1", 0),
     ] {
         let url = format!("https://h.invalid/tiles/{{z}}/{{x}}/{{y}}.png?{query}");
         let mut project = Project::default();
@@ -559,6 +565,7 @@ fn durable_database_origins_clean_each_owned_field_without_opening_a_database() 
         ("postgis", "postgresql", "/source/postgis/database"),
         ("mysql", "mysql", "/source/mysql/database"),
         ("sqlserver", "mssql", "/source/sqlserver/database"),
+        ("duckdb", "postgresql", "/source/duckdb/database"),
     ] {
         for private in [false, true] {
             let public = format!("{scheme}://reader@db-origin.invalid/gis");
@@ -566,7 +573,10 @@ fn durable_database_origins_clean_each_owned_field_without_opening_a_database() 
                 if private { format!("{scheme}://reader:RGSYNTH_db_origin_20261106@db-origin.invalid/gis") } else { public.clone() };
             let dataset = rustgis_data::Dataset::new("Origin", rustgis_data::GeometryType::None, Vec::new());
             let mut layer = serde_json::to_value(rustgis_map::Layer::new(1, dataset)).unwrap();
-            let origin = json!({"database":address, "table":"rows"});
+            let mut origin = json!({"database":address, "table":"rows"});
+            if role == "duckdb" {
+                origin["family"] = json!("Points");
+            }
             if role == "edit" {
                 layer["postgis"] = json!({"origin":origin, "key":"id", "srid":4326, "writable":false});
             } else {
@@ -603,6 +613,142 @@ fn durable_database_origins_clean_each_owned_field_without_opening_a_database() 
                 assert_eq!(report.notices(), notices, "{kind}: {role}");
             }
             assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "{role}: all output rolls back live fields");
+        }
+    }
+}
+
+/// Runtime-only login omissions and executable replacement losses use different notice kinds.
+#[test]
+fn peer_output_counts_runtime_logins_and_changed_executable_fields() {
+    let public = "https://peer-runtime.invalid/data";
+    let bound = rustgis_data::login_address::bind("0123456789abcdef", "https://peer-runtime.invalid", public).unwrap();
+    let mut s = Session::new(Project::default());
+    let mut dataset = rustgis_data::Dataset::new("Bound", rustgis_data::GeometryType::None, Vec::new());
+    dataset.source = Some(bound.clone());
+    let id = s.map_mut().add_dataset(dataset);
+    s.map_mut().layer_mut(id).unwrap().connection = "saved-connection".into();
+    s.project.tasks.push(Task {
+        name: "Login".into(),
+        description: String::new(),
+        steps: vec![TaskStep {
+            title: String::new(),
+            instructions: String::new(),
+            command: "connection.login".into(),
+            params: json!({"apiKey":SECRET}),
+        }],
+    });
+    let (text, report) = s.peer_text(Peer::Embedder).unwrap();
+    assert_eq!(report.layer_addresses(), 1, "a foreign receiver cannot use the recorded connection's live binding");
+    assert!(!text.contains("rustgis-login:") && !text.contains(SECRET));
+    assert_eq!(s.map().layer(id).unwrap().dataset.source.as_deref(), Some(bound.as_str()));
+    let report = s.open_peer_text(Peer::Embedder, &text).unwrap();
+    assert_eq!(report.executable_changes, 1);
+    assert!(report.notices().iter().any(|n| n.contains("executable field(s) changed")));
+    assert_eq!(s.project.tasks[0].steps[0].params["apiKey"], "");
+}
+
+/// A valid S3 wrapper's endpoint is also an address, not an opaque place to store a password.
+#[test]
+fn durable_s3_endpoints_clean_recognized_credentials_and_keep_provenance() {
+    for (endpoint, expected, count) in [
+        ("https://reader:RGSYNTH_endpoint@h.invalid", "https://h.invalid", 1),
+        ("https://h.invalid?token=RGSYNTH_endpoint", "https://h.invalid", 1),
+        ("https://h.invalid", "https://h.invalid", 0),
+        ("", "", 0),
+    ] {
+        let address = rustgis_data::s3_address::bind("0123456789abcdef", endpoint, "s3://bucket/data").unwrap();
+        let mut p = Project::default();
+        let mut table = rustgis_data::Dataset::new("S3", rustgis_data::GeometryType::None, Vec::new());
+        table.source = Some(address.clone());
+        p.add_table(table);
+        let (text, report) = p.saved_text(None).unwrap();
+        assert!(!text.contains("RGSYNTH_endpoint"));
+        assert_eq!(report.layer_addresses(), count);
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let parsed = rustgis_data::s3_address::parse(value["tables"][0]["source"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!((parsed.binding, parsed.endpoint, parsed.url), ("0123456789abcdef", expected, "s3://bucket/data"));
+        assert_eq!(p.tables[0].source.as_deref(), Some(address.as_str()));
+    }
+}
+
+#[test]
+fn nested_notebook_source_stays_opaque_but_is_reported_unchecked() {
+    for command in ["notebook.addCell", "notebook.editCell"] {
+        for source in ["layer.addUrl {\"url\":\"https://h.invalid/?token=RGSYNTH_nested\"}", "print('RGSYNTH_nested token')", "clean prose"]
+        {
+            let mut p = Project::default();
+            p.tasks.push(Task {
+                name: "Nested".into(),
+                description: String::new(),
+                steps: vec![TaskStep {
+                    title: String::new(),
+                    instructions: String::new(),
+                    command: command.into(),
+                    params: json!({"source":source}),
+                }],
+            });
+            let (text, report) = p.saved_text(None).unwrap();
+            let written: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(written["tasks"][0]["steps"][0]["params"]["source"], source);
+            assert_eq!(report.unchecked, u32::from(source != "clean prose"));
+            assert_eq!(report.steps, 0);
+        }
+    }
+    assert_eq!(crate::log_params(&json!({"key":"abc", "source":{"url":"https://h.invalid/a"}})).into_log_value()["key"], "");
+    assert_eq!(crate::log_params(&json!({"key":"abc", "data":{"url":"https://h.invalid/a"}})).into_log_value()["key"], "abc");
+}
+
+/// A retained address must actually reopen its protected reader, not merely survive as text.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn bridge_round_trip_reopens_its_protected_reader() {
+    if super::isolate_account_test("tests::credential_output::bridge_round_trip_reopens_its_protected_reader") {
+        return;
+    }
+    use rustgis_data::source::{fgb, remote};
+    let (dataset, _) = rustgis_data::io::read_geojson(r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"value":7}}]}"#, "Protected").unwrap();
+    let bytes = fgb::write(&dataset).unwrap();
+    let original = fgb::FgbSource::open_bytes(bytes.clone(), "Protected").unwrap();
+    let full = "https://protected-reader.invalid/data.fgb?token=RGSYNTH_reader";
+    // Session construction installs the native fetcher; replace it only after that setup.
+    let mut s = Session::new(Project::default());
+    remote::set_fetcher(move |url, want, done| {
+        if url != full {
+            done(Err(remote::Failed::Other("protected reader needs its token".into())));
+        } else if matches!(want, remote::Want::Whole) {
+            done(Ok(bytes.clone()));
+        } else {
+            done(Err(remote::Failed::NoRanges));
+        }
+    });
+    let id = s.map_mut().add_dataset(dataset);
+    s.map_mut().layer_mut(id).unwrap().source = Some(rustgis_map::source::SourceLayer::from_path(full, None, Box::new(original)));
+    let (text, _) = s.peer_text(Peer::Bridge).unwrap();
+    assert!(!text.contains("RGSYNTH_reader"));
+    let report = s.open_peer_text(Peer::Bridge, &text).unwrap();
+    assert_eq!(report.lost, 0, "the unchanged streamed source retains its address");
+    let source = s.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap();
+    assert_eq!(source.path.as_deref(), Some(full), "the exact source keeps its protected address");
+    source.wait_open(std::time::Duration::from_secs(5));
+    assert!(source.is_open(), "retained reader failed to open: {:?}", source.error);
+    let (read, _) = source.read_all().unwrap();
+    assert_eq!(read.features.len(), 1);
+    assert_eq!(read.features[0].attrs[0], rustgis_data::Value::Int(7));
+}
+
+/// Discovery must announce omitted settings even when the following supplied document is invalid.
+#[test]
+fn failed_collections_discovery_retains_its_counted_query_notice() {
+    for (query, count) in [("", 0), ("?token=RGSYNTH_discovery", 1)] {
+        let mut s = Session::new(Project::default());
+        let p = json!({"url":format!("https://discovery.invalid/root{query}"), "type":"ogcapi",
+            "text":json!({"links":[{"rel":"data", "type":"application/json", "href":"/catalog"}]}).to_string(),
+            "documents":[{"url":"https://discovery.invalid/catalog", "text":"invalid capabilities"}]});
+        assert!(s.run("service.layers", &p).is_err());
+        let messages: Vec<_> = s.notices.iter().filter(|n| n.text.contains("address(es) the service listed")).collect();
+        assert_eq!(messages.len(), count);
+        if count > 0 {
+            assert!(messages[0].text.starts_with("1 address(es)"));
         }
     }
 }

@@ -120,6 +120,14 @@ def test_widget_exchange_never_sends_keys_and_checks_the_current_slot():
     m.run("info.project")
     assert m._project == before
     assert m.notices() == []
+    # A different protected source still has one omitted address and needs a fresh warning.
+    project = json.loads(m._project)
+    project["maps"][0]["layers"][0]["dataset"]["source"] = f"https://h.invalid/b?token={secret}"
+    s.run("project.openText", text=json.dumps(project))
+    m.run("info.project")
+    assert any("without their keys" in notice for notice, _ in m.notices())
+    m.run("info.project")
+    assert m.notices() == []
     incoming = json.loads(m._project)
     incoming["maps"][0]["layers"][0]["name"] = "Styled by app"
     from_app(m, json.dumps(incoming))

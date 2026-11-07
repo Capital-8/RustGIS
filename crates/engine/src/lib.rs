@@ -16,7 +16,7 @@ pub mod prefs;
 pub mod project;
 mod roles;
 pub use peer::Peer;
-pub use roles::{Document, ParamRole, Role};
+pub(crate) use roles::{Document, ParamRole, Role};
 mod parameters;
 pub mod project_log;
 pub use parameters::{params_envelope, script_line};
@@ -66,8 +66,8 @@ pub struct CommandSpec {
     /// `None` = enabled; `Some(reason)` = disabled.
     pub enabled: fn(&Session) -> Option<&'static str>,
     pub run: fn(&mut Session, &Value) -> CmdResult,
-    /// Durable-output roles. None keeps unreviewed extension parameters opaque.
-    pub roles: Option<&'static [ParamRole]>,
+    /// Reviewed builtin durable-output roles. Extension parameters remain opaque.
+    pub(crate) roles: Option<&'static [ParamRole]>,
 }
 
 fn always(_: &Session) -> Option<&'static str> {
@@ -89,8 +89,8 @@ impl CommandSpec {
     pub const fn new(id: &'static str, label: &'static str, location: &'static str, run: fn(&mut Session, &Value) -> CmdResult) -> Self {
         CommandSpec { id, label, location, shortcut: "", params: "{}", mutates: true, enabled: always, run, roles: None }
     }
-    /// Declares durable-output roles; an empty list uses reviewed common parameter rules.
-    pub const fn roles(mut self, roles: &'static [ParamRole]) -> Self {
+    /// Declares builtin durable-output roles; an empty list uses reviewed common parameter rules.
+    pub(crate) const fn roles(mut self, roles: &'static [ParamRole]) -> Self {
         self.roles = Some(roles);
         self
     }

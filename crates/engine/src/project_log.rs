@@ -135,6 +135,25 @@ fn redacted(v: &Value) -> Value {
     crate::cmd::history::redacted(&embedded_redacted(v, 0))
 }
 
+/// A bounded log-only context check for a short key beside nested connection settings.
+/// User data/documents do not make an ordinary join or lookup key a credential.
+pub(crate) fn address_context(key: &str, v: &Value, depth: usize) -> bool {
+    if depth >= 8 || matches!(key, "data" | "text" | "values" | "attributes" | "properties" | "features" | "geometry") {
+        return false;
+    }
+    match v {
+        Value::String(s) => {
+            let s = s.trim_start();
+            ["http://", "https://", "s3://", "rustgis-login:", "rustgis-s3:", "postgres:", "postgresql:", "mysql:", "mssql:"]
+                .iter()
+                .any(|prefix| s.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
+        }
+        Value::Array(values) => values.iter().take(LOG_LIST_ITEMS).any(|v| address_context("", v, depth + 1)),
+        Value::Object(values) => values.iter().any(|(key, v)| address_context(key, v, depth + 1)),
+        _ => false,
+    }
+}
+
 /// Scrubs bounded nested log parameters and JSON embedded in text before the log retains them.
 fn embedded_redacted(v: &Value, depth: usize) -> Value {
     match v {

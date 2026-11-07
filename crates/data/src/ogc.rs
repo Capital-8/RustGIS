@@ -533,7 +533,7 @@ fn is_data_link(link: &serde_json::Value) -> bool {
 }
 
 /// Chooses JSON before an untyped data link, without guessing an endpoint or copying credentials.
-fn collections_link(address: &str, links: &[serde_json::Value]) -> Option<String> {
+fn collections_link(address: &str, links: &[serde_json::Value]) -> Option<(String, bool)> {
     let base = url::Url::parse(crate::login_address::inner(address)).ok()?;
     links
         .iter()
@@ -555,7 +555,12 @@ fn collections_link(address: &str, links: &[serde_json::Value]) -> Option<String
             next.set_fragment(None);
             // A typed JSON link already selects its representation; its query is authoritative.
             let next: String = if priority == 0 { next.into() } else { json_url(next.as_str()) };
-            Some((priority, crate::login_address::inherit(address, &next)))
+            let inherited =
+                crate::address::inherit_query(crate::login_address::inner(address), &next, crate::address::Relation::Advertised, &["f"]);
+            // The chosen representation/link stays authoritative. Count settings it omits,
+            // including safe options we deliberately did not append to this advertised link.
+            let withheld = inherited.withheld || inherited.url != next;
+            Some((priority, (crate::login_address::inherit(address, &next), withheld)))
         })
         .min_by_key(|(priority, _)| *priority)
         .map(|(_, url)| url)
@@ -2407,7 +2412,10 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         let title = v.get("title").and_then(|t| t.as_str()).unwrap_or_default().to_string();
         let mut service = Service { kind: "OGC API Tiles".into(), title: title.clone(), ..Service::default() };
         let links = v.get("links").and_then(|l| l.as_array()).cloned().unwrap_or_default();
-        service.collections_url = collections_link(url, &links);
+        if let Some((next, withheld)) = collections_link(url, &links) {
+            service.collections_url = Some(next);
+            service.withheld_addresses = u32::from(withheld);
+        }
         let name = if title.is_empty() { "tiles".to_string() } else { title };
         // The dataset's layers aren't listed here, so its vector tiles can't be styled: map tiles only.
         if let Some((t, list, withheld)) = tileset(url, &links, TileRel::Map) {
@@ -3992,11 +4000,12 @@ mod tests {
         let address = crate::login_address::bind(binding, origin, "https://maps.example.org/api?key=a%2Fb").unwrap();
         for href in ["/collections", "https://MAPS.example.org:443/collections"] {
             let links = serde_json::json!([{"rel":"data","type":"application/json","href":href}]);
-            let next = collections_link(&address, links.as_array().unwrap()).unwrap();
+            let (next, withheld) = collections_link(&address, links.as_array().unwrap()).unwrap();
             assert_eq!(crate::login_address::parse(&next).unwrap().unwrap().binding, binding);
+            assert!(withheld, "the advertised destination omits the original key");
         }
         let links = serde_json::json!([{"rel":"data","type":"application/json","href":"https://other.example.org/collections"}]);
-        assert_eq!(collections_link(&address, links.as_array().unwrap()).unwrap(), "https://other.example.org/collections");
+        assert_eq!(collections_link(&address, links.as_array().unwrap()).unwrap(), ("https://other.example.org/collections".into(), true));
     }
 
     #[test]
@@ -6299,6 +6308,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chosen.collections_url.as_deref(), Some("https://example.org/json"));
+    }
+
+    #[test]
+    fn collections_links_count_only_settings_the_selected_link_omits() {
+        let body = br#"{"links":[{"rel":"data","type":"application/json","href":"/catalog?f=json"}]}"#;
+        for (from, count) in
+            [("https://collections.invalid/root?f=json", 0), ("https://collections.invalid/root?f=json&token=RGSYNTH_link", 1)]
+        {
+            let service = parse(from, body).unwrap();
+            assert_eq!(service.collections_url.as_deref(), Some("https://collections.invalid/catalog?f=json"));
+            assert_eq!(service.withheld_addresses, count);
+        }
     }
 
     #[test]

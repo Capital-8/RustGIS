@@ -181,7 +181,7 @@ pub fn commands() -> Vec<C> {
             nb.cells.insert(at, Cell::new(kind, ps(p, "source").unwrap_or("")));
             Ok(json!({"cell": at, "cells": nb.cells.len()}))
         })
-        .roles(&[])
+        .roles(&[crate::ParamRole { key: "source", role: crate::Role::Opaque }])
         .when(need_notebook)
         .params(r#"{"notebook"?, "kind"?: "code"|"markdown", "source"?, "at"?: index}"#),
         C::new("notebook.editCell", "Edit Cell", "Notebook", |s, p| {
@@ -191,7 +191,7 @@ pub fn commands() -> Vec<C> {
             c.source = source.chars().take(MAX_SOURCE).collect();
             Ok(json!({"cell": k}))
         })
-        .roles(&[])
+        .roles(&[crate::ParamRole { key: "source", role: crate::Role::Opaque }])
         .when(need_notebook)
         .params(r#"{"notebook"?, "cell": index, "source": text}"#),
         C::new("notebook.removeCell", "Delete Cell", "Notebook", |s, p| {

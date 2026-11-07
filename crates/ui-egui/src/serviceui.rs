@@ -117,7 +117,13 @@ pub(crate) fn add_layer_from(
         // The layer's bounds go along, for its features' axes (#1053).
         let bounds = l.get("bbox").cloned().unwrap_or_default();
         let mut params = json!({"url": items, "name": title, "service": true, "bounds": bounds});
-        if let Some(connection) = connection {
+        let anonymous = l.get("anonymous").and_then(Value::as_bool) == Some(true)
+            || rustgis_engine::render::rustgis_tiles::logins::origin(&src.url)
+                != rustgis_engine::render::rustgis_tiles::logins::origin(items);
+        if anonymous {
+            params["url"] = json!(rustgis_engine::data::login_address::inner(items));
+            params["anonymous"] = json!(true);
+        } else if let Some(connection) = connection {
             params["connection"] = json!(connection);
         }
         // An area asked for keeps the view, even on an empty map, as `service.add` does.
@@ -180,6 +186,7 @@ pub(crate) fn add_layer_from(
     }
 }
 
+/// Starts grouped discovery under its original request, retaining the import target and byte budget.
 pub fn start(app: &mut RustGisApp, p: &Value, refresh: bool) -> Result<(), String> {
     if !p.is_object() {
         return Err(tl!("Give the service's web address").into());
@@ -230,7 +237,7 @@ pub fn start(app: &mut RustGisApp, p: &Value, refresh: bool) -> Result<(), Strin
         let url = task.params.get("url").and_then(Value::as_str).unwrap_or_default();
         let kind = task.params.get("type").and_then(Value::as_str);
         let caps = rustgis_engine::data::ogc::capabilities_url(url, kind);
-        let caps = match task.request(app, &caps) {
+        let caps = match task.request(&caps) {
             Ok(caps) => caps,
             Err(e) => {
                 app.session.download_failed(task.token);
@@ -247,14 +254,18 @@ pub fn start(app: &mut RustGisApp, p: &Value, refresh: bool) -> Result<(), Strin
 
 impl Import {
     /// Anonymous service provenance forbids selecting a login, including for same-origin links.
-    fn request(&self, app: &mut RustGisApp, url: &str) -> Result<String, String> {
+    fn request(&self, url: &str) -> Result<String, String> {
         if self.params.get("anonymous").and_then(Value::as_bool) == Some(true) {
             return Ok(rustgis_engine::data::login_address::inner(url).to_string());
         }
         let base = self.params.get("url").and_then(Value::as_str).unwrap_or_default();
-        request_from(app, self.connection.as_ref().and_then(Value::as_str), base, url)
+        // The plan already resolved this exact destination and its login (or absence).
+        // Re-selecting from the original saved connection would undo a foreign hop.
+        rustgis_engine::render::rustgis_tiles::address::check(url, Some(base)).map_err(|e| crate::connectionui::translated(&e))?;
+        Ok(url.to_string())
     }
 
+    /// Consumes the engine plan verbatim: foreign-hop anonymity cannot reselect a login.
     fn discover(&mut self, app: &mut RustGisApp) -> Result<(), String> {
         let listing = app.session.run("service.groupPlan", &self.params)?;
         if listing.get("request").and_then(|p| p.get("anonymous")).and_then(Value::as_bool) == Some(true) {
@@ -265,7 +276,7 @@ impl Import {
             self.connection = None;
         }
         if let Some(next) = listing.get("next").and_then(Value::as_str) {
-            let next = self.request(app, next)?;
+            let next = self.request(next)?;
             self.slot = fetch_into(&next);
             self.document = Some(next);
         } else {
@@ -276,20 +287,22 @@ impl Import {
                 .flatten()
                 .filter_map(|l| l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string))
                 .collect();
-            self.next(app)?;
+            self.next()?;
         }
         Ok(())
     }
 
-    fn next(&mut self, app: &mut RustGisApp) -> Result<(), String> {
+    /// Fetches one exact planned collection within the remaining shared byte budget.
+    fn next(&mut self) -> Result<(), String> {
         self.current = self.remaining.pop_front();
         if let Some(url) = &self.current {
-            let url = self.request(app, url)?;
+            let url = self.request(url)?;
             self.slot = fetch_into_limited(&url, rustgis_engine::cmd::service::MAX_GROUP_BYTES.saturating_sub(self.bytes));
         }
         Ok(())
     }
 
+    /// Accumulates supplied documents or feature responses before the engine import/refresh.
     fn landed(&mut self, app: &mut RustGisApp, bytes: Vec<u8>) -> Result<(), String> {
         if let Some(document) = self.document.take() {
             let text = crate::service_text(bytes).map_err(|_| tl!("The service's answer isn't UTF-8 text").to_string())?;
@@ -309,7 +322,7 @@ impl Import {
             }
             let text = String::from_utf8(bytes).map_err(|_| tl!("The service's answer isn't UTF-8 text").to_string())?;
             self.responses.push(json!({"url":self.current.take(),"text":text}));
-            self.next(app)?;
+            self.next()?;
             Ok(())
         }
     }

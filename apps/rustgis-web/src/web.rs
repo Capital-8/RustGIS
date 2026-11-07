@@ -418,7 +418,7 @@ impl Embed {
                         app.session.notify(notice, false);
                     }
                 }
-                Err(e) => log::error!("couldn't send the project: {e}"),
+                Err(e) => app.session.notify(e, true),
             },
             (false, Some(wait)) => ctx.request_repaint_after(wait),
             (false, None) => {}

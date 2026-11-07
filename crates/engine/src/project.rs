@@ -653,30 +653,35 @@ impl Project {
         addresses
     }
 
-    /// How many layers and tile layers read through a login binding but record no connection:
-    /// nothing would tell the opened project which login they need. One whose address also holds
-    /// a token isn't counted here: the durable address projection counts it already.
-    fn unrecorded_bound(&mut self) -> usize {
+    /// Runtime bindings that this output cannot restore: peer receivers never share a login;
+    /// explicit files can resolve layers and tile owners with a recorded saved connection.
+    pub(crate) fn bound_address_losses(&self, include_recorded: bool) -> usize {
         let only_bound = |a: &str| {
             without_login_binding(a)
                 .is_some_and(|public| matches!(crate::durable::public_address(&public), crate::durable::Kept::Unchanged))
         };
-        let mut n = 0;
-        for map in self.maps.iter_mut().chain(self.offline_areas.iter_mut().map(|area| &mut area.data)) {
-            let tiles: std::collections::BTreeSet<_> = map
-                .slots()
-                .into_iter()
-                .filter_map(|slot| {
-                    let rustgis_map::SlotPos::Tile { tile, .. } = slot.at else { return None };
-                    map.tiles.get(tile).filter(|t| t.connection.is_empty() && only_bound(slot.value)).map(|_| tile)
-                })
-                .collect();
-            n += tiles.len();
-            for layer in map.layers.iter_mut().filter(|l| l.connection.is_empty()) {
-                n += usize::from(layer.addresses_mut().any(|a| only_bound(a)));
+        let mut n = 0usize;
+        for map in self.maps.iter().chain(self.offline_areas.iter().map(|area| &area.data)) {
+            let mut layers = std::collections::BTreeSet::new();
+            let mut tiles = std::collections::BTreeSet::new();
+            for slot in map.slots().into_iter().filter(|slot| slot.address && only_bound(slot.value)) {
+                match slot.at {
+                    rustgis_map::SlotPos::Layer { layer, .. } => {
+                        if map.layers.get(layer).is_some_and(|l| include_recorded || l.connection.is_empty()) {
+                            layers.insert(layer);
+                        }
+                    }
+                    rustgis_map::SlotPos::Tile { tile, .. } => {
+                        if map.tiles.get(tile).is_some_and(|t| include_recorded || t.connection.is_empty()) {
+                            tiles.insert(tile);
+                        }
+                    }
+                    rustgis_map::SlotPos::Group { .. } | rustgis_map::SlotPos::Terrain => n = n.saturating_add(1),
+                }
             }
+            n = n.saturating_add(layers.len()).saturating_add(tiles.len());
         }
-        n
+        n.saturating_add(self.tables.iter().filter(|table| table.source.as_deref().is_some_and(only_bound)).count())
     }
 
     /// The standalone table of an id.
@@ -948,7 +953,7 @@ impl Project {
     /// fields are restored on every return and native unwind; only explicit saves are remembered.
     pub fn saved_text(&mut self, dir: Option<&Path>) -> Result<(String, crate::durable::Report), String> {
         self.ensure_imports_complete()?;
-        let unrecorded = self.unrecorded_bound();
+        let unrecorded = self.bound_address_losses(false);
         let (text, mut report) = crate::durable::output_remembered(self, dir.and_then(Path::to_str), project_text)?;
         report.addresses = report.addresses.saturating_add(u32::try_from(unrecorded).unwrap_or(u32::MAX));
         Ok((text, report))
@@ -970,7 +975,9 @@ impl Project {
     /// Text too large to open again is refused. Returns the text and its counted output notices.
     pub fn recovery_text_with_report(mut self) -> Result<(String, crate::durable::Report), String> {
         self.omit_pending_imports();
-        let (text, report) = crate::durable::output_owned(self, project_text)?;
+        let unrecorded = self.bound_address_losses(false);
+        let (text, mut report) = crate::durable::output_owned(self, project_text)?;
+        report.addresses = report.addresses.saturating_add(u32::try_from(unrecorded).unwrap_or(u32::MAX));
         if text.len() as u64 > MAX_BYTES {
             return Err("the project is too large to keep a recovery copy".into());
         }

@@ -1602,3 +1602,57 @@ fn capabilities_styles_keep_foreign_lineage() {
     }
     assert!(results.iter().all(|(_, _, kept)| *kept), "style discovery forgot its foreign hop: {results:?}");
 }
+
+/// Features reached through foreign capabilities keep the same opt-out as tile discovery.
+#[test]
+fn feature_group_plans_and_imports_keep_foreign_capabilities_anonymous() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if super::isolate_account_test("tests::service_logins::feature_group_plans_and_imports_keep_foreign_capabilities_anonymous") {
+        return;
+    }
+    for (document_crossed, items_crossed, authenticated) in
+        [(false, false, false), (false, false, true), (true, false, true), (false, true, true)]
+    {
+        let crossed = document_crossed || items_crossed;
+        let mut s = session(None);
+        let a = "https://feature-lineage-a.invalid";
+        let b = "https://feature-lineage-b.invalid";
+        let bridge = if document_crossed { format!("{b}/bridge") } else { format!("{a}/bridge") };
+        let items = if items_crossed { format!("{b}/items") } else { format!("{a}/items") };
+        let login = new(&mut s, json!({"kind":"ogcapi", "address":a, "auth":if authenticated {"header"} else {"none"}, "keyName":"X-Key"}));
+        if authenticated {
+            s.run("connection.login", &json!({"id":login, "apiKey":"RGSYNTH_feature_lineage"})).unwrap();
+        }
+        let other = new(&mut s, json!({"kind":"ogcapi", "address":b, "auth":"header", "keyName":"X-Key"}));
+        s.run("connection.login", &json!({"id":other, "apiKey":"RGSYNTH_feature_destination"})).unwrap();
+        let link = |url: &str| json!({"links":[{"rel":"data", "type":"application/json", "href":url}]}).to_string();
+        let mut params = json!({"url":format!("{a}/root"), "type":"ogcapi", "connection":login,
+        "text":link(&bridge), "documents":[
+            {"url":bridge,"text":link(&format!("{a}/returned"))},
+            {"url":format!("{a}/returned"),"text":json!({"collections":[{"id":"roads", "links":[{"rel":"items", "type":"application/geo+json", "href":items}]}]}).to_string()}
+        ]});
+        let plan = s.run("service.groupPlan", &params).unwrap();
+        let feature = &plan["layers"][0];
+        assert_eq!(feature.get("anonymous").and_then(Value::as_bool).unwrap_or(false), crossed);
+        let listed = s.run("service.layers", &params).unwrap();
+        assert_eq!(listed["layers"][0].get("anonymous").and_then(Value::as_bool).unwrap_or(false), crossed);
+        params["responses"] = json!([{"url":feature["offer"]["url"], "text":r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}]}"#}]);
+        s.run("service.import", &params).unwrap();
+        let layer = &s.map().layers[0];
+        assert_eq!(layer.anonymous, crossed);
+        assert_eq!(layer.connection.is_empty(), crossed);
+        assert_eq!(header(layer.dataset.source.as_deref().unwrap()).is_none(), crossed || !authenticated);
+        assert_eq!(layer.dataset.features.len(), 1);
+        params["group"] = json!(s.map().service_groups[0].id);
+        s.run("service.refresh", &params).unwrap();
+        let layer = &s.map().layers[0];
+        assert_eq!(layer.anonymous, crossed);
+        assert_eq!(layer.connection.is_empty(), crossed);
+        assert_eq!(header(layer.dataset.source.as_deref().unwrap()).is_none(), crossed || !authenticated);
+        let saved = s.project.saved_text(None).unwrap().0;
+        s.run("project.openText", &json!({"text":saved})).unwrap();
+        let layer = &s.map().layers[0];
+        assert_eq!(layer.anonymous, crossed);
+        assert_eq!(layer.connection.is_empty(), crossed);
+    }
+}

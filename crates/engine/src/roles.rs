@@ -12,18 +12,17 @@ use crate::durable::{self, Durable, Kept, Report};
 
 /// A replayable parameter's durable-output role. Permission policy does not consume roles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ParamRole {
+pub(crate) struct ParamRole {
     pub key: &'static str,
     pub role: Role,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role {
-    Address,
-    Path,
+pub(crate) enum Role {
     Secret,
     Dataset,
     Configuration,
     Sql,
+    Opaque,
     ToolParams,
     Script,
     TaskSteps,
@@ -32,7 +31,7 @@ pub enum Role {
     Document(Document),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Document {
+pub(crate) enum Document {
     Project,
     Map,
     Task,
@@ -77,7 +76,7 @@ const ADDRESS: &[&str] =
     &["url", "urls", "href", "source", "template", "tiles", "store", "endpoint", "address", "uri", "connection", "database"];
 const CONFIG: &[&str] = &["headers", "options", "auth", "connection", "source", "sources"];
 
-/// Durable output reads its own field from the immutable command registry. An explicit empty
+/// Durable output reads its own field from reviewed builtin registrations. An explicit empty
 /// declaration retains the reviewed common scalar/address/configuration rules below.
 fn metadata(id: &str) -> Option<&'static [ParamRole]> {
     static ROLES: OnceLock<HashMap<&'static str, &'static [ParamRole]>> = OnceLock::new();
@@ -149,6 +148,9 @@ fn object(id: &str, value: &Value, depth: usize, config_depth: usize, registered
             } else {
                 envelope(role, v, obj, depth + 1, report)
             }
+        } else if role == Some(Role::Opaque) {
+            unchecked |= suspicious(v);
+            None
         } else if (role == Some(Role::Secret) || rustgis_data::address::secret_key(key))
             && (k != "key"
                 || crate::sources::looks_like_a_key(v.as_str().unwrap_or(""))
@@ -175,7 +177,7 @@ fn object(id: &str, value: &Value, depth: usize, config_depth: usize, registered
                 let clean = crate::project_log::sql_secrets_removed(s);
                 (clean != s).then_some(Value::String(clean))
             })
-        } else if matches!(role, Some(Role::Address | Role::Path)) || ADDRESS.contains(&k.as_str()) || address_like(v) {
+        } else if ADDRESS.contains(&k.as_str()) || address_like(v) {
             if v.is_object() && registered && (role == Some(Role::Configuration) || CONFIG.contains(&k.as_str())) {
                 object("", v, depth, config_depth + 1, true, report)
             } else {

@@ -104,7 +104,7 @@ const SAS_KEYS: &[&str] =
 
 /// Exact and containment rules over canonical names, plus query-wide context.
 fn credential(k: &str, query: &QueryNames) -> bool {
-    matches!(k, "key" | "pwd" | "sig" | "signature" | "sas" | "authorization" | "proxyauthorization" | "cookie" | "setcookie" | "bearer")
+    matches!(k, "key" | "appid" | "subscriptionkey" | "clientkey" | "saskey" | "pwd" | "sig" | "signature" | "sas" | "authorization" | "proxyauthorization" | "cookie" | "setcookie" | "bearer")
         // These public refusal and tracing headers share the signing family's prefix.
         || (k.starts_with("xamz") && !matches!(k, "xamznrequestid" | "xamznwafaction" | "xamzcfid"))
         || k.starts_with("xgoog")
@@ -527,6 +527,7 @@ mod tests {
     #[test]
     fn canonical_names_remove_encoded_and_unresolved_pairs_without_touching_values() {
         let over = "a".repeat(MAX_NAME_BYTES + 1);
+        let mut unredacted = Vec::new();
         for key in [
             "%74oken",
             "%2574oken",
@@ -544,16 +545,31 @@ mod tests {
             "sig=M&%73v",
             "\\u0074oken",
             "accessKeyId",
+            "appid",
+            "APP_ID",
+            "%2561ppid",
+            "subscription-key",
+            "Subscription_Key",
+            "%73ubscription%2Dkey",
+            "client-key",
+            "clientKey",
+            "sas-key",
+            "SAS_Key",
             "%2525252574oken",
             over.as_str(),
         ] {
             let address = format!("https://h.invalid/a?{key}=RGSYNTH_name_20261103&layer=a%20b&f=json&%zz=1");
-            let Public::Changed { address: public, removed, .. } = public_web_address(&address) else { panic!("{key}") };
+            let Public::Changed { address: public, removed, .. } = public_web_address(&address) else {
+                unredacted.push(key.to_string());
+                continue;
+            };
             assert!(!public.contains("RGSYNTH_name_20261103"), "{key}: {public}");
             assert!(public.ends_with("layer=a%20b&f=json&%zz=1"), "{public}");
             assert!(removed > 0);
         }
+        assert!(unredacted.is_empty(), "credential names left unchanged: {unredacted:?}");
         for query in [
+            "client_id=public&application_id=public&map=1",
             "layer=a%20b&f=json&%zz=1",
             "layer=token%3DM",
             "code=EPSG:4326",

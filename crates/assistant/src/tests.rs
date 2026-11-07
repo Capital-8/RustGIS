@@ -4345,4 +4345,11 @@ fn peer_replacement_cancels_approvals_and_stale_replies() {
     assert!(agent.transcript.len() >= transcript);
     let _ = agent.receive(generation, ok(say("stale")), &mut s);
     assert!(!agent.busy() && agent.pending(&s).is_none());
+    assert!(matches!(agent.ask("start a new request", &s), Step::Send(_)));
+    let current = agent.generation();
+    let transcript = agent.transcript.len();
+    let _ = agent.receive(generation, ok(say("stale while waiting")), &mut s);
+    assert_eq!(agent.generation(), current);
+    assert!(agent.waiting() && agent.pending(&s).is_none());
+    assert_eq!(agent.transcript.len(), transcript);
 }

@@ -234,7 +234,7 @@ fn redact_script(script: &str) -> String {
         .lines()
         .take(rustgis_engine::cmd::workflows::MAX_SCRIPT_LINES)
         .map(|line| match rustgis_engine::script_line(line) {
-            None => line.trim().to_string(),
+            None => redact_string(line.trim()),
             Some(Ok((id, params))) => {
                 let id = redact_string(&id);
                 if params.is_null() { id } else { format!("{id} {}", rustgis_engine::log_params(&params).into_log_value()) }
@@ -329,6 +329,13 @@ mod tests {
         let logged = redact_script(script);
         assert!(logged.starts_with("map.zoomIn {}\nlayer.addUrl [parameters not JSON; withheld]\nmap.zoomOut {}"));
         assert!(!logged.contains("RGSYNTH_"));
+        let comments = "# clean comment\n# https://h.invalid/a?token=RGSYNTH_comment_20261106";
+        let args = normalized_args("run", &json!({"script": comments}));
+        assert!(!args.to_string().contains("RGSYNTH_comment"));
+        assert!(!redact_script(comments).contains("RGSYNTH_comment"));
+        assert!(redact_script(comments).starts_with("# clean comment\n"));
+        let nested = json!({"key":"abc", "source":{"url":"https://h.invalid/data"}});
+        assert_eq!(normalized_args("run_command", &json!({"command":"plugin.unknown", "params":nested}))["params"]["key"], "");
         let document =
             json!({"type": "FeatureCollection", "features": [], "padding": "x".repeat(250), "token": "RGSYNTH_data_20261103"}).to_string();
         let arguments = json!({"command": "layer.addDataText", "params": {"text": document}});

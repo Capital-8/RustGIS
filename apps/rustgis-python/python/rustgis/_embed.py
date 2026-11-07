@@ -208,7 +208,7 @@ class _Embedded(_Api):
             if text != self._project or notices != self._sent_notices:
                 self._hold([(notice, False) for notice in notices])
             self._sent_notices = notices
-            if keys > self._sent_keys:
+            if keys and (text != self._project or keys > self._sent_keys):
                 self._hold([(f"{keys} layer address(es) went to the map widget without their keys, tokens, passwords or URL fragments; restore missing values if needed", False)])
             self._sent_keys = keys
         except RustGISError as e:
