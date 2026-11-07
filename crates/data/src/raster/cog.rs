@@ -450,6 +450,24 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             if tw == 0 || th == 0 || (tw as usize).saturating_mul(th as usize).saturating_mul(per_chunk) > MAX_TILE_SAMPLES {
                 return Err(err(format!("tiles of {tw} × {th} pixels")));
             }
+            // A level decodes as the full image does, with as many samples: an overview with
+            // another count (three of an RGBI image's four) is left out, and said, before its
+            // tiles count against the budget.
+            let samples = dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).ok().flatten().unwrap_or(1);
+            let overview = levels.last().is_none_or(|l: &Level| w < l.width);
+            if overview && samples != full_samples {
+                mismatched_count += 1;
+                if mismatched.len() < 5 {
+                    mismatched.push(format!("image {index} ({samples})"));
+                }
+                // As many left out as levels kept, at most: the scan stays bounded.
+                if mismatched_count >= MAX_LEVELS || !dec.more_images() {
+                    break;
+                }
+                dec.next_image().map_err(err)?;
+                index += 1;
+                continue;
+            }
             // Every band plane's tiles, when the bands are stored apart.
             let n = (w.div_ceil(tw) as usize).saturating_mul(h.div_ceil(th) as usize).saturating_mul(planes);
             take_tiles(&mut allowance, n)?;
@@ -462,18 +480,8 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             offsets.truncate(n);
             counts.truncate(n);
             // An overview a little larger than the one before isn't an overview of it.
-            if levels.last().is_none_or(|l: &Level| w < l.width) {
-                // A level decodes as the full image does, with as many samples: an overview with
-                // another count (three of an RGBI image's four) is left out, and said.
-                let samples = dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).ok().flatten().unwrap_or(1);
-                if samples == full_samples {
-                    levels.push(Level { ifd: index, width: w, height: h, tile_width: tw, tile_height: th, offsets, counts });
-                } else {
-                    mismatched_count += 1;
-                    if mismatched.len() < 5 {
-                        mismatched.push(format!("image {index} ({samples})"));
-                    }
-                }
+            if overview {
+                levels.push(Level { ifd: index, width: w, height: h, tile_width: tw, tile_height: th, offsets, counts });
             }
         }
         if levels.len() >= MAX_LEVELS || !dec.more_images() {

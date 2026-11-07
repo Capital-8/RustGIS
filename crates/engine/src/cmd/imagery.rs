@@ -1652,20 +1652,24 @@ pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
         return Err(format!("the mosaic would be {cols} × {rows} cells; set a larger cell size in the workspace options"));
     }
     let nb = imgs.iter().map(|r| r.band_count()).min().unwrap_or(1).min(if w.kind == "reality" { 1 } else { 4 });
+    // The images with bands left out, the first five named.
+    let omitted_count = imgs.iter().filter(|r| r.band_count() > nb).count();
     let omitted: Vec<String> = w
         .images
         .iter()
         .zip(&imgs)
         .filter(|(_, r)| r.band_count() > nb)
+        .take(5)
         .map(|(name, r)| {
             let bands = ((nb + 1)..=r.band_count()).map(|b| b.to_string()).collect::<Vec<_>>().join(", ");
             format!("'{name}': band(s) {bands}")
         })
         .collect();
     let extra = (!omitted.is_empty()).then(|| {
+        let more = if omitted_count > omitted.len() { "; …" } else { "" };
         json!({"messages": [format!(
-            "{} image(s) have bands omitted from the {nb}-band mosaic: {}",
-            omitted.len(), omitted.join("; ")
+            "{omitted_count} image(s) have bands omitted from the {nb}-band mosaic: {}{more}",
+            omitted.join("; ")
         )]})
     });
     Ok(Box::new(move || {

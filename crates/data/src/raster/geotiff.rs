@@ -2455,8 +2455,17 @@ mod tests {
         assert_eq!((r.band_count(), r.color.clone()), (4, ColorHint::Rgb { alpha: false }));
         // Every other pixel of the full image, not the full image whole.
         assert_eq!((r.width, r.height, r.overview), (20, 20, Some((40, 40))));
-        assert_eq!(r.value(3, 0, 0), Some(f32::from(pixel(3, 0, 0))));
-        assert_eq!(r.value(3, 1, 1), Some(f32::from(pixel(3, 2, 2))));
+        for y in 0..r.height {
+            for x in 0..r.width {
+                for b in 0..4 {
+                    assert_eq!(
+                        r.value(b as usize, i64::from(x), i64::from(y)),
+                        Some(f32::from(pixel(b, x * 2, y * 2))),
+                        "band {b} at {x},{y}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
