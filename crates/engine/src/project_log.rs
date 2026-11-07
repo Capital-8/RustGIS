@@ -22,6 +22,13 @@ pub fn log_params(params: &Value) -> LogCopy {
     LogCopy(kept_params(params))
 }
 
+/// Cleans a structural command/tool identifier for display and audit output only.
+/// The original identifier remains the sole input to lookup, execution and approval.
+pub fn log_identifier(id: &str) -> String {
+    let public = crate::roles::identifier(id, &mut crate::durable::Report::default());
+    crate::durable::generated_text(public.as_deref().unwrap_or(id))
+}
+
 /// Now, in milliseconds since 1970 (UTC).
 pub(crate) fn now_ms() -> u64 {
     web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)

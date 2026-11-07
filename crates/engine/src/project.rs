@@ -650,10 +650,7 @@ impl Project {
             if let Some(graph) = &mut model.graph {
                 for node in &mut graph.nodes {
                     recorded_addresses(&mut node.params, &mut addresses);
-                    // A node's input may be an address rather than a layer's name.
-                    if let Some(layer) = &mut node.layer {
-                        addresses.push(layer);
-                    }
+                    // node.layer selects a name, including names that resemble runtime URLs.
                 }
             }
         }
@@ -1287,7 +1284,7 @@ impl Durable for Task {
     fn prepare(&self, p: &mut Prepare<'_>) {
         let Self { name: _, description: _, steps } = self;
         for (i, TaskStep { title: _, instructions: _, command, params }) in steps.iter().enumerate() {
-            p.command(Leaf::Task(i), command, params);
+            p.command(Leaf::Task(i), Leaf::TaskCommand(i), command, params);
         }
     }
 
@@ -1296,8 +1293,11 @@ impl Durable for Task {
         if !owners.is_empty() {
             return None;
         }
-        let Leaf::Task(i) = leaf else { return None };
-        Some(FieldMut::Json(&mut self.steps.get_mut(*i)?.params))
+        match leaf {
+            Leaf::Task(i) => Some(FieldMut::Json(&mut self.steps.get_mut(*i)?.params)),
+            Leaf::TaskCommand(i) => Some(FieldMut::Text(&mut self.steps.get_mut(*i)?.command)),
+            _ => None,
+        }
     }
 }
 
@@ -1306,7 +1306,7 @@ impl Durable for Model {
     fn prepare(&self, p: &mut Prepare<'_>) {
         let Self { name: _, steps, graph } = self;
         for (i, ModelStep { tool, params }) in steps.iter().enumerate() {
-            p.tool(Leaf::ModelStep(i), tool, params);
+            p.tool(Leaf::ModelStep(i), Leaf::ModelStepTool(i), tool, params);
         }
         if let Some(g) = graph {
             p.child(Owner::Graph, g);
@@ -1321,8 +1321,11 @@ impl Durable for Model {
         if !owners.is_empty() {
             return None;
         }
-        let Leaf::ModelStep(i) = leaf else { return None };
-        Some(FieldMut::Json(&mut self.steps.get_mut(*i)?.params))
+        match leaf {
+            Leaf::ModelStep(i) => Some(FieldMut::Json(&mut self.steps.get_mut(*i)?.params)),
+            Leaf::ModelStepTool(i) => Some(FieldMut::Text(&mut self.steps.get_mut(*i)?.tool)),
+            _ => None,
+        }
     }
 }
 
@@ -1330,11 +1333,8 @@ impl Durable for ModelGraph {
     /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut Prepare<'_>) {
         let Self { nodes, edges: _ } = self;
-        for (i, ModelNode { id: _, kind: _, x: _, y: _, layer, tool, params, name: _ }) in nodes.iter().enumerate() {
-            p.tool(Leaf::ModelNode(i), tool.as_deref().unwrap_or(""), params);
-            if let Some(layer) = layer {
-                p.string(Leaf::ModelLayer(i), layer, true, false);
-            }
+        for (i, ModelNode { id: _, kind: _, x: _, y: _, layer: _, tool, params, name: _ }) in nodes.iter().enumerate() {
+            p.tool(Leaf::ModelNode(i), Leaf::ModelNodeTool(i), tool.as_deref().unwrap_or(""), params);
         }
     }
 
@@ -1345,7 +1345,7 @@ impl Durable for ModelGraph {
         }
         match leaf {
             Leaf::ModelNode(i) => Some(FieldMut::Json(&mut self.nodes.get_mut(*i)?.params)),
-            Leaf::ModelLayer(i) => self.nodes.get_mut(*i)?.layer.as_mut().map(FieldMut::Text),
+            Leaf::ModelNodeTool(i) => self.nodes.get_mut(*i)?.tool.as_mut().map(FieldMut::Text),
             _ => None,
         }
     }

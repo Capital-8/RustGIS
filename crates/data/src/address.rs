@@ -331,6 +331,11 @@ pub fn public_web_address(address: &str) -> Public {
     if public == text { Public::Unchanged } else { Public::Changed { address: public, removed } }
 }
 
+/// A bare supported scheme is a prose example with no authority or credential to remove.
+pub(crate) fn scheme_example(text: &str) -> bool {
+    ["http://", "https://", "s3://"].iter().any(|scheme| text.eq_ignore_ascii_case(scheme))
+}
+
 /// Cleans addresses in generated text and counts changed addresses. All spacing and all other
 /// text stay byte-for-byte. Never apply this to user-authored text or dataset values.
 pub fn scrub_addresses(text: &str) -> (Cow<'_, str>, u32) {
@@ -365,6 +370,10 @@ pub fn scrub_addresses(text: &str) -> (Cow<'_, str>, u32) {
                 .len()
                 .max(scheme_at + 1);
             let address = word.get(begin..end).unwrap_or("");
+            // A bare scheme in diagnostic prose has no address or credentials to remove.
+            if scheme_example(address) {
+                continue;
+            }
             let public = public_web_address(address);
             if matches!(public, Public::Unchanged) {
                 continue;
@@ -462,6 +471,8 @@ pub struct ReviewedScope {
     pub directory: &'static str,
     pub whole_origin: bool,
 }
+/// No deployment has been authorized for full-query inheritance. Keep this list empty until
+/// that review exists; the explicit-list tests exercise the same deny boundary.
 pub const F2_SCOPES: &[ReviewedScope] = &[];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -620,6 +631,9 @@ mod tests {
             ("[s3:bucket/x?token=RGSYNTH_0]", "[s3:]", 1),
             ("https:x", "https:", 1),
             ("s3:", "s3:", 1),
+            ("plain http://, confirm before sending", "plain http://, confirm before sending", 0),
+            ("use https:// for encryption", "use https:// for encryption", 0),
+            ("an S3:// address", "an S3:// address", 0),
             ("read https:/h.invalid/x then https://h.invalid/b?layer=a%20b", "read https: then https://h.invalid/b?layer=a%20b", 1),
             (
                 "http://h.invalid/a https://h.invalid/b?layer=a%20b s3://bucket/x",

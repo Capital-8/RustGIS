@@ -267,18 +267,27 @@ pub fn generation() -> u64 {
     let now = alarm_at(Instant::now());
     let next = {
         let mut a = alarms().lock().unwrap_or_else(|e| e.into_inner());
-        if a.first().is_some_and(|at| *at <= now) {
+        let (over, next) = take_due(&mut a, now);
+        if over {
             // Every wait over is one draw: the generation goes up once for them all.
-            let later = a.split_off(&now.saturating_add(1));
-            *a = later;
             GENERATION.fetch_add(1, Ordering::Relaxed);
         }
-        a.first().copied()
+        next
     };
     if let Some(at) = next {
         ring(Duration::from_millis(at.saturating_sub(now)));
     }
     GENERATION.load(Ordering::Relaxed)
+}
+
+/// Consumes every elapsed deadline together and returns the next one to rearm. Keeping the
+/// clock as an input lets the ordering contract be tested without scheduler deadlines.
+fn take_due(alarms: &mut std::collections::BTreeSet<u64>, now: u64) -> (bool, Option<u64>) {
+    let over = alarms.first().is_some_and(|at| *at <= now);
+    if over {
+        *alarms = alarms.split_off(&now.saturating_add(1));
+    }
+    (over, alarms.first().copied())
 }
 
 /// How long until the earliest wait pending; none when there is none.
@@ -2532,24 +2541,14 @@ mod tests {
     /// its elevation source waits), so the later is kept, and the app asked for it then.
     #[test]
     fn a_later_wait_isnt_lost_behind_an_earlier_one() {
-        let _alarm = super::alarm_turn();
-        let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let noted = asked.clone();
-        super::set_alarm(move |after| noted.lock().unwrap_or_else(|e| e.into_inner()).push(after));
-        super::clear_alarms();
-        let before = generation();
-        notify_at(Instant::now() + Duration::from_millis(20));
-        notify_at(Instant::now() + Duration::from_millis(150));
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let earlier = generation();
-        assert!(earlier > before, "the earlier wait over");
-        // The later is still pending, and asked of the app as the earlier was over.
-        assert!(super::next_alarm().is_some_and(|d| d <= Duration::from_millis(150)), "{:?}", super::next_alarm());
-        let later = |asked: &Vec<Duration>| asked.iter().any(|d| (Duration::from_millis(30)..=Duration::from_millis(150)).contains(d));
-        assert!(later(&asked.lock().unwrap_or_else(|e| e.into_inner())), "{:?}", asked.lock().unwrap_or_else(|e| e.into_inner()));
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        assert!(generation() > earlier, "the later wait over");
-        super::clear_alarm();
+        let mut alarms = std::collections::BTreeSet::from([20, 150]);
+        assert_eq!(super::take_due(&mut alarms, 10), (false, Some(20)));
+        assert_eq!(super::take_due(&mut alarms, 50), (true, Some(150)), "rearm the later wait after the first expires");
+        assert_eq!(super::take_due(&mut alarms, 100), (false, Some(150)));
+        assert_eq!(super::take_due(&mut alarms, 200), (true, None));
+        assert_eq!(super::take_due(&mut alarms, 300), (false, None), "expired deadlines are consumed once");
+        let mut delayed = std::collections::BTreeSet::from([20, 150]);
+        assert_eq!(super::take_due(&mut delayed, 200), (true, None), "a delayed poll correctly consumes both waits");
     }
 
     /// A draw before a wait is over asks the app for it again: the app's request lasts one frame,

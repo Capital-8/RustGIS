@@ -277,6 +277,9 @@ fn append_percent_encoded(result: &mut String, value: &str) {
 /// prevents overlapping values or a credential resembling `[redacted]` from leaking secrets.
 pub fn scrub(text: &str) -> String {
     let entries = entries();
+    if entries.is_empty() && !text.contains(rustgis_data::login_address::PREFIX) {
+        return text.to_string();
+    }
     let mut patterns: Vec<_> = entries.values().flat_map(|entry| &entry.redactions).collect();
     patterns.sort_unstable_by_key(|pattern| std::cmp::Reverse(pattern.value.expose().len()));
     // Strip capabilities even after revocation, when there are no active credential patterns.

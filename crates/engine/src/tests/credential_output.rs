@@ -9,6 +9,183 @@ use rustgis_map::presentation::{Page, PageKind, Presentation};
 const SECRET: &str = "RGSYNTH_output_20261103";
 const DATA: &str = "RGSYNTH_data_20261103";
 
+/// Database labels and durable addresses share query-key classification, without changing
+/// the executable connection string or dropping clean connection options.
+#[test]
+fn durable_database_query_aliases_match_public_labels() {
+    for scheme in ["mysql", "mariadb", "mssql", "postgresql"] {
+        for key in ["access_token", "subscription-key", "api_key"] {
+            let public = format!("{scheme}://reader@db.invalid/gis?ssl=true");
+            let private = format!("{public}&{key}={SECRET}");
+            let kept = match durable::public_address(&private) {
+                durable::Kept::Changed(s) => s,
+                _ => private.clone(),
+            };
+            assert_eq!(kept, public, "durable {scheme}/{key}");
+            assert_eq!(crate::sources::redact(&private), public, "public label {scheme}/{key}");
+            assert!(matches!(durable::public_address(&public), durable::Kept::Unchanged));
+            assert_eq!(crate::sources::redact(&public), public);
+        }
+    }
+}
+
+/// Graph input fields select existing names; source-address cleaning must not rename those
+/// references when saved text is opened without this process's credential restore memory.
+#[test]
+fn durable_model_input_names_survive_a_cold_round_trip() {
+    let bound = rustgis_data::login_address::bind("0123456789abcdef", "https://example.invalid", "https://example.invalid/roads").unwrap();
+    for name in ["https://example.invalid/roads#north", bound.as_str()] {
+        let mut s = world();
+        s.map_mut().layers[0].name = name.into();
+        let graph = ModelGraph {
+            nodes: vec![ModelNode {
+                id: "input1".into(),
+                kind: crate::project::ModelNodeKind::Input,
+                layer: Some(name.into()),
+                ..Default::default()
+            }],
+            edges: Vec::new(),
+        };
+        s.project.models.push(Model { name: "Names".into(), steps: Vec::new(), graph: Some(graph) });
+        let (text, _) = s.project.saved_text(None).unwrap();
+        for cold in [Project::from_json(&text).unwrap(), Project::from_import_json(&text, None).unwrap()] {
+            let model = cold.models.last().unwrap().graph.as_ref().unwrap();
+            let selector = model.nodes[0].layer.as_deref().unwrap();
+            assert_eq!(selector, name, "a graph input selects a name, even when it resembles an address or runtime wrapper");
+            assert!(cold.map().layer_by_name(selector).is_some(), "the opened graph still resolves its real input");
+        }
+    }
+}
+
+/// Address parsing must precede active-pattern masking at every generated history/error
+/// boundary, even when the active key is part of the URL scheme itself.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn generated_errors_and_history_clean_addresses_before_active_patterns() {
+    if isolate_process_test("tests::credential_output::generated_errors_and_history_clean_addresses_before_active_patterns") {
+        return;
+    }
+    use crate::render::rustgis_tiles::logins;
+    let binding = logins::activate(
+        "https://history-collision.invalid",
+        "synthetic-history-collision",
+        logins::Method::Header("X-Key".into()),
+        "https",
+        false,
+    )
+    .unwrap();
+    let raw = format!("failed at https://h.invalid/a?token={SECRET}&layer=roads");
+    let mut s = world();
+    s.push_gp_record(GpRecord {
+        tool: "Unknown".into(),
+        id: "unknown".into(),
+        params: Value::Null,
+        command: None,
+        at: 0,
+        ok: false,
+        messages: vec![raw.clone()],
+        millis: 0,
+        outputs: Vec::new(),
+    });
+    s.notify(&raw, true);
+    let error = s.run("layer.rename", &json!({"layer":format!("https://h.invalid/a?token={SECRET}"),"name":"unused"})).unwrap_err();
+    let history = s.project.gp_history.last().unwrap().messages[0].clone();
+    let notice = s.notices.last().unwrap().text.clone();
+    assert!(logins::deactivate(&binding));
+    assert!(!history.contains(SECRET), "history: {history}");
+    assert!(!notice.contains(SECRET), "notice: {notice}");
+    assert!(!error.contains(SECRET), "command error: {error}");
+    for id in [
+        format!("https://h.invalid/a?token={SECRET}"),
+        format!("sql.connect={{\"password\":\"{SECRET}\"}}"),
+        format!("sql.connect {{\"password\":\"{SECRET}\"}}"),
+    ] {
+        let error = s.run(&id, &Value::Null).unwrap_err();
+        assert!(!error.contains(SECRET), "unknown command error: {error}");
+    }
+    assert!(!s.project.saved_text(None).unwrap().0.contains(SECRET));
+}
+
+/// Invalid command/tool identifiers are executable slots too: an address there must not
+/// bypass cleaning through a null parameter or a malformed script line.
+#[test]
+fn durable_identifier_addresses_are_cleaned_and_counted() {
+    let url = format!("https://identifier.invalid/a?token={SECRET}&layer=roads");
+    let source = format!(
+        "# clean comment\r\n{url}\r\n{url} {{broken\nsql.connect={{\"password\":\"{SECRET}\"}}\nsql.connect={{\"password\":\"{SECRET}\"}} junk\nmap.zoomIn {{}}\n"
+    );
+    let mut project = Project::default();
+    project.notebooks.push(Notebook {
+        name: "Identifiers".into(),
+        jupyter: None,
+        cells: vec![Cell { kind: CellKind::Code, source, output: None, error: false, jupyter: None }],
+    });
+    project.tasks.push(Task {
+        name: "Identifiers".into(),
+        description: String::new(),
+        steps: [
+            url.clone(),
+            format!("sql.connect {{\"password\":\"{SECRET}\"}}"),
+            format!("sql.connect:{{\"password\":\"{SECRET}\"}}"),
+            format!("sql.connect:password:{SECRET}"),
+            format!("sql.connect:token:{SECRET}"),
+        ]
+        .into_iter()
+        .map(|command| TaskStep { title: String::new(), instructions: String::new(), command, params: Value::Null })
+        .collect(),
+    });
+    project.models.push(Model {
+        name: "Identifiers".into(),
+        steps: vec![ModelStep { tool: url.clone(), params: Value::Null }],
+        graph: Some(ModelGraph {
+            nodes: vec![ModelNode { id: "tool1".into(), tool: Some(url.clone()), ..Default::default() }],
+            edges: Vec::new(),
+        }),
+    });
+    let mut s = Session::new(project);
+    s.project.gp_history.push(GpRecord {
+        tool: "Unknown".into(),
+        id: url.clone(),
+        params: Value::Null,
+        command: Some((url, Value::Null)),
+        at: 0,
+        ok: false,
+        messages: Vec::new(),
+        millis: 0,
+        outputs: Vec::new(),
+    });
+    let original = serde_json::to_value(&s.project).unwrap();
+    let (text, report) = s.project.saved_text(None).unwrap();
+    assert!(!text.contains(SECRET), "an identifier bypassed durable projection: {text}");
+    assert!(report.lines >= 2, "{report:?}");
+    assert_eq!(report.steps, 9, "each changed executable is counted once");
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), original, "live identifiers are restored exactly");
+    let (clean, report) = crate::roles::script(
+        "# clean comment\r\nmap.zoomIn {}\r\nmap.zoomOut\nplugin:token-tools/read\nplugin:demo/token\ngeolibre:token\n",
+        0,
+    );
+    assert!(clean.is_none() && report.notices().is_empty(), "ordinary ids and formatting stay exact");
+}
+
+/// Cleaning both fields of one operation still affects one executable step.
+#[test]
+fn durable_executable_count_is_per_step() {
+    let mut project = Project::default();
+    project.tasks.push(Task {
+        name: "One step".into(),
+        description: String::new(),
+        steps: vec![TaskStep {
+            title: String::new(),
+            instructions: String::new(),
+            command: format!("https://identifier.invalid/?token={SECRET}"),
+            params: json!({"password":SECRET}),
+        }],
+    });
+    let (text, report) = project.saved_text(None).unwrap();
+    assert!(!text.contains(SECRET));
+    assert_eq!(report.steps, 1, "identifier and params belong to the same step: {report:?}");
+}
+
 /// Inline synthetic state exercises owning fields without contacting any service.
 fn marked() -> Session {
     let mut s = world();

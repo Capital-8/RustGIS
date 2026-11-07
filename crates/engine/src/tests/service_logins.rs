@@ -1279,16 +1279,21 @@ fn templates_tasks_and_models_written_out_keep_no_login_binding() {
     let tile = bound(&mut s, &id, "https://export757.example.org/tiles/{z}/{x}/{y}.png");
     s.run("map.addTiles", &json!({"url": tile, "name": "Bound"})).unwrap();
     s.run("task.new", &json!({"name":"Fetch","steps":[{"title":"Add","command":"map.addTiles","params":{"url": tile}}]})).unwrap();
-    s.run("model.new", &json!({"name":"Tiles","steps":[{"tool":"buffer","params":{"input": tile, "distance": 1}}]})).unwrap();
-    // A model drawn as a graph keeps its input's address in the node itself.
-    let graph = json!({"nodes":[{"id":"in","kind":"input","layer": tile}], "edges": []});
+    // Keep the synthetic address in a tool's parameters, not a layer-name selector.
+    s.run("model.new", &json!({"name":"Tiles","graph":{"nodes":[{"id":"tool1","kind":"tool","tool":"buffer","params":{"input": tile,"distance":1}}],"edges":[]}})).unwrap();
+    // A graph input selects an existing layer by name; its actual source fields are cleaned.
+    let graph = json!({"nodes":[{"id":"in","kind":"input","layer": "Cities"}], "edges": []});
     s.run("model.new", &json!({"name":"Drawn","graph": graph})).unwrap();
     let dir = std::env::temp_dir().join(format!("export757-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (template, task) = (dir.join("bound.rgistemplate"), dir.join("bound.rgistask"));
     s.run("project.saveTemplate", &json!({"path": template.to_string_lossy()})).unwrap();
     s.run("task.save", &json!({"task":"Fetch","path": task.to_string_lossy()})).unwrap();
-    let model = s.run("model.export", &json!({"model":"Tiles"})).unwrap()["text"].as_str().unwrap().to_string();
+    let model = s.run("model.export", &json!({"name":"Tiles"})).unwrap()["text"].as_str().unwrap().to_string();
+    let drawn = s.run("model.export", &json!({"name":"Drawn"})).unwrap()["text"].as_str().unwrap().to_string();
+    let graph: Value = serde_json::from_str(&drawn).unwrap();
+    assert_eq!(graph["graph"]["nodes"][0]["layer"], "Cities");
+    assert!(!drawn.contains(rustgis_data::login_address::PREFIX) && !drawn.contains("export-sentinel-757"));
     let written = [std::fs::read_to_string(&template).unwrap(), std::fs::read_to_string(&task).unwrap(), model];
     let _ = std::fs::remove_dir_all(&dir);
     for text in &written {

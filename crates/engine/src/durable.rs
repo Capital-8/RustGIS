@@ -113,11 +113,15 @@ pub(crate) enum Leaf {
     Layer(rustgis_map::LayerRole),
     Table,
     Task(usize),
+    TaskCommand(usize),
     ModelStep(usize),
+    ModelStepTool(usize),
     ModelNode(usize),
-    ModelLayer(usize),
+    ModelNodeTool(usize),
     HistoryParams,
+    HistoryId,
     HistoryCommand,
+    HistoryCommandId,
     Message(usize),
     CellSource(usize),
     CellOutput(usize),
@@ -201,10 +205,8 @@ fn json_bytes(v: &Value) -> usize {
 
 pub(crate) trait Durable {
     /// Preparation is read-only, exhaustive over owning fields, and offers each leaf once.
-    /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut Prepare<'_>);
     /// Resolves recorded indices only, through plain owned fields, without allocation or policy.
-    /// Resolves a prepared location through owned fields, without allocation or policy.
     fn field_mut(&mut self, owners: &[Owner], leaf: &Leaf) -> Option<FieldMut<'_>>;
 }
 
@@ -290,31 +292,32 @@ impl<'a> Prepare<'a> {
         }
     }
 
-    /// Prepares a command's replayable parameters using explicit data/configuration roles.
-    pub(crate) fn command(&mut self, leaf: Leaf, id: &str, value: &Value) {
-        let (clean, report) = crate::roles::command(id, value, self.depth);
-        let clean = match clean {
-            Some(clean) => Some(crate::project::public_login_params(&clean).unwrap_or(clean)),
-            None => crate::project::public_login_params(value),
-        };
-        self.report.merge(&report);
-        if let Some(clean) = clean {
-            self.report.steps = self.report.steps.saturating_add(1);
-            self.edit(leaf, Payload::Json(clean), Kind::Credential);
-        }
+    /// Prepares both fields of one replayable command, counting the owning step once.
+    pub(crate) fn command(&mut self, leaf: Leaf, id_leaf: Leaf, id: &str, value: &Value) {
+        self.executable((leaf, id_leaf), id, value, crate::roles::command(id, value, self.depth));
     }
 
-    /// Model and history tool params have the same roles as the corresponding `gp.run` params.
-    pub(crate) fn tool(&mut self, leaf: Leaf, id: &str, value: &Value) {
-        let (clean, report) = crate::roles::tool(id, value, self.depth);
+    /// Model and history tool params use the same common roles as `gp.run` params.
+    pub(crate) fn tool(&mut self, leaf: Leaf, id_leaf: Leaf, id: &str, value: &Value) {
+        self.executable((leaf, id_leaf), id, value, crate::roles::tool(id, value, self.depth));
+    }
+
+    /// Journals the identifier and params independently while reporting their shared owner.
+    fn executable(&mut self, (leaf, id_leaf): (Leaf, Leaf), id: &str, value: &Value, (clean, report): (Option<Value>, Report)) {
         let clean = match clean {
             Some(clean) => Some(crate::project::public_login_params(&clean).unwrap_or(clean)),
             None => crate::project::public_login_params(value),
         };
         self.report.merge(&report);
-        if let Some(clean) = clean {
+        let clean_id = crate::roles::identifier(id, &mut self.report);
+        if clean.is_some() || clean_id.is_some() {
             self.report.steps = self.report.steps.saturating_add(1);
+        }
+        if let Some(clean) = clean {
             self.edit(leaf, Payload::Json(clean), Kind::Credential);
+        }
+        if let Some(clean) = clean_id {
+            self.edit(id_leaf, Payload::Text(clean), Kind::Credential);
         }
     }
 
@@ -574,7 +577,8 @@ fn public_address_at(address: &str, depth: usize) -> Kept {
         address::{Public, public_web_address},
         s3_address,
     };
-    if let Some((public, _)) = rustgis_data::source::myconn::split_password(address) {
+    if let Some((mut public, _)) = rustgis_data::source::myconn::split_password(address) {
+        rustgis_data::address::redact_query(&mut public);
         return if public == address { Kept::Unchanged } else { Kept::Changed(public) };
     }
     if let Some((public, _)) = rustgis_data::source::msconn::split_password(address) {
@@ -683,11 +687,15 @@ pub(crate) fn changed_executables(old: &mut crate::Project, incoming: &mut crate
             || !matches!(
                 edit.at.leaf,
                 Leaf::Task(_)
+                    | Leaf::TaskCommand(_)
                     | Leaf::ModelStep(_)
+                    | Leaf::ModelStepTool(_)
                     | Leaf::ModelNode(_)
-                    | Leaf::ModelLayer(_)
+                    | Leaf::ModelNodeTool(_)
                     | Leaf::HistoryParams
+                    | Leaf::HistoryId
                     | Leaf::HistoryCommand
+                    | Leaf::HistoryCommandId
                     | Leaf::CellSource(_)
             )
         {

@@ -20,7 +20,7 @@ pub(crate) use roles::{Document, ParamRole, Role};
 mod parameters;
 pub mod project_log;
 pub use parameters::{params_envelope, script_line};
-pub use project_log::{LogCopy, log_params};
+pub use project_log::{LogCopy, log_identifier, log_params};
 pub mod s3_connections;
 pub mod s3_keys;
 #[cfg(test)]
@@ -1466,7 +1466,12 @@ impl Session {
         }
     }
 
+    /// Cleans every returned error, including early refusal and plugin paths.
     fn run_command(&mut self, id: &str, params: &Value) -> CmdResult {
+        self.run_command_inner(id, params).map_err(|e| durable::generated_text(&e))
+    }
+
+    fn run_command_inner(&mut self, id: &str, params: &Value) -> CmdResult {
         // The merge key asked for ([`Session::merge_undo`]) goes to this command if it runs, and is
         // gone if it's refused first, so it can't merge a later command into the last step.
         let merge = if self.depth == 0 { self.merge.take() } else { None };
@@ -1478,7 +1483,7 @@ impl Session {
             self.merge = merge;
             return self.run_plugin(id, params);
         }
-        let Some(&spec) = self.registry.get(id) else { return Err(format!("unknown command '{id}'")) };
+        let Some(&spec) = self.registry.get(id) else { return Err(format!("unknown command '{}'", project_log::log_identifier(id))) };
         // Keys the command does not read: said, so a script or an agent can correct itself.
         if let (Value::Object(given), Some(known)) = (params, spec.param_keys()) {
             // Bounded: the keys come from the caller (the first few, each clipped).
@@ -1545,8 +1550,7 @@ impl Session {
         {
             self.sources.note(src);
         }
-        // An error never quotes a web-service connection's password or key.
-        res.map_err(|e| render::rustgis_tiles::logins::scrub(&e))
+        res
     }
 
     /// Retires only this consumed reservation, preserving unrelated pending imports in history.
@@ -2026,7 +2030,7 @@ impl Session {
     /// redacted: what a notice or history record may show. Login values are known only here, so
     /// a failure redacted by [`Session::notify_redacted`]'s callers goes through this first.
     pub fn redacted(text: &str) -> rustgis_data::diagnostics::Redacted {
-        rustgis_data::diagnostics::Redacted::new(&render::rustgis_tiles::logins::scrub(text))
+        rustgis_data::diagnostics::Redacted::new(&durable::generated_text(text))
     }
 
     /// [`Session::notify`] for text already scrubbed and redacted by [`Session::redacted`] (a
@@ -2521,9 +2525,9 @@ impl durable::Durable for GpRecord {
         use durable::Leaf;
         let Self { tool, id, params, command, at: _, ok: _, messages, millis: _, outputs: _ } = self;
         let tool = if id.is_empty() { cmd::gp::tool_id(tool).unwrap_or("") } else { id };
-        p.tool(Leaf::HistoryParams, tool, params);
+        p.tool(Leaf::HistoryParams, Leaf::HistoryId, tool, params);
         if let Some((id, params)) = command {
-            p.command(Leaf::HistoryCommand, id, params);
+            p.command(Leaf::HistoryCommand, Leaf::HistoryCommandId, id, params);
         }
         for (i, message) in messages.iter().enumerate() {
             p.generated(Leaf::Message(i), message);
@@ -2536,7 +2540,9 @@ impl durable::Durable for GpRecord {
         }
         match leaf {
             Leaf::HistoryParams => Some(FieldMut::Json(&mut self.params)),
+            Leaf::HistoryId => Some(FieldMut::Text(&mut self.id)),
             Leaf::HistoryCommand => Some(FieldMut::Json(&mut self.command.as_mut()?.1)),
+            Leaf::HistoryCommandId => Some(FieldMut::Text(&mut self.command.as_mut()?.0)),
             Leaf::Message(i) => self.messages.get_mut(*i).map(FieldMut::Text),
             _ => None,
         }
@@ -2547,8 +2553,7 @@ impl Session {
     /// The single history production seam: retained generated messages never keep address keys.
     pub(crate) fn push_gp_record(&mut self, mut record: GpRecord) {
         for message in &mut record.messages {
-            let scrubbed = render::rustgis_tiles::logins::scrub(message);
-            *message = rustgis_data::address::scrub_addresses(&scrubbed).0.into_owned();
+            *message = durable::generated_text(message);
         }
         self.project.gp_history.push(record);
     }
