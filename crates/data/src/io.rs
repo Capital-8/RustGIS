@@ -2022,7 +2022,8 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
     let mut skipped: Vec<String> = Vec::new();
     for n in shps {
         if out.len() >= MAX_ZIP_LAYERS {
-            break;
+            skipped.push(format!("{n} (past the {MAX_ZIP_LAYERS}-layer limit)"));
+            continue;
         }
         let base = stem(&n);
         let name = Path::new(&n).file_stem().and_then(|s| s.to_str()).unwrap_or("layer").to_string();
@@ -3490,6 +3491,19 @@ mod tests {
         }
         // A .shp alone is refused with a hint to zip it.
         assert!(read_bytes("x.shp", &entries[0].1).is_err());
+        // Shapefiles past the layer limit are named, not dropped unsaid; at the limit nothing is said.
+        let shapefiles = |count: usize| -> Vec<(String, Vec<u8>)> {
+            (0..count).flat_map(|i| entries.iter().take(3).map(move |(n, b)| (format!("s{i:02}.{}", ext(n)), b.clone()))).collect()
+        };
+        fn ext(n: &str) -> String {
+            n.rsplit('.').next().unwrap_or_default().to_ascii_lowercase()
+        }
+        let layers = read_zip("x.zip", &crate::zip::write(&shapefiles(MAX_ZIP_LAYERS + 2)).unwrap()).unwrap();
+        assert_eq!(layers.len(), MAX_ZIP_LAYERS);
+        assert_eq!(layers[0].1.messages, ["x.zip: skipped s32.shp (past the 32-layer limit); s33.shp (past the 32-layer limit)"]);
+        let layers = read_zip("x.zip", &crate::zip::write(&shapefiles(MAX_ZIP_LAYERS)).unwrap()).unwrap();
+        assert_eq!(layers.len(), MAX_ZIP_LAYERS);
+        assert!(layers.iter().all(|(_, r)| r.messages.is_empty()), "{:?}", layers[0].1.messages);
     }
 
     /// A Shapefile's loose files picked or dropped together are zipped into one, which reads as a
