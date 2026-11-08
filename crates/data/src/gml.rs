@@ -244,6 +244,8 @@ struct Kind {
     rows: Vec<(Option<Geometry>, BTreeMap<String, String>)>,
     /// Features whose Z or M values were dropped.
     zm: usize,
+    /// Rings and parts of its geometries left out.
+    lost: usize,
 }
 
 /// Reads a GML file into a layer per feature type (those with features).
@@ -271,7 +273,6 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
     let mut unknown_srs: Option<String> = None;
     let mut over = 0usize;
     // Rings and parts left out of the geometries kept.
-    let mut parts_lost = 0usize;
     for f in members {
         let name = local(&f).to_string();
         if !kinds.contains_key(&name) {
@@ -287,6 +288,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         let mut bad = false;
         // Whether the geometry kept had Z or M values.
         let mut zm = false;
+        let mut parts_lost = 0;
         for p in f.children().filter(|c| c.is_element()) {
             // A property holding a geometry, or a simple value.
             // A feature's bounding box (gml:boundedBy) is neither its shape nor an attribute.
@@ -338,16 +340,12 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         // A geometry that couldn't be read, unless another property gave the feature its shape.
         skipped += usize::from(bad && geom.is_none());
         kind.zm += usize::from(zm && geom.is_some());
+        kind.lost += parts_lost;
         kind.rows.push((geom, attrs));
     }
     let mut report = ReadReport { skipped, ..ReadReport::default() };
     if skipped > 0 {
         report.messages.push(format!("{skipped} features had geometry that couldn't be read"));
-    }
-    if parts_lost > 0 {
-        report
-            .messages
-            .push(format!("{parts_lost} rings or parts of geometries were left out: too few points, unreadable coordinates, or an exterior ring past the first"));
     }
     if over > 0 {
         report.messages.push(format!("{over} features of more than {MAX_LAYERS} feature types were left out"));
@@ -395,6 +393,13 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         let mut rep = if out.is_empty() { report.clone() } else { ReadReport::default() };
         if file_srs.is_none() && outside {
             rep.messages.push("the GML doesn't say its coordinate system (srsName) and its coordinates aren't longitude/latitude".into());
+        }
+        // Said with the layer it happened in, which may be the only one added.
+        if kind.lost > 0 {
+            rep.messages.push(format!(
+                "{}: {} rings or parts of geometries were left out: too few points, unreadable coordinates, or an exterior ring past the first",
+                ds.name, kind.lost
+            ));
         }
         if zm > 0 {
             ds.zm_dropped = true;
@@ -484,7 +489,7 @@ mod tests {
 </wfs:FeatureCollection>"#;
         let layers = read("r.gml", gml.as_bytes()).unwrap();
         assert!(!layers[0].0.zm_dropped, "{:?}", layers[0].1.messages);
-        assert!(layers[0].1.messages.iter().any(|m| m.starts_with("1 rings or parts")), "{:?}", layers[0].1.messages);
+        assert!(layers[0].1.messages.iter().any(|m| m.contains(": 1 rings or parts")), "{:?}", layers[0].1.messages);
         assert_eq!(layers[0].0.features[0].geometry, Some(Geometry::Line(vec![vec![Coord::new(10.0, 48.0), Coord::new(11.0, 49.0)]])));
 
         // A two-point 3D interior ring is left out: the 2D polygon kept drops no Z, and the ring
@@ -497,7 +502,7 @@ mod tests {
 </wfs:FeatureCollection>"#;
         let layers = read("p.gml", gml.as_bytes()).unwrap();
         assert!(!layers[0].0.zm_dropped, "{:?}", layers[0].1.messages);
-        assert!(layers[0].1.messages.iter().any(|m| m.starts_with("1 rings or parts")), "{:?}", layers[0].1.messages);
+        assert!(layers[0].1.messages.iter().any(|m| m.contains(": 1 rings or parts")), "{:?}", layers[0].1.messages);
         assert!(matches!(&layers[0].0.features[0].geometry, Some(Geometry::Polygon(p)) if p.len() == 1 && p[0].len() == 1));
     }
 
@@ -524,7 +529,25 @@ mod tests {
         assert_eq!((ds.features.len(), rep.skipped), (2, 0));
         let said: Vec<&String> = rep.messages.iter().filter(|m| m.contains("rings or parts")).collect();
         assert_eq!(said.len(), 1, "{:?}", rep.messages);
-        assert!(said[0].starts_with("2 rings or parts"), "{said:?}");
+        assert!(said[0].contains(": 2 rings or parts"), "{said:?}");
+
+        // With two feature types, the notice goes with the one that lost a part, not the first.
+        let gml = r#"<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:app="http://example.com/app">
+<wfs:member><app:roads gml:id="r.1"><app:geom><gml:LineString srsName="EPSG:4326"><gml:posList>10 48 11 49</gml:posList></gml:LineString></app:geom></app:roads></wfs:member>
+<wfs:member><app:parcels gml:id="p.1"><app:geom><gml:MultiSurface srsName="EPSG:4326">
+  <gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing><gml:posList>10 48 11 48 11 49 10 48</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember>
+  <gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing><gml:posList>10 48 11 48</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember>
+</gml:MultiSurface></app:geom></app:parcels></wfs:member>
+</wfs:FeatureCollection>"#;
+        let layers = read("two.gml", gml.as_bytes()).unwrap();
+        let said = |i: usize| layers[i].1.messages.iter().any(|m| m.contains("rings or parts"));
+        assert_eq!(layers.len(), 2);
+        assert!(!said(0) && said(1), "{:?}", layers.iter().map(|l| &l.1.messages).collect::<Vec<_>>());
+        assert!(
+            layers[1].1.messages.iter().any(|m| m.starts_with(&format!("{}: 1 rings", layers[1].0.name))),
+            "{:?}",
+            layers[1].1.messages
+        );
     }
 
     #[test]

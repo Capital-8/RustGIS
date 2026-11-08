@@ -21810,8 +21810,10 @@ fn a_geometry_collection_of_several_is_refused_as_such() {
     }
     // One member, at any depth, is the geometry.
     let one = json!({"type": "GeometryCollection", "geometries": [{"type": "GeometryCollection", "geometries": [point]}]});
+    let before = s.map().layer_by_name("Cities").unwrap().dataset.features.len();
     let added = s.run("edit.addFeature", &json!({"layer": "Cities", "geometry": one})).unwrap();
     let row = added["row"].as_u64().unwrap() as usize;
+    assert_eq!((row, s.map().layer_by_name("Cities").unwrap().dataset.features.len()), (before, before + 1));
     s.run("edit.setGeometry", &json!({"layer": "Cities", "row": 0, "geometry": one})).unwrap();
     let cities = &s.map().layer_by_name("Cities").unwrap().dataset;
     for r in [row, 0] {
