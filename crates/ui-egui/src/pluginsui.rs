@@ -398,7 +398,7 @@ fn tell_unloaded(app: &mut RustGisApp) {
     let text = match failed.as_slice() {
         [] => return,
         [(id, reason)] => crate::i18n::fmt(
-            "The plugin {id} wasn't loaded. Open Plugins › Plugin Manager to see it. {reason}",
+            "The plugin {id} wasn't loaded: {reason}. Open Plugins › Plugin Manager to see it.",
             &[("id", id), ("reason", reason)],
         ),
         _ => {
@@ -1249,8 +1249,8 @@ mod tests {
         let mut app = app_fetching(|_| Err("unreachable".into()));
         let told = start(&mut app, vec![record("demo", "0")]);
         assert_eq!(told.len(), 1, "{told:?}");
-        assert!(told[0].0.starts_with("The plugin demo wasn't loaded."), "{told:?}");
-        assert!(told[0].0.ends_with("unreachable"), "{told:?}");
+        assert!(told[0].0.starts_with("The plugin demo wasn't loaded: unreachable."), "{told:?}");
+        assert!(told[0].0.ends_with("Plugin Manager to see it."), "{told:?}");
 
         // A download that isn't the one installed.
         let mut app = app_fetching(|_| Ok(b"x".to_vec()));
@@ -1263,7 +1263,7 @@ mod tests {
         let damaged = Saved { data: Some("!not base64!".into()), url: None, ..record("damaged", "0") };
         let told = start(&mut app, vec![damaged]);
         assert_eq!(told.len(), 1, "{told:?}");
-        assert!(told[0].0.starts_with("The plugin damaged wasn't loaded.") && told[0].0.contains("damaged:"), "{told:?}");
+        assert!(told[0].0.starts_with("The plugin damaged wasn't loaded: ") && told[0].0.contains("damaged:"), "{told:?}");
 
         // Loaded: nothing to tell, nothing listed.
         struct Cleanup(#[allow(dead_code)] tempfile::TempDir);
