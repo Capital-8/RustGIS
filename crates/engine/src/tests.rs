@@ -21794,20 +21794,29 @@ fn unknown_params_are_said() {
 /// A GeometryCollection of several members is refused by what is wrong with it.
 #[test]
 fn a_geometry_collection_of_several_is_refused_as_such() {
+    use rustgis_data::{Coord, Geometry};
     let mut s = world();
     let point = json!({"type": "Point", "coordinates": [1, 2]});
     let two = json!({"type": "GeometryCollection", "geometries": [point, point]});
     let nested = json!({"type": "GeometryCollection", "geometries": [two]});
+    let empty = json!({"type": "GeometryCollection", "geometries": []});
     for cmd in ["edit.addFeature", "edit.setGeometry"] {
-        for g in [&two, &nested] {
+        for g in [&two, &nested, &empty] {
             let e = s.run(cmd, &json!({"layer": "Cities", "row": 0, "geometry": g})).unwrap_err();
             assert!(e.contains("a GeometryCollection must hold exactly one geometry"), "{cmd}: {e}");
         }
         let e = s.run(cmd, &json!({"layer": "Cities", "row": 0, "geometry": {"type": "Blob"}})).unwrap_err();
         assert!(e.contains("geometry must be a GeoJSON geometry"), "{cmd}: {e}");
     }
-    // One member is the geometry.
-    s.run("edit.addFeature", &json!({"layer": "Cities", "geometry": {"type": "GeometryCollection", "geometries": [point]}})).unwrap();
+    // One member, at any depth, is the geometry.
+    let one = json!({"type": "GeometryCollection", "geometries": [{"type": "GeometryCollection", "geometries": [point]}]});
+    let added = s.run("edit.addFeature", &json!({"layer": "Cities", "geometry": one})).unwrap();
+    let row = added["row"].as_u64().unwrap() as usize;
+    s.run("edit.setGeometry", &json!({"layer": "Cities", "row": 0, "geometry": one})).unwrap();
+    let cities = &s.map().layer_by_name("Cities").unwrap().dataset;
+    for r in [row, 0] {
+        assert_eq!(cities.features[r].geometry, Some(Geometry::Point(Coord::new(1.0, 2.0))), "row {r}");
+    }
 }
 
 #[test]

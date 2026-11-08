@@ -3531,7 +3531,9 @@ impl Pages {
             // Why the request failed is kept, so the notice says why completeness is unknown.
             let matched = match answer {
                 Ok(b) => wfs_matched(&b).ok_or(None),
-                Err(e) => Err(Some(e)),
+                // An error holding an address isn't repeated: `redact` keeps its path, which can
+                // hold a key.
+                Err(e) => Err(Some(e).filter(|e| !e.contains("://"))),
             };
             let matched = match matched {
                 Ok(matched) => matched,

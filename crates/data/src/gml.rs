@@ -347,7 +347,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
     if parts_lost > 0 {
         report
             .messages
-            .push(format!("{parts_lost} rings or parts of geometries with too few points or unreadable coordinates were left out"));
+            .push(format!("{parts_lost} rings or parts of geometries were left out: too few points, unreadable coordinates, or an exterior ring past the first"));
     }
     if over > 0 {
         report.messages.push(format!("{over} features of more than {MAX_LAYERS} feature types were left out"));
