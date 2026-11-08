@@ -814,7 +814,9 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
         // arrives as the plain name through the METHODS table.
         "HOTINE_OBLIQUE_MERCATOR" | "HOTINE_OBLIQUE_MERCATOR_AZIMUTH_NATURAL_ORIGIN" if get(&["AZIMUTH"]).is_some() => omerc(true)?,
         // EPSG's methods 9806 and 9818 have no scale factor; PROJ's cass and poly ignore one.
-        // ESRI writes plain `Cassini` to `.prj` files.
+        // ESRI writes plain `Cassini` to `.prj` files for the same ellipsoidal method (EPSG 9806):
+        // ESRI's projection reference describes it as Cassini-Soldner, and GDAL's ESRI WKT
+        // morphing maps `Cassini` and `Cassini_Soldner` to each other.
         "CASSINI_SOLDNER" | "CASSINI" => format!("+proj=cass +lat_0={lat0} {at}"),
         "POLYCONIC" => format!("+proj=poly +lat_0={lat0} {at}"),
         "EQUAL_EARTH" => format!("+proj=eqearth {at}"),
@@ -1619,10 +1621,12 @@ mod tests {
             format!("{}My_Soldner{}", &wkt[..start], &wkt[end..]).replace("PROJECTION[\"Cassini_Soldner\"]", "PROJECTION[\"Cassini\"]");
         assert!(esri.contains("PROJECTION[\"Cassini\"]"), "{esri}");
         let crs = crs_from_wkt(&esri).unwrap_or_else(|e| panic!("{e}: {esri}"));
-        let lonlat = Coord::new(13.4, 52.4);
-        let a = epsg.transformer().unwrap().from_lonlat(lonlat).unwrap();
-        let b = crs.transformer().unwrap().from_lonlat(lonlat).unwrap();
-        assert!((a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01, "{a:?} {b:?}");
+        // Near the grid origin and a few degrees from it, where a spherical form would differ.
+        for lonlat in [Coord::new(13.4, 52.4), Coord::new(17.5, 55.5)] {
+            let a = epsg.transformer().unwrap().from_lonlat(lonlat).unwrap();
+            let b = crs.transformer().unwrap().from_lonlat(lonlat).unwrap();
+            assert!((a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01, "{a:?} {b:?}");
+        }
     }
 
     #[test]

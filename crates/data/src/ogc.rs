@@ -3536,7 +3536,15 @@ impl Pages {
             let matched = match matched {
                 Ok(matched) => matched,
                 Err(why) => {
-                    let why = why.map(|e| format!(" ({})", e.chars().take(200).collect::<String>())).unwrap_or_default();
+                    // Without the credentials an address in the error may hold, and not all of a
+                    // long one.
+                    let why = why
+                        .map(|e| {
+                            let mut e = crate::diagnostics::redact(&e);
+                            crate::diagnostics::cut_with_ellipsis(&mut e, MAX_REASON);
+                            format!(" ({e})")
+                        })
+                        .unwrap_or_default();
                     return self.stop(format!("the WFS total couldn't be read{why}; the features received may be incomplete"));
                 }
             };
@@ -5014,6 +5022,13 @@ mod tests {
             assert!(note.contains("incomplete"));
             // The failed request's reason is kept.
             assert_eq!(note.contains("(timeout)"), answer.is_err(), "{note}");
+        }
+        // A credential in the failed request's address isn't repeated in the notice.
+        {
+            let failed = Err::<Vec<u8>, String>("error sending request for url (https://x.test/wfs?token=abc123)".to_string());
+            let (_, note) = join_pages(url, first.to_vec(), 100, |_| failed.clone());
+            let note = note.unwrap();
+            assert!(note.contains("incomplete") && !note.contains("abc123"), "{note}");
         }
         for last in [
             Err("timeout".into()),
