@@ -4641,7 +4641,7 @@ mod tests {
         h.state_mut().map.labels.push(over);
         assert_eq!(label_at(h.state(), rect, at).map(|l| l.text), Some("Over".into()), "the unmoved label is on top");
         assert!(pinned_label_at(h.state(), rect, at).is_some_and(|l| l.collide.pinned), "the moved one is still found");
-        h.state_mut().map.labels.pop();
+        // Clicked with the unmoved label still on top: the moved one is put back.
         selection_pointer(&mut h, at, None, shift);
         selection_pointer(&mut h, at, Some(true), shift);
         selection_pointer(&mut h, at, Some(false), shift);

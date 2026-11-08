@@ -1133,7 +1133,9 @@ impl RustGisApp {
             }
             Some(Value::Number(_) | Value::String(_)) => {}
             // Not taken for the active layer: with replaceTable that would overwrite a table.
-            Some(other) => return Err(format!("\"layer\" is a layer's id or name, not {other}")),
+            Some(other) => {
+                return Err(crate::i18n::fmt("\"layer\" must be a layer's id or name, not {value}", &[("value", &other.to_string())]));
+            }
         }
         let id = self.session.layer_id(p)?;
         let l = self.session.map().layer(id).ok_or_else(gone)?;
@@ -1142,7 +1144,7 @@ impl RustGisApp {
             Some(v) => match v.as_u64() {
                 Some(instance) if instance == l.instance_id() => Ok(id),
                 Some(_) => Err(gone()),
-                None => Err(format!("\"instance\" is a whole number, not {v}")),
+                None => Err(crate::i18n::fmt("\"instance\" must be a layer's instance number, not {value}", &[("value", &v.to_string())])),
             },
         }
     }
@@ -4496,7 +4498,9 @@ impl RustGisApp {
                 }
                 Err(e) => {
                     // A waiting command's error names the address, as the notice does.
+                    // Redacted whole, as the notice is: a key with a space in it isn't left half there.
                     let e = if e.starts_with(&url) { e } else { format!("{url}: {e}") };
+                    let e = rustgis_engine::Session::redacted(&e).into_string();
                     self.session.request_failed(&p, &e);
                     if let Some(id) = claim {
                         self.session.download_failed(id);
@@ -4736,7 +4740,7 @@ impl RustGisApp {
     /// shows that line (a failure clears it), so a late step never overwrites a newer add's line
     /// and is told as a notice instead.
     fn report_step(&mut self, dialog: bool, shown: Option<&str>, r: Result<String, String>) {
-        let in_dialog = dialog && shown.is_some() && self.dialogs.info.as_deref() == shown;
+        let in_dialog = dialog && self.dialogs.open == Some("addService") && shown.is_some() && self.dialogs.info.as_deref() == shown;
         match (in_dialog, r) {
             (true, Ok(m)) => self.dialogs.info = Some(m),
             (true, Err(e)) => {
@@ -6459,15 +6463,20 @@ mod download_service_tests {
     /// newer add leaves that add's line alone and is told as a notice.
     #[test]
     fn a_failed_service_step_clears_only_its_own_line() {
-        for newer in [false, true] {
+        for (newer, open) in [(false, true), (true, true), (false, false)] {
             let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
             let params = json!({"url":"https://h.invalid/wcs", "name":"Heights"});
             let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(Err("the server is down".to_string()))));
             let opened = app.session.opened;
             app.ui.service_steps.push(super::ServiceStep::Coverage { params, slot, dialog: true, origin: None, opened });
             app.dialogs.info = Some(if newer { "Reading the tileset of Roads" } else { "Describing Heights" }.into());
+            app.dialogs.open = open.then_some("addService");
             app.poll_service_steps();
-            if newer {
+            if !open {
+                // Closed, the dialog would keep the error unseen: it is told as a notice.
+                assert!(app.dialogs.error.is_none(), "{:?}", app.dialogs.error);
+                assert!(app.session.notices.iter().any(|n| n.error && n.text.contains("the server is down")));
+            } else if newer {
                 assert_eq!(app.dialogs.info.as_deref(), Some("Reading the tileset of Roads"), "the newer line stays");
                 assert!(app.dialogs.error.is_none(), "{:?}", app.dialogs.error);
                 assert!(app.session.notices.iter().any(|n| n.error && n.text.contains("the server is down")));

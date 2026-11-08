@@ -767,8 +767,12 @@ fn schema_refused(name: &str, found: &str) -> String {
 
 /// A name as the menu shows it, with a note for everything it had to drop or cut.
 fn clean_name(name: &str, notes: &mut Vec<String>) -> String {
-    let trimmed = name.trim();
+    // Spaces and control characters at either end are removed; those inside are shown as spaces.
+    let trimmed = name.trim_matches(|c: char| c.is_whitespace() || c.is_control());
     let controls = trimmed.chars().filter(|c| c.is_control()).count();
+    // Spaces at the ends are trimmed quietly, as before; other control characters there are told.
+    let hard = |s: &str| s.chars().filter(|c| c.is_control() && !c.is_whitespace()).count();
+    let removed = hard(name).saturating_sub(hard(trimmed));
     // A run of spaces holding a control character becomes one space, so "Mine\nTwo" reads "Mine Two".
     let mut spaced = String::with_capacity(trimmed.len());
     let mut run = String::new();
@@ -793,6 +797,13 @@ fn clean_name(name: &str, notes: &mut Vec<String>) -> String {
             i18n::fmt("{name}: 1 control character in the name was shown as a space", &[("name", kept)])
         } else {
             i18n::fmt("{name}: {n} control characters in the name were shown as spaces", &[("name", kept), ("n", &controls.to_string())])
+        });
+    }
+    if removed > 0 {
+        notes.push(if removed == 1 {
+            i18n::fmt("{name}: 1 control character at an end of the name was removed", &[("name", kept)])
+        } else {
+            i18n::fmt("{name}: {n} control characters at the ends of the name were removed", &[("name", kept), ("n", &removed.to_string())])
         });
     }
     if printable > MAX_NAME {
@@ -1718,6 +1729,13 @@ mod tests {
         assert_eq!(theme.name, "Mine Second line with a tab", "a newline would break the button");
         assert_eq!(theme.notes.len(), 1, "{:?}", theme.notes);
         assert!(theme.notes[0].contains("2 control characters"), "{:?}", theme.notes);
+
+        // One at an end is removed, and the note says so rather than "shown as a space".
+        json["name"] = serde_json::json!("Mine \u{7}");
+        let theme = Theme::parse("Mine", &json.to_string()).expect("it parses");
+        assert_eq!(theme.name, "Mine");
+        assert_eq!(theme.notes.len(), 1, "{:?}", theme.notes);
+        assert!(theme.notes[0].contains("1 control character at an end of the name was removed"), "{:?}", theme.notes);
 
         json["name"] = serde_json::json!("N".repeat(200));
         let theme = Theme::parse("Mine", &json.to_string()).expect("it parses");
