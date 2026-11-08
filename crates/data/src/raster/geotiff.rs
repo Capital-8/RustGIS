@@ -2448,8 +2448,23 @@ mod tests {
         let bytes = rgb_tiled_samples(&[(40, 16, 4), (20, 1200, 3), (10, 16, 4)], 8, 1, |b, x, y| (b * 10 + x + y) as u16);
         let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
         let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
-        assert_eq!(layout.levels.iter().map(|l| l.width).collect::<Vec<_>>(), [40, 10]);
+        assert_eq!(layout.levels.iter().map(|l| (l.width, l.ifd)).collect::<Vec<_>>(), [(40, 0), (10, 2)]);
         assert!(layout.lost.iter().any(|n| n.contains("1 overview(s)") && n.contains("image 1 (3)")), "{:?}", layout.lost);
+        assert!(layout.lost.iter().all(|n| !n.contains("scan for overviews stopped")), "{:?}", layout.lost);
+    }
+
+    /// Looking for overviews passes over a bounded number of images, and says when it stops.
+    #[test]
+    fn cog_overview_scan_stops_after_so_many_skipped_images() {
+        use super::super::cog::{self, Parse, Sparse};
+        // The full image, 64 more of its size (not overviews of it), then an overview.
+        let mut images = vec![(32, 16, 4); 65];
+        images.push((16, 16, 4));
+        let bytes = rgb_tiled_samples(&images, 8, 1, |b, x, y| (b * 10 + x + y) as u16);
+        let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
+        let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+        assert_eq!(layout.levels.iter().map(|l| l.width).collect::<Vec<_>>(), [32]);
+        assert!(layout.lost.iter().any(|n| n.contains("stopped after 64 skipped images")), "{:?}", layout.lost);
     }
 
     /// An RGBI image too large to read whole, with a three-sample overview that would fit: the

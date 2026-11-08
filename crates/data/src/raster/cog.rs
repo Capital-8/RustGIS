@@ -441,8 +441,14 @@ fn read_layout(r: Sparse) -> Result<Parse> {
     let mut skipped = 0usize;
     loop {
         let subfile = dec.find_tag_unsigned::<u32>(Tag::NewSubfileType).ok().flatten().unwrap_or(0);
-        // Transparency masks are skipped.
-        if subfile & 4 == 0 {
+        // Transparency masks are skipped, and count toward the scan's bound.
+        if subfile & 4 != 0 {
+            skipped += 1;
+            if skipped >= MAX_SKIPPED && dec.more_images() {
+                lost.push(format!("the scan for overviews stopped after {skipped} skipped images: later images aren't read"));
+                break;
+            }
+        } else {
             let Some(tw) = dec.find_tag_unsigned::<u32>(Tag::TileWidth).ok().flatten() else {
                 if index == 0 {
                     return Ok(Parse::NotTiled("a GeoTIFF in strips is read whole".into()));
