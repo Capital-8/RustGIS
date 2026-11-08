@@ -6859,6 +6859,10 @@ fn publication_arrangements_and_the_favourite() {
     let custom = json!({"locator": "bottom-left", "northArrow": "top-left", "legend": "top-right", "scaleBar": "bottom-right"});
     let r = s.run("layout.publication", &json!({"extent": extent, "author": "", "arrangement": custom})).unwrap();
     assert_eq!((r["arrangement"].as_str(), corners(&s)), (Some("custom"), ["bottom left", "top left", "top right", "bottom right"]), "{r}");
+    // Corner names, like arrangement names, are read whatever their case.
+    let shouted = json!({"locator": "Bottom-Left", "northArrow": "TOP-LEFT", "legend": "top-Right", "scaleBar": "bottom-right"});
+    let r = s.run("layout.publication", &json!({"extent": extent, "author": "", "arrangement": shouted})).unwrap();
+    assert_eq!(corners(&s), ["bottom left", "top left", "top right", "bottom right"], "{r}");
     // The favourite: shown, set, then the one the default and "favourite" take.
     let shown = s.run("layout.arrangement", &json!({})).unwrap();
     assert_eq!((shown["favourite"].as_str(), shown["corners"]["legend"].as_str()), (Some("classic"), Some("bottom-left")));
