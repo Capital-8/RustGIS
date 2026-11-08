@@ -455,7 +455,9 @@ gap between two parts never counts; a line's parts that cross the antimeridian, 
 where the next begins on its other side, as a GeoJSON file splits a line that crosses it, are one
 line. A ring ends where it starts, so a point there is made once, and a line that ends where it
 starts (a contour) is walked as a ring too; a part shorter than its offsets gets none. A line that
-passes through one place twice gets a point there each time the distance lands on it. Each point
+passes through one place twice gets a point there each time the distance lands on it, except at a
+closed line's shared start and end, which gets one point (a line through A, B and back to A gets
+one at A). Each point
 has its feature's attributes and three fields: `orig_fid`, the feature's OID, as Feature Vertices
 To Points writes it, and, named as in QGIS's Points along geometry, `distance` (how far along its
 part, in `units`, the start offset included) and `angle` (the line's direction there, in degrees
@@ -936,7 +938,11 @@ CRS metadata. Coordinates are used directly, without projection or snapping.
 - **Unsplit Line** (`unsplitLine`) joins line parts at exactly equal endpoints where precisely
   two part ends meet and all attribute values agree. Reversed parts and closed cycles are
   supported. Branches, attribute changes, and intersections away from endpoints stay separate.
-  Every output chain retains its common attributes; no field values are discarded.
+  Every output chain retains its common attributes; no field values are discarded. Each chain of
+  joined parts is its own output feature, so a multipart input can become several features.
+  Joins are decided among the selected features only, when there is a selection: an unselected
+  part meeting an endpoint neither joins it nor stops a join there. Two parts with equal
+  attributes that share both endpoints join into one closed line.
 
 Missing geometries and empty or too-short parts are skipped with a count. If skipping leaves
 no usable output, the tool returns an error. Non-finite coordinates and malformed rows with
@@ -975,7 +981,7 @@ features were checked.
 | `rings_intersect` | Two rings of one polygon overlap or touch along a line |
 | `disconnected_interior` | Rings of one polygon touch at points so that they cut its interior into pieces, such as a hole touching the exterior ring at two points, or three holes each touching the next |
 | `parts_overlap` | Two polygons of one multipart feature overlap or touch along a line |
-| `too_complex` | Some of the feature's checks were left out: it needs more work than the tool spends on one feature, there wasn't enough memory to check it, or the geo library's relate operation failed on some of its rings or parts (`detail` says which of the three, not which rings or parts). The checks of each ring's points still run. The tool says how many features each reason left out |
+| `too_complex` | Some of the feature's checks were left out: it needs more work than the tool spends on one feature, there wasn't enough memory to check it, or the geo library's relate operation failed on some of its rings or parts (`detail` says which of the three, not which rings or parts). The checks of each ring's points still run, except in a ring with non-finite coordinates, which is reported for those and skips its other point checks. The tool says how many features each reason left out |
 
 Codes are listed in this order, and are never translated. The checks work in stored
 coordinates, without projection. Lines may cross themselves, so only polygon rings are checked
