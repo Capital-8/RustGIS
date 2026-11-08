@@ -22,7 +22,7 @@ pub fn commands() -> Vec<C> {
         ),
         C::new("info.fileLayers", "List Layers in File", "Home › Add › Add Data", file_layers).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
-            .params(r#"{"path": string, "crs"?: "EPSG:… for a .city.json that doesn't say (as layer.addData)"}"#),
+            .params(r#"{"path": string, "crs"?: "EPSG:… for a CityJSON model (.city.json, a .json, or in a zip) that doesn't say (as layer.addData)"}"#),
         C::new("info.fileColumns", "List Columns in File", "Home › Add › Add Data › Delimited Text", file_columns).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
             r#"{"path": "a delimited text file (CSV, TSV, TXT) or a spreadsheet", "delimiter"?: ","|";"|"\\t"|"|", "layer"?: "a spreadsheet's sheet (the first by default)"}"#,
         ),
@@ -1594,7 +1594,7 @@ pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u
                 .map(|(dataset, report)| rustgis_data::io::LayerRead { dataset, report, styles: Vec::new() })
                 .collect()
         }
-        // A CityJSON model that names no coordinate system, or names one it doesn't have.
+        // A CityJSON model with a coordinate system given, which takes the place of any it names.
         _ if crs.is_some() && rustgis_data::io::is_cityjson(file_name, bytes) => {
             let crs = crs.map(rustgis_data::raster::Crs::parse).transpose()?;
             rustgis_data::cityjson::read(file_name, bytes, crs)
