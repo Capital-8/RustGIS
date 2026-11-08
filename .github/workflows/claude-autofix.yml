@@ -241,6 +241,10 @@ jobs:
               | select(.starter.nodes[0] | trusted)
               | select(.comments.nodes[-1]
                        | (.author.__typename == "Bot" and (.body | startswith("**Claude autofix ("))) | not)
+              # A thread a maintainer left for the release quality pass (its last reply ends with
+              # the quality-sweep marker) waits for that pass, not for autofix.
+              | select(.comments.nodes[-1]
+                       | (trusted and ((.body // "") | test("<!-- quality-sweep -->\\s*$"))) | not)
               | { id, path, line: (.line // .originalLine), outdated: .isOutdated,
                   comments: (.comments.totalCount as $n | .starter.nodes[0] as $s
                              | [ $s, (.comments.nodes[] | select(.id != $s.id)) ]
