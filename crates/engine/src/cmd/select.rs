@@ -269,10 +269,25 @@ pub(crate) fn warn_bounded(s: &mut Session, bounded: &[(String, usize)]) {
     }
     let total: usize = bounded.iter().map(|(_, n)| n).sum();
     let layers: Vec<String> = bounded.iter().map(|(layer, n)| format!("{layer} {n}")).collect();
+    let steps = grouped(network::REACH_STEPS_TOTAL);
+    let longest = network::REACH_STEPS_MAX * network::REACH_STEP_DEG;
     s.warn(format!(
-        "{total} feature(s) near a pole ({}) couldn't be measured in full (past a search's 250,000 steps a layer, or along an edge over 512° long) and were counted at the least distance they could be: they may lie farther, even beyond the radius",
+        "{total} feature(s) near a pole ({}) couldn't be measured in full (past a search's {steps} steps a layer, or along an edge over {longest}° long) and were counted at the least distance they could be: they may lie farther, even beyond the radius",
         layers.join(", ")
     ));
+}
+
+/// `n` with its digits in groups of three (`250,000`).
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The hit count describes the query, regardless of whether its rows are added or removed.
@@ -511,6 +526,23 @@ mod tests {
     use crate::{Project, Tool};
     use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as DataValue};
     use rustgis_geom::{lonlat_to_merc, merc_to_lonlat};
+
+    /// The pole warning states the search's limits from the constants that set them.
+    #[test]
+    fn bounded_warning_states_the_search_limits() {
+        assert_eq!(
+            [grouped(0), grouped(999), grouped(1000), grouped(250_000), grouped(1_234_567)],
+            ["0", "999", "1,000", "250,000", "1,234,567"]
+        );
+        let mut s = Session::new(Project::default());
+        let mark = s.notices_given();
+        warn_bounded(&mut s, &[("Cities".into(), 2)]);
+        let text = s.notices_since(mark).first().map(|n| n.text.as_str()).unwrap_or_default();
+        assert!(
+            text.contains("2 feature(s) near a pole (Cities 2)") && text.contains("250,000 steps") && text.contains("over 512° long"),
+            "{text}"
+        );
+    }
 
     fn fixture() -> (Session, u32, u32) {
         let mut s = Session::new(Project::default());
