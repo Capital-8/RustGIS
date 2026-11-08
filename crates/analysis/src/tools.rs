@@ -98,7 +98,7 @@ pub static TOOLS: &[ToolSpec] = &[
         id: "repairGeometry",
         name: "Repair Geometry",
         toolbox: "Data Management › Features",
-        summary: "Writes every feature with its geometry made valid where it can be: rings closed, repeated vertices and degenerate parts dropped, self-intersections, overlapping parts and holes outside their shell resolved. Features it cannot repair are written unchanged, and those left with no area or usable points without geometry. Says what was repaired in each.",
+        summary: "Writes every feature with its geometry made valid where it can be: rings closed, repeated vertices and degenerate parts dropped, self-intersections, overlapping parts and holes outside their shell resolved. Features with a missing or non-finite coordinate anywhere, even in a hole, or left with no usable points or, for polygons, no area, are written without geometry; those it cannot repair are written unchanged. Says what was repaired in each.",
         params: &[
             P { name: "input", label: "Input Features", kind: K::VectorLayer, required: true, default: "", help: "" },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
@@ -8768,12 +8768,15 @@ mod tests {
         };
         let lossy = run(vec![Coord::new(0.01, 60.0), Coord::new(f64::NAN, 60.0), Coord::new(0.0, f64::INFINITY)]);
         assert!(lossy.iter().any(|m| m.contains("from 2 points (bandwidth")), "{lossy:?}");
+        assert!(lossy.iter().all(|m| !m.contains("beyond what")), "{lossy:?}");
         let notes: Vec<_> = lossy.iter().filter(|m| m.contains("non-finite")).collect();
         assert!(
             notes.len() == 1
                 && notes.iter().all(|m| m.starts_with("2 point(s) with non-finite coordinates were left out of 1 multipoint feature(s)")),
             "{lossy:?}"
         );
+        let unusable = run(vec![Coord::new(f64::NAN, 60.0), Coord::new(0.0, f64::INFINITY)]);
+        assert!(unusable.iter().any(|m| m.contains("from 1 points (1 skipped, bandwidth")), "{unusable:?}");
         let clean = run(vec![Coord::new(0.01, 60.0), Coord::new(0.02, 60.0)]);
         assert!(
             clean.iter().any(|m| m.contains("from 3 points (bandwidth")) && clean.iter().all(|m| !m.contains("non-finite")),

@@ -942,7 +942,8 @@ CRS metadata. Coordinates are used directly, without projection or snapping.
   joined parts is its own output feature, so a multipart input can become several features.
   Joins are decided among the selected features only, when there is a selection: an unselected
   part meeting an endpoint neither joins it nor stops a join there. Two parts with equal
-  attributes that share both endpoints join into one closed line.
+  attributes that share both endpoints join into one closed line when no other considered part
+  ends there.
 
 Missing geometries and empty or too-short parts are skipped with a count. If skipping leaves
 no usable output, the tool returns an error. Non-finite coordinates and malformed rows with
