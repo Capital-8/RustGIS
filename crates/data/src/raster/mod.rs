@@ -577,8 +577,8 @@ pub struct Raster {
     /// left out.
     pub lost: Vec<String>,
     /// How many values of each band changed when read as `f32` (Int32 IDs past 16,777,216, Float64
-    /// values with more digits than `f32` holds), by band; empty when none did. NaN and no-data
-    /// values aren't counted.
+    /// values with more digits than `f32` holds), by band; empty when none did. NaN values and
+    /// samples that are exactly the no-data value aren't counted (one that rounds onto it is).
     pub rounded: Vec<u64>,
     transformer: Transformer,
     extent: Extent,
