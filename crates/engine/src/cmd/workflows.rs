@@ -1040,7 +1040,7 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let (mut no_point, mut no_value) = (0usize, 0usize);
     let mut pts: Vec<(Coord, f64)> = Vec::with_capacity(ds.features.len());
     for (r, ft) in ds.features.iter().enumerate() {
-        let Some(c) = ft.geometry.as_ref().and_then(|g| g.label_point()) else {
+        let Some(c) = ft.geometry.as_ref().and_then(|g| g.label_point()).filter(|c| c.is_finite()) else {
             no_point += 1;
             continue;
         };
