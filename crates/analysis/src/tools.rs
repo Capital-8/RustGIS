@@ -1512,7 +1512,7 @@ fn buffer_with_limits(inp: &dyn Inputs, p: &Json, limit: usize, bytes: usize) ->
     }
     if coarse > 0 {
         r.messages.push(format!(
-            "{coarse} of {} features' buffers have outline edges left unsplit, with no points added along them (a ring of thousands of long edges uses up the points it may add): their sides there can stray from the distance by more than a buffer otherwise keeps to (0.012%, 0.05% along a line or outline buffered in stretches, or 1 cm)",
+            "{coarse} of {} features' buffers have outline edges left with fewer points along them than they need (the points a ring may add ran out, as on a ring of thousands of long edges, or a very long edge was halved as many times as it may be): their sides there can stray from the distance by more than a buffer otherwise keeps to (0.012%, 0.05% along a line or outline buffered in stretches, or 1 cm)",
             picked.len()
         ));
     }
@@ -3322,7 +3322,7 @@ fn select_by_location_with_work_limit(inp: &dyn Inputs, p: &Json, limit: usize, 
     let coarse = coarse.into_inner();
     if coarse > 0 {
         messages.push(format!(
-            "{coarse} selecting features' buffers have outline edges left unsplit, with no points added along them (a ring of thousands of long edges uses up the points it may add): features near their edges there may be selected or not by more than a buffer otherwise keeps to (0.012% of the distance, 0.05% along a line or outline buffered in stretches, or 1 cm)"
+            "{coarse} selecting features' buffers have outline edges left with fewer points along them than they need (the points a ring may add ran out, as on a ring of thousands of long edges, or a very long edge was halved as many times as it may be): features near their edges there may be selected or not by more than a buffer otherwise keeps to (0.012% of the distance, 0.05% along a line or outline buffered in stretches, or 1 cm)"
         ));
     }
     Ok(ToolResult { output: Output::Selection { layer: ds.name.clone(), rows: hits }, messages })
@@ -8501,7 +8501,7 @@ mod tests {
             for dissolve in ["None", "All"] {
                 let params = serde_json::json!({"input": "l", "distance": 1, "units": "Meters", "dissolve": dissolve});
                 let res = crate::run("buffer", &m, &params).unwrap_or_else(|e| panic!("{e}"));
-                let said = res.messages.iter().any(|m| m.starts_with("1 of 1 features' buffers have outline edges left unsplit"));
+                let said = res.messages.iter().any(|m| m.starts_with("1 of 1 features' buffers have outline edges left with fewer points"));
                 assert_eq!(said, coarse, "dissolve {dissolve}: {:?}", res.messages);
             }
         }
