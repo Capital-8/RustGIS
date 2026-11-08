@@ -760,6 +760,10 @@ struct ImportItem<T> {
 /// Missing versions are legacy files. The stricter field checks apply only to file import.
 pub(crate) fn check_file(v: &Value) -> Result<(), String> {
     let graph = v.get("graph");
+    // Some other file (GeoJSON, a project) is said to be one, not told to update RustGIS.
+    if graph.is_none() && v.get("steps").is_none() {
+        return Err("not a RustGIS model or web tool (no graph or steps)".into());
+    }
     if let Some(version) = v.get("version") {
         let supported = if graph.is_some() { version.as_str() == Some(FILE_VERSION) } else { version.as_u64() == Some(WEB_TOOL_VERSION) };
         if !supported {
@@ -824,7 +828,7 @@ pub(crate) fn check_file(v: &Value) -> Result<(), String> {
         let lost_edges = edges.len().saturating_sub(normalized.edges.len());
         if lost_nodes > 0 || lost_edges > 0 {
             return Err(format!(
-                "this model would discard {lost_nodes} node(s) and {lost_edges} connection(s). Fix empty or duplicate node IDs and invalid connections before importing it."
+                "this model would discard {lost_nodes} node(s) and {lost_edges} connection(s): empty or duplicate node IDs, repeated connections into a single-input port, or invalid connections. Fix them before importing it."
             ));
         }
         let by_id: HashMap<&str, &ModelNode> = normalized.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
