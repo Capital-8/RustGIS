@@ -1304,8 +1304,10 @@ their name.
   has that tool and those after it run again as the results are added, and so does a tool that
   writes a file, a plugin tool or a GeoLibre tool, with those after it. Those run as a model
   always has, holding the window until they finish, with the work limits of a run that can't
-  be cancelled. A file a tool reads by its path isn't compared: one changed during the run
-  gives the result from what was read. A model run from a script in the Script pane is worked
+  be cancelled. The tools worked out in the background take no work limit, so a model can
+  finish there and stop at the limit when its tools run holding the window or from the command
+  line. A file a tool reads by its path isn't compared: one changed during the run gives the
+  result from what was read. A model run from a script in the Script pane is worked
   out in the background with the script; one run from the command line or the assistant runs
   where the command runs.
 - **Save** keeps the model in the project; **Export** writes it as a `*.model.json` file, which
