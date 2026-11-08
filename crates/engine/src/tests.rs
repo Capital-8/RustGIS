@@ -15961,6 +15961,37 @@ fn stac_search_and_assets() {
     assert!(s.run("stac.addAsset", &json!({"item": {"type": "Feature", "id": "x", "assets": {}}})).is_err());
 }
 
+/// A single STAC asset whose metadata names codes for a failed retrieval (JAXA Earth's
+/// `je:rasters` `dn.error`) draws them as values, and says so; an asset without them says nothing.
+#[test]
+fn a_stac_asset_with_retrieval_codes_says_they_draw_as_values() {
+    let item = |id: &str, extra: &str| {
+        format!(
+            r#"{{"type": "Feature", "id": "{id}", "collection": "c", "bbox": [7, 46, 8, 47], "geometry": null,
+               "properties": {{"datetime": "2024-06-02T10:30:00Z"}},
+               "assets": {{"places": {{"href": "{{base}}/data/places.geojson", "type": "application/geo+json", "roles": ["data"]{extra}}}}}}}"#
+        )
+    };
+    let geojson = r#"{"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {"n": 1}, "geometry": {"type": "Point", "coordinates": [7.5, 46.5]}}]}"#;
+    let base = serve_routes(
+        vec![
+            ("/items/clean", item("clean", "")),
+            ("/items/coded", item("coded", r#", "je:rasters": {"dn": {"error": [5.0, 7.0]}}"#)),
+            ("/data/places.geojson", geojson.to_string()),
+        ],
+        4,
+    );
+    let mut s = Session::new(Project::default());
+    let mark = s.notice_mark();
+    s.run("stac.addAsset", &json!({"url": format!("{base}/items/clean"), "name": "Clean"})).unwrap();
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(!said.iter().any(|t| t.contains("failed retrievals")), "clean input tells nothing: {said:?}");
+    let mark = s.notice_mark();
+    s.run("stac.addAsset", &json!({"url": format!("{base}/items/coded"), "name": "Coded"})).unwrap();
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains("Coded: its metadata marks failed retrievals with 2 code(s) (5, 7)")), "{said:?}");
+}
+
 /// Directions through a routing server of one's own (a local Valhalla answer here): the route
 /// and its steps as layers; the app's answer can be passed in instead, and nothing is fetched.
 #[test]

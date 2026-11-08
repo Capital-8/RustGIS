@@ -250,6 +250,9 @@ fn add_asset(s: &mut Session, p: &Value) -> CmdResult {
     let p = bound.as_ref();
     let i = item(p)?;
     let (key, href) = i.asset_href(ps(p, "asset"))?;
+    // Codes for a failed retrieval (JAXA Earth's `dn.error`), which a data cube skips but a
+    // single file draws as values.
+    let codes = i.pick(Some(&key)).ok().map(|a| (a.invalid.clone(), a.codes_unread)).unwrap_or_default();
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| format!("{} {key}", i.id));
     // A Planetary Computer asset is read with its storage container's token.
     #[cfg(not(target_arch = "wasm32"))]
@@ -258,7 +261,22 @@ fn add_asset(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(connection) = p.get("connection") {
         add["connection"] = connection.clone();
     }
-    super::layer::add_url(s, &add)
+    let added = super::layer::add_url(s, &add)?;
+    match codes {
+        (_, true) => s.warn(format!(
+            "{name}: its metadata marks failed retrievals with codes that couldn't be read whole, and the map draws them as values"
+        )),
+        (invalid, false) if !invalid.is_empty() => {
+            let listed: Vec<String> = invalid.iter().map(f64::to_string).collect();
+            s.warn(format!(
+                "{name}: its metadata marks failed retrievals with {} code(s) ({}), which the map draws as values",
+                invalid.len(),
+                listed.join(", ")
+            ));
+        }
+        _ => {}
+    }
+    Ok(added)
 }
 
 /// The most items a data cube on the time slider takes (its search is paged up to this).
