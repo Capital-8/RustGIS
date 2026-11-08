@@ -21791,6 +21791,25 @@ fn unknown_params_are_said() {
     assert!(said.len() < 500 && said.contains("995 more"), "{said}");
 }
 
+/// A GeometryCollection of several members is refused by what is wrong with it.
+#[test]
+fn a_geometry_collection_of_several_is_refused_as_such() {
+    let mut s = world();
+    let point = json!({"type": "Point", "coordinates": [1, 2]});
+    let two = json!({"type": "GeometryCollection", "geometries": [point, point]});
+    let nested = json!({"type": "GeometryCollection", "geometries": [two]});
+    for cmd in ["edit.addFeature", "edit.setGeometry"] {
+        for g in [&two, &nested] {
+            let e = s.run(cmd, &json!({"layer": "Cities", "row": 0, "geometry": g})).unwrap_err();
+            assert!(e.contains("a GeometryCollection must hold exactly one geometry"), "{cmd}: {e}");
+        }
+        let e = s.run(cmd, &json!({"layer": "Cities", "row": 0, "geometry": {"type": "Blob"}})).unwrap_err();
+        assert!(e.contains("geometry must be a GeoJSON geometry"), "{cmd}: {e}");
+    }
+    // One member is the geometry.
+    s.run("edit.addFeature", &json!({"layer": "Cities", "geometry": {"type": "GeometryCollection", "geometries": [point]}})).unwrap();
+}
+
 #[test]
 fn geojson_collection_import_reports_loss_even_without_surviving_geometry() {
     let collection = json!({"type":"GeometryCollection", "geometries":[
