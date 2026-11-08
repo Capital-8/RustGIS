@@ -27,7 +27,9 @@ Based on the RustGIS user guide, Analysis › Geoprocessing tools
      `featureEnvelopeToPolygon`, `unsplitLine` (`input`, optional `output`; see the user guide
      for envelope axes and endpoint-joining rules); `checkGeometry` (`input`: a layer of the
      features with invalid geometry, saying what is wrong with each); `repairGeometry` (`input`:
-     every feature with its geometry made valid, and a field saying what was repaired)
+     every feature with its geometry made valid where it can be, and a field saying what was
+     repaired; features it cannot repair are written unchanged, those left with no area or
+     usable points without geometry)
    - selection: `selectByLocation` (`input`, `select`, `distance`, `invert`), `selectByAttributes`
      (`input`, `where`)
    - statistics: `countPoints` (Summarize Within: `polygons`, `points`, `statistics`: summary
