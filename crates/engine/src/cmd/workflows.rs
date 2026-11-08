@@ -27,6 +27,7 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"name"?: model (default: the last), "graph"?: run this graph instead (as model.new)}"#),
         C::new("model.validate", "Validate Model", "Analyze › Geoprocessing", |s, p| {
             let (_, g, _) = model_graph(s, p)?;
+            note_passed_graph(s, p);
             let problems = crate::model::validate(s, &g);
             Ok(json!({"ok": problems.is_empty(), "problems": problems}))
         }).roles(&[crate::ParamRole { key: "graph", role: crate::Role::ModelGraph }]).effects(crate::policy::Effects::NONE)
@@ -443,9 +444,38 @@ pub fn gallery_list(kind: &str) -> CmdResult {
     Ok(Value::Array(out))
 }
 
+/// Tells the user what a graph passed to a command lost when it was read: one notice for the
+/// nodes and one for the connections, each with a count.
+fn notify_graph_dropped(s: &mut Session, dropped: crate::model::GraphDropped) {
+    if dropped.nodes > 0 {
+        s.notify(format!("model graph: {} node(s) left out: unreadable, without an id, or with the id of another", dropped.nodes), false);
+    }
+    if dropped.edges > 0 {
+        s.notify(
+            format!("model graph: {} connection(s) left out: unreadable, to a missing node or itself, or repeating another", dropped.edges),
+            false,
+        );
+    }
+}
+
+/// Reads the `graph` a command was passed, if any, and says what reading it left out.
+fn read_graph(s: &mut Session, p: &Value) -> Result<Option<crate::project::ModelGraph>, String> {
+    let Some(g) = p.get("graph").filter(|g| !g.is_null()) else { return Ok(None) };
+    let (graph, dropped) = crate::model::graph_from_json_counted(g)?;
+    notify_graph_dropped(s, dropped);
+    Ok(Some(graph))
+}
+
+/// Says what the graph a command was passed (rather than a saved model's) lost when read.
+fn note_passed_graph(s: &mut Session, p: &Value) {
+    if let Some(Ok((_, dropped))) = p.get("graph").filter(|g| !g.is_null()).map(crate::model::graph_from_json_counted) {
+        notify_graph_dropped(s, dropped);
+    }
+}
+
 fn new_model(s: &mut Session, p: &Value) -> CmdResult {
     let base = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Model").chars().take(200).collect::<String>();
-    let graph = p.get("graph").filter(|g| !g.is_null()).map(crate::model::graph_from_json).transpose()?;
+    let graph = read_graph(s, p)?;
     let steps: Vec<ModelStep> = match p.get("steps") {
         _ if graph.is_some() => graph.as_ref().map(crate::model::graph_to_steps).unwrap_or_default(),
         Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("steps: {e}"))?,
@@ -636,6 +666,7 @@ fn run_model_here(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     let (name, _, trusted) = model_graph(s, p)?;
+    note_passed_graph(s, p);
     let op = s.authorize_model(p)?;
     if trusted || p.get("graph").is_some_and(|g| !g.is_null()) {
         crate::model::run(s, op)
@@ -654,7 +685,7 @@ pub(crate) fn model_save_names(p: &Value) -> Result<(String, String), String> {
 /// Saves a graph as a model, replacing the one of that name (or adding it).
 fn save_model(s: &mut Session, p: &Value) -> CmdResult {
     let (name, new_name) = model_save_names(p)?;
-    let g = crate::model::graph_from_json(p.get("graph").ok_or("graph is required")?)?;
+    let g = read_graph(s, p)?.ok_or("graph is required")?;
     let i = s.project.models.iter().position(|m| m.name.eq_ignore_ascii_case(&name));
     if !new_name.eq_ignore_ascii_case(&name) && s.project.models.iter().any(|m| m.name.eq_ignore_ascii_case(&new_name)) {
         return Err(format!("a model named '{new_name}' already exists"));
@@ -673,6 +704,7 @@ fn save_model(s: &mut Session, p: &Value) -> CmdResult {
 /// A model as a `*.model.json` file: written to `path`, or its text returned.
 fn export_model(s: &mut Session, p: &Value) -> CmdResult {
     let (name, g, _) = model_graph(s, p)?;
+    note_passed_graph(s, p);
     let (text, report) =
         crate::durable::output_owned(g, |g| serde_json::to_string_pretty(&crate::model::to_file(&name, g)).map_err(|e| e.to_string()))?;
     crate::durable::notify(s, &report);

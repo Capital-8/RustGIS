@@ -25721,6 +25721,53 @@ fn dem_tiles_mosaic_clip_by_polygon_share_a_stretch_and_report_overviews() {
     assert!(e.to_string().contains("overview"), "{e}");
 }
 
+/// A graph passed to a model command says what reading it left out (one notice per kind, with a
+/// count); a clean graph says nothing.
+#[test]
+fn model_graph_drops_are_noticed() {
+    let mut s = world();
+    let clean = json!({
+        "nodes": [
+            {"id": "i1", "kind": "input", "x": 0, "y": 0, "layer": "Cities"},
+            {"id": "o1", "kind": "output", "x": 240, "y": 0, "name": "Kept"}
+        ],
+        "edges": [{"from": "i1", "fromPort": "out", "to": "o1", "toPort": "in"}]
+    });
+    let said = |s: &Session, mark: u64, what: &str| s.notices_since(mark).iter().filter(|n| n.text.contains(what)).count();
+    let mark = s.notice_mark();
+    s.run("model.new", &json!({"name": "Clean", "graph": clean})).unwrap();
+    s.run("model.save", &json!({"name": "Clean", "graph": clean})).unwrap();
+    s.run("model.validate", &json!({"graph": clean})).unwrap();
+    assert_eq!(said(&s, mark, "left out"), 0, "{:?}", s.notices_since(mark));
+
+    let lossy = json!({
+        "nodes": [
+            {"id": "i1", "kind": "input", "x": 0, "y": 0, "layer": "Cities"},
+            {"id": "i1", "kind": "input", "x": 10, "y": 0, "layer": "Countries"},
+            {"id": "  ", "kind": "input", "x": 20, "y": 0, "layer": "Cities"},
+            {"kind": 7},
+            {"id": "o1", "kind": "output", "x": 240, "y": 0, "name": "Kept"}
+        ],
+        "edges": [
+            {"from": "i1", "fromPort": "out", "to": "o1", "toPort": "in"},
+            {"from": "i1", "fromPort": "out", "to": "missing", "toPort": "in"},
+            {"from": "o1", "fromPort": "out", "to": "o1", "toPort": "in"},
+            "not an edge"
+        ]
+    });
+    for (cmd, params) in [
+        ("model.new", json!({"name": "Lossy", "graph": lossy})),
+        ("model.save", json!({"name": "Lossy", "graph": lossy})),
+        ("model.validate", json!({"graph": lossy})),
+        ("model.export", json!({"graph": lossy})),
+    ] {
+        let mark = s.notice_mark();
+        s.run(cmd, &params).unwrap();
+        assert_eq!(said(&s, mark, "3 node(s) left out"), 1, "{cmd}: {:?}", s.notices_since(mark));
+        assert_eq!(said(&s, mark, "3 connection(s) left out"), 1, "{cmd}: {:?}", s.notices_since(mark));
+    }
+}
+
 /// ModelBuilder graphs: validated, run in flow order, intermediate results dropped, outputs named.
 fn model_graphs(s: &mut Session) {
     let graph = json!({

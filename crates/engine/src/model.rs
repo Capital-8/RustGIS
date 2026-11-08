@@ -477,6 +477,21 @@ pub fn graph_to_steps(g: &ModelGraph) -> Vec<ModelStep> {
 /// edges to missing nodes or to themselves. Bounded in size.
 /// Repeated connections into many-valued input ports retain their multiplicity.
 pub fn graph_from_json(v: &Value) -> Result<ModelGraph, String> {
+    graph_from_json_counted(v).map(|(g, _)| g)
+}
+
+/// What [`graph_from_json_counted`] left out of a graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GraphDropped {
+    /// Nodes that could not be read, had no id, or repeated another's id.
+    pub nodes: usize,
+    /// Connections that could not be read, joined a missing node or itself, or repeated another.
+    pub edges: usize,
+}
+
+/// Reads a graph as [`graph_from_json`] does, and counts the nodes and connections it left out,
+/// so a command can say so. Errors when `nodes` is missing or either list is too long.
+pub fn graph_from_json_counted(v: &Value) -> Result<(ModelGraph, GraphDropped), String> {
     let nodes = v.get("nodes").and_then(Value::as_array).ok_or("a model graph needs \"nodes\"")?;
     if nodes.len() > MAX_NODES {
         return Err(format!("a model can have at most {MAX_NODES} nodes"));
@@ -486,10 +501,15 @@ pub fn graph_from_json(v: &Value) -> Result<ModelGraph, String> {
         return Err(format!("a model can have at most {MAX_EDGES} connections"));
     }
     let mut g = ModelGraph::default();
+    let mut dropped = GraphDropped::default();
     for n in nodes {
-        let Ok(mut node) = serde_json::from_value::<ModelNode>(n.clone()) else { continue };
+        let Ok(mut node) = serde_json::from_value::<ModelNode>(n.clone()) else {
+            dropped.nodes += 1;
+            continue;
+        };
         node.id = node.id.trim().chars().take(MAX_NODE_ID).collect();
         if node.id.is_empty() || g.nodes.iter().any(|m| m.id == node.id) {
+            dropped.nodes += 1;
             continue;
         }
         if !node.x.is_finite() || !node.y.is_finite() {
@@ -504,19 +524,24 @@ pub fn graph_from_json(v: &Value) -> Result<ModelGraph, String> {
         g.nodes.push(node);
     }
     for e in edges {
-        let Ok(e) = serde_json::from_value::<ModelEdge>(e.clone()) else { continue };
+        let Ok(e) = serde_json::from_value::<ModelEdge>(e.clone()) else {
+            dropped.edges += 1;
+            continue;
+        };
         let has = |id: &str| g.nodes.iter().any(|n| n.id == id);
         let repeated_input =
             g.nodes.iter().find(|n| n.id == e.to).is_some_and(|n| input_ports(n).iter().any(|p| p.id == e.to_port && p.many));
         if e.from != e.to && has(&e.from) && has(&e.to) && !e.to_port.is_empty() && (repeated_input || !g.edges.contains(&e)) {
             g.edges.push(e);
+        } else {
+            dropped.edges += 1;
         }
     }
     // A graph with no positions (written by hand or by an agent) is laid out.
     if g.nodes.iter().all(|n| n.x == 0.0 && n.y == 0.0) {
         layout(&mut g);
     }
-    Ok(g)
+    Ok((g, dropped))
 }
 
 /// How one node fared in a run.
