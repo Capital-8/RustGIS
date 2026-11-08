@@ -941,9 +941,10 @@ CRS metadata. Coordinates are used directly, without projection or snapping.
   Every output chain retains its common attributes; no field values are discarded. Each chain of
   joined parts is its own output feature, so a multipart input can become several features.
   Joins are decided among the selected features only, when there is a selection: an unselected
-  part meeting an endpoint neither joins it nor stops a join there. Two parts with equal
-  attributes that share both endpoints join into one closed line when no other considered part
-  ends there.
+  part meeting an endpoint neither joins it nor stops a join there. Two open parts with
+  equal attributes that share both endpoints join into one closed line when no other considered
+  part ends there; a part that is already closed has two ends at its endpoint, so it joins
+  nothing there.
 
 Missing geometries and empty or too-short parts are skipped with a count. If skipping leaves
 no usable output, the tool returns an error. Non-finite coordinates and malformed rows with
@@ -973,7 +974,7 @@ features were checked.
 | Code | What is wrong |
 | --- | --- |
 | `null_geometry` | No geometry, or one without coordinates |
-| `non_finite_coordinate` | A coordinate is not a number or infinite. The row is written without geometry, so it can't spoil the layer's extent |
+| `non_finite_coordinate` | A coordinate is not a number or infinite. The row is written without geometry, so it can't spoil the layer's extent. A ring with one is reported for those coordinates and left out of every other check: its points, its edges' crossings and its containment in other rings |
 | `too_few_points` | A line part with fewer than 2 distinct points, a ring with fewer than 3, or a polygon part without rings |
 | `ring_not_closed` | A ring's last point is not its first |
 | `repeated_vertex` | The same vertex twice in a row (a closed ring's last point doesn't count) |
@@ -982,7 +983,7 @@ features were checked.
 | `rings_intersect` | Two rings of one polygon overlap or touch along a line |
 | `disconnected_interior` | Rings of one polygon touch at points so that they cut its interior into pieces, such as a hole touching the exterior ring at two points, or three holes each touching the next |
 | `parts_overlap` | Two polygons of one multipart feature overlap or touch along a line |
-| `too_complex` | Some of the feature's checks were left out: it needs more work than the tool spends on one feature, there wasn't enough memory to check it, or the geo library's relate operation failed on some of its rings or parts (`detail` says which of the three, not which rings or parts). The checks of each ring's points still run, except in a ring with non-finite coordinates, which is reported for those and skips its other point checks. The tool says how many features each reason left out |
+| `too_complex` | Some of the feature's checks were left out: it needs more work than the tool spends on one feature, there wasn't enough memory to check it, or the geo library's relate operation failed on some of its rings or parts (`detail` says which of the three, not which rings or parts). The checks of each ring's points still run. The tool says how many features each reason left out |
 
 Codes are listed in this order, and are never translated. The checks work in stored
 coordinates, without projection. Lines may cross themselves, so only polygon rings are checked
