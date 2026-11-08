@@ -93,6 +93,16 @@ pub fn gpkg_table(p: &Value, ext: &str) -> Result<GpkgTable, String> {
 /// it again.
 fn report_table(s: &mut Session, path: &str, gpkg: &GpkgTable, table: Option<GpkgWritten>, out: &mut Value) {
     let Some(table) = table else { return };
+    // A new file's table is said only when it isn't the name asked for (a reserved name is
+    // prefixed); one added to or replaced in a file is always named below.
+    if gpkg.mode == GpkgMode::NewFile
+        && let Some(asked) = gpkg.name.as_deref().filter(|n| *n != table.table)
+    {
+        s.notify(
+            format!("{path}: wrote the table {} instead of '{asked}', a name GeoPackage reserves or leaves empty", table.table),
+            false,
+        );
+    }
     if gpkg.mode != GpkgMode::NewFile {
         let (reread, failed) =
             if table.replaced { super::gpkg::reset_sources(s, Path::new(path), &table.table, true) } else { (0, Vec::new()) };
