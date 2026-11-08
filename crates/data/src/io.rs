@@ -3493,7 +3493,7 @@ mod tests {
         assert!(read_bytes("x.shp", &entries[0].1).is_err());
         // Shapefiles past the layer limit are named, not dropped unsaid; at the limit nothing is said.
         let shapefiles = |count: usize| -> Vec<(String, Vec<u8>)> {
-            (0..count).flat_map(|i| entries.iter().take(3).map(move |(n, b)| (format!("s{i:02}.{}", ext(n)), b.clone()))).collect()
+            (0..count).flat_map(|i| entries.iter().take(4).map(move |(n, b)| (format!("s{i:02}.{}", ext(n)), b.clone()))).collect()
         };
         fn ext(n: &str) -> String {
             n.rsplit('.').next().unwrap_or_default().to_ascii_lowercase()
