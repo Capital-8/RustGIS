@@ -399,7 +399,7 @@ fn tell_unloaded(app: &mut RustGisApp) {
         [] => return,
         [(id, reason)] => crate::i18n::fmt(
             "The plugin {id} wasn't loaded: {reason}. Open Plugins › Plugin Manager to see it.",
-            &[("id", id), ("reason", reason)],
+            &[("id", id), ("reason", reason.trim_end_matches('.'))],
         ),
         _ => {
             let ids: Vec<&str> = failed.iter().map(|(id, _)| id.as_str()).collect();
@@ -1303,7 +1303,8 @@ mod tests {
         let listed: Vec<&str> = app.plugins.unloaded.iter().map(|u| u.saved.id.as_str()).collect();
         assert_eq!(listed, ["damaged"]);
         let told: Vec<&str> = app.session.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
-        assert!(told.len() == 1 && told[0].starts_with("The plugin damaged wasn't loaded."), "{told:?}");
+        assert!(told.len() == 1 && told[0].starts_with("The plugin damaged wasn't loaded: "), "{told:?}");
+        assert!(!told[0].contains(".."), "a reason's own full stop isn't doubled: {told:?}");
         assert!(rp::get("restore-new").is_some());
     }
 

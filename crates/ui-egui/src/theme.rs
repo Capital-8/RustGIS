@@ -339,8 +339,7 @@ impl Metrics {
 
     /// Held to what a window draws, and how many values it had to hold.
     pub fn clamped(self) -> (Self, usize) {
-        // A size past f32 is infinite and held at the bound like any other; only NaN has no nearest bound.
-        let fit = |v: f32, lo: f32, hi: f32, otherwise: f32| if v.is_nan() { otherwise } else { v.clamp(lo, hi) };
+        let fit = |v: f32, lo: f32, hi: f32, otherwise: f32| if v.is_finite() { v.clamp(lo, hi) } else { otherwise };
         let std = Metrics::standard();
         let metrics = Metrics {
             item_spacing: [
@@ -1677,9 +1676,9 @@ mod tests {
         assert_eq!(theme.notes.len(), 1, "{:?}", theme.notes);
         assert!(theme.notes[0].contains("5 sizes"), "every held value is counted: {:?}", theme.notes);
 
+        // JSON has no infinity, and a size past f32 is refused when the file is read, not reset.
         json["metrics"]["heading"] = serde_json::json!(1e39);
-        let theme = Theme::parse("Mine", &json.to_string()).expect("it parses");
-        assert_eq!(theme.metrics.heading, 60.0, "a size past f32 is held at the bound, not reset");
+        assert!(Theme::parse("Mine", &json.to_string()).is_err());
     }
 
     /// Radius clamping and rounding are counted, while an exact supported radius stays quiet.
