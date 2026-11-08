@@ -397,7 +397,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         // Said with the layer it happened in, which may be the only one added.
         if kind.lost > 0 {
             rep.messages.push(format!(
-                "{}: {} rings or parts of geometries were left out: too few points, unreadable coordinates, or an exterior ring past the first",
+                "{}: {} rings or parts of geometries were left out: too few points, unreadable coordinates, a polygon with no exterior ring, or an exterior ring past the first",
                 ds.name, kind.lost
             ));
         }
@@ -548,6 +548,17 @@ mod tests {
             "{:?}",
             layers[1].1.messages
         );
+
+        // A surface's polygon with only an interior ring is left out and counted once.
+        let gml = r#"<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:app="http://example.com/app">
+<wfs:member><app:parcels gml:id="p.1"><app:geom><gml:MultiSurface srsName="EPSG:4326">
+  <gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing><gml:posList>10 48 11 48 11 49 10 48</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember>
+  <gml:surfaceMember><gml:Polygon><gml:interior><gml:LinearRing><gml:posList>10 48 11 48 11 49 10 48</gml:posList></gml:LinearRing></gml:interior></gml:Polygon></gml:surfaceMember>
+</gml:MultiSurface></app:geom></app:parcels></wfs:member>
+</wfs:FeatureCollection>"#;
+        let layers = read("hole.gml", gml.as_bytes()).unwrap();
+        let said: Vec<&String> = layers[0].1.messages.iter().filter(|m| m.contains("rings or parts")).collect();
+        assert!(said.len() == 1 && said[0].contains(": 1 rings") && said[0].contains("no exterior ring"), "{said:?}");
     }
 
     #[test]
