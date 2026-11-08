@@ -1661,7 +1661,8 @@ pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
         .filter(|(_, r)| r.band_count() > nb)
         .take(5)
         .map(|(name, r)| {
-            let bands = ((nb + 1)..=r.band_count()).map(|b| b.to_string()).collect::<Vec<_>>().join(", ");
+            // A range, however many bands: a one-band reality mosaic can leave out thousands.
+            let bands = if r.band_count() == nb + 1 { (nb + 1).to_string() } else { format!("{}–{}", nb + 1, r.band_count()) };
             format!("'{name}': band(s) {bands}")
         })
         .collect();
