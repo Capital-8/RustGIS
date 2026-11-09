@@ -344,18 +344,42 @@ fn resolve_sources(style: &mut Style, spec: &Spec, base: &str) -> Result<Option<
     let mut pending = false;
     let mut left_out = Vec::new();
     let mut waiting = false;
-    let missing: Vec<&str> = style
+    let skipped: Vec<&str> = style
         .layers
         .iter()
-        .filter(|l| l.kind != LayerKind::Background && l.source.as_deref().is_none_or(|id| style.source(id).is_none()))
+        .filter(|l| {
+            l.kind != LayerKind::Background
+                && l.source.as_deref().is_none_or(|id| style.source(id).is_none_or(|source| matches!(source, Source::Other)))
+        })
         .map(|l| l.id.as_str())
         .collect();
-    if !missing.is_empty() {
-        left_out.push(format!(
-            "{} style layer(s) skipped because their source is missing or undefined: {}",
-            missing.len(),
-            missing.join(", ")
-        ));
+    if !skipped.is_empty() {
+        // A drawing copies these diagnostics: bound both the number of names and each name's
+        // length, even when a hostile document gives one enormous id. Keep the total exact.
+        const MAX_NAMES: usize = 16;
+        const MAX_NAME_CHARS: usize = 80;
+        let mut shortened = false;
+        let mut names = skipped
+            .iter()
+            .take(MAX_NAMES)
+            .map(|id| {
+                let mut label: String = id.chars().take(MAX_NAME_CHARS).collect();
+                if id.chars().nth(MAX_NAME_CHARS).is_some() {
+                    label.push('…');
+                    shortened = true;
+                }
+                label
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if skipped.len() > MAX_NAMES {
+            names.push_str(&format!(", … ({} more)", skipped.len() - MAX_NAMES));
+        }
+        if shortened {
+            names.push_str(" (names shortened)");
+        }
+        left_out
+            .push(format!("{} style layer(s) skipped because their source is missing, undefined or unsupported: {names}", skipped.len()));
     }
     for (id, src) in &mut style.sources {
         let resolved = resolve_source(src, spec, base).and_then(|pending| match src {
@@ -781,7 +805,8 @@ mod tests {
         let base = "https://t.example.com/style.json";
         let notes = |layers: serde_json::Value| {
             let mut style = Style::parse(&serde_json::json!({"version": 8,
-                "sources": {"s": {"type": "vector", "tiles": ["https://t.example.com/{z}/{x}/{y}.pbf"]}},
+                "sources": {"s": {"type": "vector", "tiles": ["https://t.example.com/{z}/{x}/{y}.pbf"]},
+                    "unsupported": {"type": "geojson", "data": {"type": "FeatureCollection", "features": []}}},
                 "layers": layers}))
             .unwrap();
             resolve_sources(&mut style, &spec(Kind::Style, base), base).unwrap().unwrap().left_out
@@ -797,11 +822,22 @@ mod tests {
             let said = notes(serde_json::json!([
                 {"id": "absent", "type": kind},
                 {"id": "unknown", "type": kind, "source": "missing"},
+                {"id": "unsupported", "type": kind, "source": "unsupported"},
                 {"id": "valid", "type": "line", "source": "s"},
                 {"id": "bg", "type": "background"}
             ]));
-            assert_eq!(said, ["2 style layer(s) skipped because their source is missing or undefined: absent, unknown"], "{kind}");
+            assert_eq!(
+                said,
+                ["3 style layer(s) skipped because their source is missing, undefined or unsupported: absent, unknown, unsupported"],
+                "{kind}"
+            );
         }
+        let long = "名".repeat(2000);
+        let layers: Vec<_> = (0..20).map(|i| json!({"id": format!("{i}-{long}"), "type": "line"})).collect();
+        let said = notes(json!(layers)).join("; ");
+        assert!(said.starts_with("20 style layer(s) skipped"), "{said}");
+        assert!(said.contains("4 more") && said.contains("names shortened"), "{said}");
+        assert!(said.len() < 6000, "diagnostic must not copy every full layer name: {} bytes", said.len());
     }
 
     #[test]

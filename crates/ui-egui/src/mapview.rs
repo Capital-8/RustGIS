@@ -1188,7 +1188,12 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         // In a picture, for the camera it was drawn for: the picture moves them with the rest (a
         // basemap zoomed in past what f32 holds is such a picture, under the tiles).
         let (live_frame, live_pending) = match gf.live_frame(if picture { app.map.tex_camera } else { cam }) {
-            Some((f, pending, declined)) => {
+            Some((mut f, pending, declined)) => {
+                for error in f.tile_errors.drain(..) {
+                    if app.map.tile_errors.insert(error.clone()) {
+                        app.session.notify(error, true);
+                    }
+                }
                 // A layer no longer drawn live (its style turned out to draw more than raster
                 // tiles): the map is drawn again, as tiles arriving would draw it.
                 if declined && app.map.live_rev.take().is_some() {
