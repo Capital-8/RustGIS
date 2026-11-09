@@ -954,11 +954,16 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
 
 /// GeoTIFF bytes of a raster layer (band is 1-based; RGB rasters keep their colour bands; `cog`
 /// makes it a cloud-optimised one).
-pub fn geotiff_bytes(s: &Session, p: &Value) -> Result<(String, Vec<u8>), String> {
+pub fn geotiff_bytes(s: &mut Session, p: &Value) -> Result<(String, Vec<u8>), String> {
     let (_, r) = get(s, p)?;
     let bi = band(p, "band", &r)?.unwrap_or(0);
-    let bytes = if b(p, "cog") == Some(true) { raster::cogwrite::write(&r, bi) } else { raster::geotiff::write(&r, bi) };
-    Ok((r.name.clone(), bytes.map_err(|e| e.to_string())?))
+    let cog = b(p, "cog") == Some(true);
+    let bytes = if cog { raster::cogwrite::write(&r, bi) } else { raster::geotiff::write(&r, bi) }.map_err(|e| e.to_string())?;
+    let note = geotiff_note(&r, bi, cog)?;
+    if !note.is_empty() {
+        s.notify(format!("Exported {}.tif{note}", r.name), false);
+    }
+    Ok((r.name.clone(), bytes))
 }
 
 /// `share.exportRaster`'s inputs, and the work that writes the raster as a GeoTIFF (a
@@ -994,17 +999,43 @@ pub(super) fn write_geotiff(r: &Raster, bi: usize, cog: bool, path: &str) -> Res
         rustgis_data::io::write_atomic(Path::new(path), &bytes).map_err(|e| format!("{path}: {e}"))?;
         None
     };
+    let note = geotiff_note(r, bi, cog.is_some())?;
+    let mut v = match r.overview {
+        Some((fw, fh)) => json!({"path": path, "width": r.width, "height": r.height, "overviewOf": [fw, fh]}),
+        None => json!({"path": path}),
+    };
+    if let (Some(o), Some(c)) = (v.as_object_mut(), cog) {
+        o.insert("cog".into(), json!({"overviews": c.levels.len().saturating_sub(1), "bigTiff": c.big, "bytes": c.bytes}));
+    }
+    Ok(super::exports::Wrote {
+        answer: v,
+        notes: vec![format!("Exported {path}{note}")],
+        written_path: Some(path.to_string()),
+        then: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        owner: None,
+    })
+}
+
+/// Writes a tool's raster file and reports the same export notes as `share.exportRaster`.
+pub(super) fn write_and_report(s: &mut Session, r: &Raster, bi: usize, cog: bool, path: &str) -> Result<Value, String> {
+    let wrote = write_geotiff(r, bi, cog, path)?;
+    for note in wrote.notes {
+        s.notify(note, false);
+    }
+    Ok(wrote.answer)
+}
+
+/// What the selected GeoTIFF writer keeps, changes or leaves out, shared by files and downloads.
+fn geotiff_note(r: &Raster, bi: usize, cog: bool) -> Result<String, String> {
     let mut note = match r.overview {
         Some((fw, fh)) => format!(" (the {} × {} overview of the {fw} × {fh} raster)", r.width, r.height),
         None => String::new(),
     };
     // Values changed when the file was read are written as they are held: those of the bands the
     // writer writes, as it chooses them.
-    let bands = if cog.is_some() {
-        raster::cogwrite::written_bands(r, bi).map_err(|e| e.to_string())?
-    } else {
-        raster::geotiff::written_bands(r, bi)
-    };
+    let bands =
+        if cog { raster::cogwrite::written_bands(r, bi).map_err(|e| e.to_string())? } else { raster::geotiff::written_bands(r, bi) };
     let written: u64 = bands.iter().filter_map(|b| r.rounded.get(*b)).sum();
     if written > 0 {
         let (values, verb) = values_were(written);
@@ -1035,21 +1066,7 @@ pub(super) fn write_geotiff(r: &Raster, bi: usize, cog: bool, path: &str) -> Res
     if spaced > 0 {
         note.push_str(&format!("; {spaced} band or class name(s) held control characters, written as spaces"));
     }
-    let mut v = match r.overview {
-        Some((fw, fh)) => json!({"path": path, "width": r.width, "height": r.height, "overviewOf": [fw, fh]}),
-        None => json!({"path": path}),
-    };
-    if let (Some(o), Some(c)) = (v.as_object_mut(), cog) {
-        o.insert("cog".into(), json!({"overviews": c.levels.len().saturating_sub(1), "bigTiff": c.big, "bytes": c.bytes}));
-    }
-    Ok(super::exports::Wrote {
-        answer: v,
-        notes: vec![format!("Exported {path}{note}")],
-        written_path: Some(path.to_string()),
-        then: None,
-        #[cfg(not(target_arch = "wasm32"))]
-        owner: None,
-    })
+    Ok(note)
 }
 
 /// Pixel values of the topmost visible raster under a longitude/latitude point.

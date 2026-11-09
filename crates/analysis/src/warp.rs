@@ -635,7 +635,7 @@ impl Canvas {
         }
     }
 
-    /// The output raster on `g`, its bands named as the source's.
+    /// The output raster on `g`, keeping the source's band labels, class names and credits.
     fn finish(&self, r: &Raster, g: &Grid, bands: Vec<Vec<f32>>, name: String) -> Result<Raster, String> {
         let mut out = Raster::new(
             name,
@@ -651,7 +651,11 @@ impl Canvas {
         .map_err(|e| e.to_string())?;
         for (i, band) in out.bands.iter_mut().enumerate() {
             band.name = r.bands.get(i).map_or_else(|| "Alpha".to_string(), |b| b.name.clone());
+            if let Some(source) = r.bands.get(i) {
+                band.classes = source.classes.clone();
+            }
         }
+        out.copyright = r.copyright.clone();
         Ok(out)
     }
 }

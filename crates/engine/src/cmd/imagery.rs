@@ -340,10 +340,9 @@ fn warp_to_fit(s: &mut Session, p: &Value, layer: &str, r: &Raster) -> CmdResult
     // A file written is the layer's source; without one the pixels are kept in the project.
     let rl = match &path {
         Some(path) => {
-            let cog =
-                rustgis_data::raster::cogwrite::write_file(&out, 0, std::path::Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
+            let wrote = super::raster::write_and_report(s, &out, 0, true, path)?;
             info["path"] = json!(path);
-            info["cog"] = json!({"overviews": cog.levels.len().saturating_sub(1), "bigTiff": cog.big, "bytes": cog.bytes});
+            info["cog"] = wrote.get("cog").cloned().unwrap_or(Value::Null);
             let e = out.extent();
             info["extent"] = json!([e.min_x, e.min_y, e.max_x, e.max_y]);
             RasterLayer::from_path(out, path.clone())
@@ -607,10 +606,9 @@ fn add_output(s: &mut Session, out: Raster, path: Option<String>, classes: bool,
     // A file written is the layer's source; without one the pixels are kept in the project.
     let mut rl = match &path {
         Some(path) => {
-            let cog =
-                rustgis_data::raster::cogwrite::write_file(&out, 0, std::path::Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
+            let wrote = super::raster::write_and_report(s, &out, 0, true, path)?;
             info["path"] = json!(path);
-            info["cog"] = json!({"overviews": cog.levels.len().saturating_sub(1), "bigTiff": cog.big, "bytes": cog.bytes});
+            info["cog"] = wrote.get("cog").cloned().unwrap_or(Value::Null);
             RasterLayer::from_path(out, path.clone())
         }
         None => layer_of(out)?,
@@ -1287,6 +1285,17 @@ fn raster_mosaic(s: &mut Session, p: &Value) -> CmdResult {
         o.name = i.name.clone();
         o.classes = i.classes.clone();
     });
+    out.copyright = first.copyright.clone();
+    // The first input's metadata accompanies its pixels; report other credits rather than
+    // silently dropping them or attributing every input to the first one's owner.
+    super::raster::say_losses(
+        s,
+        rs.iter()
+            .skip(1)
+            .filter(|r| r.copyright.is_some() && r.copyright != first.copyright)
+            .map(|r| (r.name.clone(), "its copyright differs from the first input's and is not kept in the mosaic".to_string()))
+            .collect(),
+    );
     // Cells rounded when an input was read may be among those the mosaic keeps.
     out.keep_rounded_marks(rs.iter().map(|r| &**r));
     let other: Vec<&str> = rs
@@ -1300,8 +1309,7 @@ fn raster_mosaic(s: &mut Session, p: &Value) -> CmdResult {
     }
     let path = ps(p, "path").map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
     if let Some(path) = &path {
-        let bytes = rustgis_data::raster::geotiff::write(&out, 0).map_err(|e| e.to_string())?;
-        rustgis_data::io::write_atomic(std::path::Path::new(path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+        super::raster::write_and_report(s, &out, 0, false, path)?;
     }
     let mut v = add(s, out, false)?;
     if let (Some(o), Some(path)) = (v.as_object_mut(), path) {

@@ -16002,6 +16002,114 @@ fn rounded_raster_values_are_said_on_import_and_export() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Downloads and files made by mosaic/warp report the rounded values they actually write.
+#[test]
+fn raster_download_mosaic_and_warp_report_export_losses() {
+    let dir = std::env::temp_dir().join(format!("rustgis-raster-export-notes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, values, rounded) in [("rounded", "16777217 100000001\n1234567.891 7", true), ("clean", "1 2\n3 4", false)] {
+        let mut s = Session::new(Project::default());
+        let path = dir.join(format!("{name}.asc"));
+        std::fs::write(&path, format!("ncols 2\nnrows 2\nxllcorner 10\nyllcorner 40\ncellsize 1\n{values}")).unwrap();
+        let id = s.run("layer.addData", &json!({"path": path, "name": name})).unwrap()["layer"].as_u64().unwrap();
+        for cog in [false, true] {
+            let mark = s.notice_mark();
+            let (_, bytes) = crate::cmd::raster::geotiff_bytes(&mut s, &json!({"layer": id, "cog": cog})).unwrap();
+            assert_eq!(rustgis_data::raster::read_bytes("download.tif", &bytes).unwrap().width, 2);
+            let notes = s.notices_since(mark);
+            assert_eq!(
+                notes.iter().filter(|n| n.text.contains("3 values in it were rounded to 32-bit floats")).count(),
+                usize::from(rounded),
+                "download, cog={cog}: {notes:?}"
+            );
+        }
+        let points = [[0, 0, 10, 42], [2, 0, 12, 42], [0, 2, 10, 40]];
+        for (command, mut params) in [
+            ("raster.mosaic", json!({"inputs": [name, name], "name": "mosaic"})),
+            ("raster.georeference", json!({"layer": name, "transform": "affine", "points": points, "name": "warped"})),
+        ] {
+            let output = dir.join(format!("{name}-{command}.tif"));
+            params["path"] = json!(output);
+            let mark = s.notice_mark();
+            s.run(command, &params).unwrap();
+            assert!(rustgis_data::raster::read_path(&output).is_ok());
+            let notes = s.notices_since(mark);
+            assert_eq!(
+                notes.iter().filter(|n| n.text.contains("some values in it may have been rounded to 32-bit floats")).count(),
+                usize::from(rounded),
+                "{command}: {notes:?}"
+            );
+            assert!(!notes.iter().any(|n| n.text.contains("3 values in it")), "{command}: {notes:?}");
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Metadata limits are reported from downloads, mosaics and warped files, with the files checked.
+#[test]
+fn raster_export_paths_report_band_class_and_credit_changes() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let dir = std::env::temp_dir().join(format!("rustgis-raster-export-metadata-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::new(Project::default());
+    let gt = GeoTransform { origin_x: 10.0, origin_y: 42.0, pixel_width: 1.0, pixel_height: -1.0 };
+    let mut r =
+        Raster::new("Metadata", 2, 2, vec![vec![1.0; 4]; 5], gt, Crs::LonLat, None, ColorHint::Rgb { alpha: false }, "Float32").unwrap();
+    r.bands[0].name = "red\u{1}name".into();
+    r.bands[0].classes = vec!["zero".into(), "one\u{2}name".into()];
+    r.bands[1].classes = vec!["zero".into(), "green class".into()];
+    r.copyright = Some("© Owner".into());
+    let mut other = r.clone();
+    other.name = "Other".into();
+    other.copyright = Some("Another owner".into());
+    let bytes = geotiff::write(&r, 0).unwrap();
+    crate::cmd::raster::add_raster(&mut s, "Metadata", rustgis_map::RasterLayer::from_bytes(r, "metadata.tif", bytes)).unwrap();
+    let bytes = geotiff::write(&other, 0).unwrap();
+    crate::cmd::raster::add_raster(&mut s, "Other", rustgis_map::RasterLayer::from_bytes(other, "other.tif", bytes)).unwrap();
+    let check = |s: &Session, mark, bytes: &[u8]| {
+        let notes = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect::<Vec<_>>().join("\n");
+        for text in [
+            "3 of its 5 bands written",
+            "class names of band(s) 2 aren't written",
+            "Copyright tag holds ASCII",
+            "2 band or class name(s) held control characters",
+        ] {
+            assert!(notes.contains(text), "missing {text}: {notes}");
+        }
+        let written = rustgis_data::raster::read_bytes("written.tif", bytes).unwrap();
+        assert_eq!(written.band_count(), 3);
+        assert_eq!(written.bands[0].name, "red name");
+        assert_eq!(written.bands[0].classes, ["zero", "one name"]);
+        assert_eq!(written.copyright.as_deref(), Some("(c) Owner"));
+    };
+    for cog in [false, true] {
+        let mark = s.notice_mark();
+        let (_, bytes) = crate::cmd::raster::geotiff_bytes(&mut s, &json!({"layer": "Metadata", "cog": cog})).unwrap();
+        check(&s, mark, &bytes);
+    }
+    let points = [[0, 0, 10, 42], [2, 0, 12, 42], [0, 2, 10, 40]];
+    for (cmd, mut params) in [
+        ("raster.mosaic", json!({"inputs": ["Metadata", "Metadata"], "name": "mosaic"})),
+        (
+            "raster.georeference",
+            json!({"layer": "Metadata", "transform": "affine", "points": points, "resampling": "nearest", "name": "warped"}),
+        ),
+    ] {
+        let path = dir.join(format!("{cmd}.tif"));
+        params["path"] = json!(path);
+        let mark = s.notice_mark();
+        s.run(cmd, &params).unwrap();
+        check(&s, mark, &std::fs::read(path).unwrap());
+    }
+    for (second, changed) in [("Metadata", false), ("Other", true)] {
+        let mark = s.notice_mark();
+        let out = s.run("raster.mosaic", &json!({"inputs": ["Metadata", second], "name": "rights"})).unwrap();
+        assert_eq!(out_raster(&s, &out).copyright.as_deref(), Some("© Owner"));
+        assert_eq!(s.notices_since(mark).iter().any(|n| n.text.contains("copyright differs")), changed, "{:?}", s.notices_since(mark));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A raster clipped, resampled, mosaicked, warped or pixel-edited from one with values rounded when it
 /// was read keeps a mark
 /// of them, with no count (it holds an unknown share), and its export says so; one made from a
