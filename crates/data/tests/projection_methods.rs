@@ -1,6 +1,6 @@
 //! Projection methods read from a Shapefile's `.prj` and from a GeoTIFF's GeoKeys, through the
-//! public readers: sinusoidal, Robinson, orthographic, Mercator (variant A) and the ellipsoidal
-//! equidistant cylindrical of EPSG:4087. Each places a point where the published formulas say,
+//! public readers: sinusoidal, Robinson, orthographic, Mercator (variant A) and the
+//! PROJ-compatible equidistant cylindrical of EPSG:4087. Each places a point where expected,
 //! and a method that still isn't supported keeps saying so.
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -254,10 +254,8 @@ fn mercator_variant_a() {
     written_back(&r);
 }
 
-/// EPSG:4087, WGS 84 / World Equidistant Cylindrical, is ellipsoidal (EPSG method 1028): a point
-/// on 45°N is 4 984 944.378 m north of the equator, the meridian's length, not the 5 009 377.086 m
-/// of a sphere of WGS 84's semi-major axis (24 km more), which is where it was read before. The
-/// EPSG Guidance Note 7-2's example puts 55°N 10°E at E = 1 113 194.91 m, N = 6 097 230.31 m.
+/// EPSG:4087 matches PROJ/GDAL's sphere of WGS 84's semi-major axis. Coordinates from PROJ
+/// 9.7.1 are read at the same latitude from both a Shapefile and a GeoTIFF.
 #[test]
 fn equidistant_cylindrical_epsg_4087() {
     let esri = format!(
@@ -266,21 +264,22 @@ fn equidistant_cylindrical_epsg_4087() {
     let coded = esri.strip_suffix(']').unwrap().to_string() + r#",AUTHORITY["EPSG",4087]]"#;
     for prj in [&esri, &coded] {
         // Within a centimetre (1e-7° is 1.1 cm of latitude).
-        let (at, messages) = read_prj(prj, 0.0, 4_984_944.378);
+        let (at, messages) = read_prj(prj, 0.0, 5_009_377.085_697_311);
         near(at, 0.0, 45.0, 1e-7);
         clean(&messages);
-        let (at, _) = read_prj(prj, 1_113_194.91, 6_097_230.31);
+        let (at, _) = read_prj(prj, 1_113_194.907_932_735_7, 6_122_571.993_630_046);
         near(at, 10.0, 55.0, 1e-7);
     }
     assert_eq!(rustgis_data::raster::wkt::crs_from_wkt(&coded), Ok(Crs::Epsg(4087)));
     // A GeoTIFF with user-defined keys (coordinate transformation 17) on WGS 84, and one by its
     // EPSG code.
-    let user_defined = tiff(17, &[], None, (1_113_194.91, 6_097_230.31));
+    let user_defined = tiff(17, &[], None, (1_113_194.907_932_735_7, 6_122_571.993_630_046));
     let (r, at) = read_tiff(&user_defined);
     assert!(matches!(r.crs, Crs::Custom(_)), "{:?}", r.crs);
     near(Some(at), 10.0, 55.0, 1e-7);
     written_back(&r);
-    let gt = rustgis_data::raster::GeoTransform { origin_x: 0.0, origin_y: 4_984_944.378, pixel_width: 1000.0, pixel_height: -1000.0 };
+    let gt =
+        rustgis_data::raster::GeoTransform { origin_x: 0.0, origin_y: 5_009_377.085_697_311, pixel_width: 1000.0, pixel_height: -1000.0 };
     let r =
         Raster::new("e", 2, 2, vec![vec![1.0; 4]], gt, Crs::Epsg(4087), None, rustgis_data::raster::ColorHint::Gray, "Float32").unwrap();
     let (back, at) = read_tiff(&rustgis_data::raster::geotiff::write(&r, 0).unwrap());

@@ -96,10 +96,11 @@ Mercator in its azimuth forms (the two-point form, with no azimuth, is refused),
 Cassini-Soldner, polyconic and Equal Earth methods are supported from their parameters, as are sinusoidal (MODIS), Robinson, orthographic and Mercator (variant A), in `.prj`
 files and in GeoTIFF keys. Esri's orthographic is a spherical projection: on an ellipsoid it is
 refused, with a notice, rather than computed as EPSG's ellipsoidal one. The equidistant
-cylindrical projection (EPSG:4087, World Equidistant Cylindrical) is computed on its ellipsoid,
-as EPSG defines it, not on a sphere, both for data and for a map drawn in it (as is the
-Equirectangular preset). An ellipsoid flatter than about 1/100, such as Jupiter's or Saturn's, is
-refused in it rather than approximated.
+cylindrical projection (EPSG:4087, World Equidistant Cylindrical) uses a sphere of its datum's
+semi-major axis, matching PROJ and GDAL, both for data and for a map drawn in it (including the
+Equirectangular preset). This also applies to planetary Equirectangular systems and definitions
+that name EPSG method 1028. The datum's ellipsoid is retained for datum transformations and
+exported coordinate system definitions.
 
 Shapefile text uses a supported `.cpg` encoding, otherwise the `.dbf` code page, with UTF-8 as
 the fallback. Keep the sidecar files together.

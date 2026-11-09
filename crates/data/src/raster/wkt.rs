@@ -1189,8 +1189,8 @@ pub fn to_wkt(crs: Crs) -> Option<String> {
     let ellps = text("ellps").or(datum.map(|d| d.2));
     let known = ellps.and_then(|e| ELLIPSOIDS.iter().find(|r| r.0.eq_ignore_ascii_case(e)));
     let ellps_name = known.map_or("unnamed", |r| r.1);
-    // proj4rs computes `eqc` on a sphere of the semi-major axis and gives that sphere, but RustGIS
-    // computes it on the datum's ellipsoid (`crs::ellipsoidal_eqc`), the one written here.
+    // proj4rs computes `eqc` on a sphere of the semi-major axis and gives that sphere. Keep the
+    // datum's original ellipsoid in the definition, as PROJ/GDAL do.
     let (a, b) = match text("proj") {
         Some("eqc") => super::crs::eqc_geographic(&def).ok()?.ellipse_parameters(),
         _ => proj.ellipse_parameters(),
