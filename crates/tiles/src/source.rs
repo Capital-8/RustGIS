@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use web_time::Instant;
 
 use crate::cache::{self, Payload, State, Want};
-use crate::style::{Source, Style};
+use crate::style::{LayerKind, Source, Style};
 use crate::{address, cog, mbtiles, pmtiles, template};
 
 /// The kind of address.
@@ -344,6 +344,19 @@ fn resolve_sources(style: &mut Style, spec: &Spec, base: &str) -> Result<Option<
     let mut pending = false;
     let mut left_out = Vec::new();
     let mut waiting = false;
+    let missing: Vec<&str> = style
+        .layers
+        .iter()
+        .filter(|l| l.kind != LayerKind::Background && l.source.as_deref().is_none_or(|id| style.source(id).is_none()))
+        .map(|l| l.id.as_str())
+        .collect();
+    if !missing.is_empty() {
+        left_out.push(format!(
+            "{} style layer(s) skipped because their source is missing or undefined: {}",
+            missing.len(),
+            missing.join(", ")
+        ));
+    }
     for (id, src) in &mut style.sources {
         let resolved = resolve_source(src, spec, base).and_then(|pending| match src {
             Source::RasterDem { tiles, encoding, .. } if !pending => {
@@ -761,6 +774,34 @@ mod tests {
         assert!(matches!(resolve(&spec(Kind::Raster, "http://169.254.169.254/{z}/{x}/{y}.png")), Resolve::Failed(_)));
         // A self-hosted server the user names is fine.
         assert!(matches!(resolve(&spec(Kind::Raster, "http://localhost:8080/{z}/{x}/{y}.png")), Resolve::Ready(_)));
+    }
+
+    #[test]
+    fn layers_without_a_defined_source_are_counted_and_named() {
+        let base = "https://t.example.com/style.json";
+        let notes = |layers: serde_json::Value| {
+            let mut style = Style::parse(&serde_json::json!({"version": 8,
+                "sources": {"s": {"type": "vector", "tiles": ["https://t.example.com/{z}/{x}/{y}.pbf"]}},
+                "layers": layers}))
+            .unwrap();
+            resolve_sources(&mut style, &spec(Kind::Style, base), base).unwrap().unwrap().left_out
+        };
+        assert!(
+            notes(serde_json::json!([
+                {"id": "bg", "type": "background"},
+                {"id": "roads", "type": "line", "source": "s"}
+            ]))
+            .is_empty()
+        );
+        for kind in ["fill", "line", "circle", "symbol", "raster", "hillshade", "color-relief", "fill-extrusion", "heatmap"] {
+            let said = notes(serde_json::json!([
+                {"id": "absent", "type": kind},
+                {"id": "unknown", "type": kind, "source": "missing"},
+                {"id": "valid", "type": "line", "source": "s"},
+                {"id": "bg", "type": "background"}
+            ]));
+            assert_eq!(said, ["2 style layer(s) skipped because their source is missing or undefined: absent, unknown"], "{kind}");
+        }
     }
 
     #[test]
