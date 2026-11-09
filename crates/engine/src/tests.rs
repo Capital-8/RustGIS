@@ -16110,6 +16110,98 @@ fn raster_export_paths_report_band_class_and_credit_changes() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Class labels describe source values; interpolating or averaging those values drops the labels
+/// with a notice, while nearest, mode and palette-safe sampling retain them.
+#[test]
+fn raster_resampling_class_names_follow_the_values_and_report_losses() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let dir = std::env::temp_dir().join(format!("rustgis-resampled-classes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::new(Project::default());
+    let labels: Vec<String> = ["unknown", "one", "two", "water", "snow", "forest"].map(str::to_owned).to_vec();
+    let gt = GeoTransform { origin_x: 10.0, origin_y: 42.0, pixel_width: 1.0, pixel_height: -1.0 };
+    for (name, color, labelled, data_type) in [
+        ("Classes", ColorHint::Gray, true, "Float32"),
+        ("Palette", ColorHint::Palette((0..6).map(|i| [i * 30, 0, 0, 255]).collect()), true, "UInt8"),
+        ("Clean", ColorHint::Gray, false, "Float32"),
+    ] {
+        let mut r = Raster::new(name, 2, 2, vec![vec![3.0, 5.0, 5.0, 3.0]], gt, Crs::LonLat, None, color, data_type).unwrap();
+        if labelled {
+            r.bands[0].classes = labels.clone();
+        }
+        let bytes = geotiff::write(&r, 0).unwrap();
+        crate::cmd::raster::add_raster(&mut s, name, rustgis_map::RasterLayer::from_bytes(r, format!("{name}.tif"), bytes)).unwrap();
+    }
+    let points = [[0, 0, 10, 42], [2, 0, 12, 42], [0, 2, 10, 40]];
+    let params = |cmd: &str, layer: &str| {
+        if cmd == "raster.georeference" {
+            json!({"layer":layer, "transform":"affine", "points":points, "cellSize":0.5})
+        } else {
+            json!({"layer":layer, "crs":4326, "extent":[10,40,12,42], "cellSize":2})
+        }
+    };
+    let lost = |n: &&crate::Notice| n.text.contains("class names of") && n.text.contains("not kept under");
+    for (cmd, requested, method, keep) in [
+        ("raster.georeference", None, "bilinear", false),
+        ("raster.georeference", Some("nearest"), "nearest", true),
+        ("raster.georeference", Some("cubic"), "cubic", false),
+        ("raster.project", Some("nearest"), "nearest", true),
+        ("raster.project", Some("bilinear"), "bilinear", false),
+        ("raster.project", Some("cubic"), "cubic", false),
+        ("raster.project", Some("average"), "average", false),
+        ("raster.project", Some("mode"), "mode", true),
+    ] {
+        for file in [false, true] {
+            let mut p = params(cmd, "Classes");
+            p["name"] = json!(format!("{cmd}-{method}-{file}"));
+            if let Some(method) = requested {
+                p["resampling"] = json!(method);
+            }
+            let path = dir.join(format!("{cmd}-{method}.tif"));
+            if file {
+                p["path"] = json!(path);
+            }
+            let mark = s.notice_mark();
+            let answer = s.run(cmd, &p).unwrap();
+            let out = out_raster(&s, &answer);
+            if keep {
+                assert_eq!(out.bands[0].classes, labels, "{cmd}/{method}");
+            } else {
+                assert!(out.bands[0].classes.is_empty(), "{cmd}/{method}: labels no longer describe the values");
+                assert!(out.bands[0].data.iter().any(|v| v.is_finite() && *v != 3.0 && *v != 5.0), "{cmd}/{method}: values really mixed");
+            }
+            let notes: Vec<_> = s.notices_since(mark).iter().filter(lost).collect();
+            assert_eq!(notes.len(), usize::from(!keep), "{cmd}/{method}: {:?}", s.notices_since(mark));
+            if !keep {
+                assert!(notes[0].text.contains("1 band(s) (1)") && notes[0].text.contains(method), "{:?}", notes[0]);
+            }
+            if file {
+                let written = rustgis_data::raster::read_bytes("written.tif", &std::fs::read(path).unwrap()).unwrap();
+                assert_eq!(written.bands[0].classes, out.bands[0].classes);
+            }
+        }
+    }
+    // Palette requests use value-preserving methods, and report the effective method.
+    for (cmd, requested, effective) in
+        [("raster.georeference", "bilinear", "nearest"), ("raster.project", "bilinear", "nearest"), ("raster.project", "average", "mode")]
+    {
+        let mut p = params(cmd, "Palette");
+        p["name"] = json!(format!("palette-{cmd}-{requested}"));
+        p["resampling"] = json!(requested);
+        let mark = s.notice_mark();
+        let answer = s.run(cmd, &p).unwrap();
+        assert_eq!(answer["resampling"], effective);
+        assert_eq!(out_raster(&s, &answer).bands[0].classes, labels);
+        assert!(!s.notices_since(mark).iter().any(|n| lost(&n)));
+    }
+    for cmd in ["raster.georeference", "raster.project"] {
+        let mark = s.notice_mark();
+        s.run(cmd, &params(cmd, "Clean")).unwrap();
+        assert!(!s.notices_since(mark).iter().any(|n| lost(&n)));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A raster clipped, resampled, mosaicked, warped or pixel-edited from one with values rounded when it
 /// was read keeps a mark
 /// of them, with no count (it holds an unknown share), and its export says so; one made from a

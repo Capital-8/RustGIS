@@ -635,8 +635,8 @@ impl Canvas {
         }
     }
 
-    /// The output raster on `g`, keeping the source's band labels, class names and credits.
-    fn finish(&self, r: &Raster, g: &Grid, bands: Vec<Vec<f32>>, name: String) -> Result<Raster, String> {
+    /// The output on `g`, keeping band labels and credits, and class names when values are preserved.
+    fn finish(&self, r: &Raster, g: &Grid, bands: Vec<Vec<f32>>, method: Method, name: String) -> Result<Raster, String> {
         let mut out = Raster::new(
             name,
             g.width as u32,
@@ -651,7 +651,9 @@ impl Canvas {
         .map_err(|e| e.to_string())?;
         for (i, band) in out.bands.iter_mut().enumerate() {
             band.name = r.bands.get(i).map_or_else(|| "Alpha".to_string(), |b| b.name.clone());
-            if let Some(source) = r.bands.get(i) {
+            if matches!(method, Method::Sample(Resampling::Nearest) | Method::Mode)
+                && let Some(source) = r.bands.get(i)
+            {
                 band.classes = source.classes.clone();
             }
         }
@@ -760,7 +762,7 @@ fn sampled(
     let sampler = Sampler { r, method, alpha: canvas.alpha_src, round: !r.data_type.starts_with("Float") };
     let mut bands = canvas.bands(ow, oh)?;
     if ow == 0 {
-        return canvas.finish(r, g, bands, name);
+        return canvas.finish(r, g, bands, Method::Sample(method), name);
     }
     let x_at = |ox: usize| g.min_x + (ox as f64 + 0.5) * g.cell_x;
     // A cell's work in `MIN_ROW_WORK`'s units (some 30 ns): its pixels read per band, and its
@@ -791,7 +793,7 @@ fn sampled(
             }
         },
     )?;
-    canvas.finish(r, g, bands, name)
+    canvas.finish(r, g, bands, Method::Sample(method), name)
 }
 
 /// `r` on the grid `g`, each cell the mean (or, with `mode`, the most frequent value, with GDAL's
@@ -815,7 +817,7 @@ fn aggregated(
     let nearest = Sampler { r, method: Resampling::Nearest, alpha: None, round };
     let mut bands = canvas.bands(ow, oh)?;
     if ow == 0 {
-        return canvas.finish(r, g, bands, name);
+        return canvas.finish(r, g, bands, if mode { Method::Mode } else { Method::Average }, name);
     }
     let x_at = |i: usize| g.min_x + i as f64 * g.cell_x;
     let each = Aggregate { r, canvas: &canvas, nearest, mode, round };
@@ -851,7 +853,7 @@ fn aggregated(
             each.row(s, &mut line);
         },
     )?;
-    canvas.finish(r, g, bands, name)
+    canvas.finish(r, g, bands, if mode { Method::Mode } else { Method::Average }, name)
 }
 
 /// A thread's scratch in [`aggregated`].
