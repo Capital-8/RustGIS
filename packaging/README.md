@@ -46,7 +46,8 @@ packaging/homebrew/render.sh 0.1.0 SHA256SUMS /tmp/tap && brew style /tmp/tap/Ca
 ### Accounts and secrets
 
 - **Homebrew**: the tap repository has a write deploy key; its private half is
-  `HOMEBREW_TAP_DEPLOY_KEY`. Homebrew loads a third-party tap only once it's trusted; installing
+  `HOMEBREW_TAP_DEPLOY_KEY`. Since Homebrew 6.0, which enforces tap trust by default, Homebrew
+  loads a third-party tap only once it's trusted; installing
   by full name (`brew install opengeos/rustgis/rustgis-cli`) trusts just that item, so the docs
   don't ask users to run `brew trust` on the whole tap. Since 0.6.0 the app's cask is also in Homebrew's own repository
   ([`Casks/r/rustgis.rb`](https://github.com/Homebrew/homebrew-cask/blob/main/Casks/r/rustgis.rb),
