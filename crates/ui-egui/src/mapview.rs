@@ -5259,7 +5259,7 @@ mod tests {
         selection_click(&mut h, [3.5, 1.5]);
         assert!(selection_rows(&h).is_empty());
         h.state_mut().run("select.rows", json!({"layer": "Points", "rows": [1]})).unwrap();
-        // Elsewhere: a second click on the same spot is not another empty click.
+        // A second empty click, elsewhere, with a row selected: it clears the selection.
         selection_click(&mut h, [1.0, 3.5]);
         assert!(selection_rows(&h).is_empty(), "an empty click clears the selection");
         let errors: Vec<_> = h.state().session.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
