@@ -142,12 +142,19 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
         // The track being recorded, as it grows.
         if let (Some(recording), Some((map, _))) = (track::field(&ctx).track, app.map.view_rect) {
             let painter = ui.painter().with_clip_rect(map);
-            let points: Vec<Option<egui::Pos2>> = recording.points.iter().map(|f| app.lonlat_to_screen(f.lon, f.lat)).collect();
-            for pair in points.windows(2) {
-                if let [Some(a), Some(b)] = pair {
-                    painter.line_segment([*a, *b], Stroke::new(5.0, Color32::WHITE));
-                    painter.line_segment([*a, *b], Stroke::new(3.0, t.green));
+            // One line for each run of points the view shows (a point behind the globe breaks it),
+            // a point on the pixel of the last left out: hours of a track stay a few shapes.
+            let mut runs: Vec<Vec<egui::Pos2>> = vec![Vec::new()];
+            for at in recording.points.iter().map(|f| app.lonlat_to_screen(f.lon, f.lat)) {
+                match (at, runs.last_mut()) {
+                    (Some(p), Some(run)) if run.last().is_none_or(|q| q.distance(p) >= 1.0) => run.push(p),
+                    (Some(_), _) => {}
+                    (None, _) => runs.push(Vec::new()),
                 }
+            }
+            for run in runs.into_iter().filter(|r| r.len() > 1) {
+                painter.add(egui::Shape::line(run.clone(), Stroke::new(5.0, Color32::WHITE)));
+                painter.add(egui::Shape::line(run, Stroke::new(3.0, t.green)));
             }
         }
         if shown == Sheet::Capture
