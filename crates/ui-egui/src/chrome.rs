@@ -1035,6 +1035,10 @@ fn search_action(id: &str) -> Option<SearchAction> {
 
 /// Desktop-only interactive actions stay visible but disabled in web Command Search.
 fn search_platform_disabled(id: &str, web: bool) -> Option<&'static str> {
+    // A phone runs the desktop's code but, like the browser, no other program (#1902).
+    if !web && !rustgis_engine::data::RUNS_PROGRAMS && id == "layer.addDatabase" {
+        return Some("databases are read through DuckDB, a program a phone can't run");
+    }
     if !web {
         return None;
     }
