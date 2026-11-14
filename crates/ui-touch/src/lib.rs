@@ -71,6 +71,14 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
     let shown = sheet(&ctx);
     // Each position the shell reported goes to the average and the track being taken.
     track::take(app, &ctx);
+    // With positioning off (Hide My Position, or Android ending it), an average being taken
+    // stops: the sheet no longer shows it, and positions from before would mix into the next.
+    if !app.locate {
+        let mut state = track::field(&ctx);
+        if state.averaging.take().is_some() {
+            track::set_field(&ctx, state);
+        }
+    }
     let frame = egui::Frame::NONE.fill(t.pane).stroke(Stroke::new(1.0, t.border));
     egui::Panel::bottom("touch_bar").exact_size(BAR).frame(frame).show(ui, |ui| bar(app, ui, &t, shown));
     // A track being recorded says so over the bar, with its Stop, whatever sheet is up.
@@ -1049,7 +1057,7 @@ fn position_buttons(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, ctx: &egui::C
                     go_to_position(app);
                 }
                 if action(ui, t, tl!("Average Position"), half, false, true) {
-                    state.averaging = Some(Vec::new());
+                    state.averaging = Some(std::sync::Arc::default());
                 }
             });
         }
@@ -1707,6 +1715,20 @@ mod tests {
         assert!(defaulted(layer, &state, "status"));
         assert!(!defaulted(layer, &Form::default(), "status"));
         assert!(add_point(&mut app, cities.id, &state));
+    }
+
+    #[test]
+    fn an_average_being_taken_stops_with_the_position() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::with_sample();
+        app.locate = true;
+        track::set_field(&ctx, track::Field { averaging: Some(std::sync::Arc::default()), ..Default::default() });
+        frame(&mut app, &ctx, Sheet::Capture);
+        assert!(track::field(&ctx).averaging.is_some());
+        // Hidden (or ended by the system): the average goes with it.
+        app.locate = false;
+        frame(&mut app, &ctx, Sheet::Capture);
+        assert!(track::field(&ctx).averaging.is_none());
     }
 
     #[test]

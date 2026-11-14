@@ -11,6 +11,7 @@
 use rustgis_ui_egui::rustgis_engine::platform::Fix;
 use rustgis_ui_egui::{RustGisApp, i18n, tl};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 /// A position less exact than this, in metres, is left out of a track (and the track says how
 /// many were): one off by more would draw a spike.
@@ -22,7 +23,9 @@ pub(crate) const TRACKS: &str = "Tracks";
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Track {
     /// The positions kept, oldest first.
-    pub points: Vec<Fix>,
+    /// Shared, so reading the field positions each frame doesn't copy them: a track runs for
+    /// hours, a position a second.
+    pub points: Arc<Vec<Fix>>,
     /// The positions left out, less exact than [`TRACK_ACCURACY`].
     pub poor: usize,
     /// When it was started, in milliseconds since 1970, when the clock could say.
@@ -40,7 +43,7 @@ impl Track {
         if fix.accuracy.is_some_and(|m| m > TRACK_ACCURACY) {
             self.poor += 1;
         } else {
-            self.points.push(fix);
+            Arc::make_mut(&mut self.points).push(fix);
         }
     }
 
@@ -57,7 +60,7 @@ impl Track {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Field {
     /// The positions averaged so far, while an average is being taken.
-    pub averaging: Option<Vec<Fix>>,
+    pub averaging: Option<Arc<Vec<Fix>>>,
     pub track: Option<Track>,
 }
 
@@ -78,7 +81,7 @@ pub(crate) fn take(app: &mut RustGisApp, ctx: &egui::Context) {
     let mut state = field(ctx);
     for fix in app.fixes.drain(..) {
         if let Some(fixes) = &mut state.averaging {
-            fixes.push(fix);
+            Arc::make_mut(fixes).push(fix);
         }
         if let Some(track) = &mut state.track {
             track.push(fix);
@@ -100,12 +103,14 @@ pub(crate) struct Average {
 }
 
 /// The average of `fixes`: each weighted by how exact it says it is (one over its accuracy
-/// squared) when every one says, else equally. Longitudes are taken about the first one's, so
-/// positions on both sides of the antimeridian average to a place between them. `None` for none.
+/// squared, the accuracy taken as at least a centimetre and at most a thousand kilometres, so
+/// no weight is infinite or nothing) when every one says, else equally. Longitudes are taken
+/// about the first one's, so positions on both sides of the antimeridian average to a place
+/// between them. `None` for none.
 pub(crate) fn average(fixes: &[Fix]) -> Option<Average> {
     let first = fixes.first()?;
-    let weighed = fixes.iter().all(|f| f.accuracy.is_some_and(|m| m > 0.0));
-    let weight = |f: &Fix| if weighed { f.accuracy.map_or(1.0, |m| 1.0 / (m * m)) } else { 1.0 };
+    let weighed = fixes.iter().all(|f| f.accuracy.is_some());
+    let weight = |f: &Fix| if weighed { f.accuracy.map_or(1.0, |m| 1.0 / m.clamp(0.01, 1e6).powi(2)) } else { 1.0 };
     let near = |lon: f64| first.lon + (lon - first.lon + 540.0).rem_euclid(360.0) - 180.0;
     let total: f64 = fixes.iter().map(weight).sum();
     if !(total.is_finite() && total > 0.0) {
@@ -164,10 +169,16 @@ pub(crate) fn finish(app: &mut RustGisApp, track: Track) -> bool {
         left_out(app);
         return false;
     }
-    let Some(layer) = tracks_layer(app) else { return false };
+    // Editing first: a Tracks layer isn't made for a track that then can't be added. Every way
+    // out still says what was left out (the refusal itself the front end says).
     if !super::edit::ensure_editing(app) {
+        left_out(app);
         return false;
     }
+    let Some(layer) = tracks_layer(app) else {
+        left_out(app);
+        return false;
+    };
     let started = track.started.or(track.points.first().and_then(|f| f.time)).and_then(stamp).unwrap_or_default();
     let name = if started.is_empty() { tl!("Track").to_string() } else { i18n::fmt("Track {start}", &[("start", &started)]) };
     let notes = match track.minutes() {
@@ -181,6 +192,7 @@ pub(crate) fn finish(app: &mut RustGisApp, track: Track) -> bool {
         "attributes": {"name": name, "notes": notes},
     });
     if app.run_by_user("edit.addFeature", feature).is_err() {
+        left_out(app);
         return false;
     }
     app.session.notify(i18n::fmt("Added the track to {layer}: {notes}.", &[("layer", TRACKS), ("notes", &notes)]), false);
@@ -230,7 +242,7 @@ mod tests {
         assert!((a.lon - 10.0001).abs() < 1e-9 && (a.lat - 20.0).abs() < 1e-9, "{a:?}");
         assert_eq!(a.count, 2);
         assert_eq!(a.accuracy, Some(5.0));
-        // About 10.5 m apart: each about 5.2 m from the middle.
+        // About 21 m apart: each about 10.5 m from the middle.
         assert!((a.spread - 10.46).abs() < 0.2, "{a:?}");
         // One three times as exact counts nine times as much.
         let b = average(&[fix(10.0, 20.0, Some(1.0), None), fix(10.001, 20.0, Some(3.0), None)]).unwrap();
@@ -238,6 +250,11 @@ mod tests {
         // One without an accuracy: all count the same, and no accuracy is given.
         let c = average(&[fix(10.0, 20.0, Some(1.0), None), fix(10.001, 20.0, None, None)]).unwrap();
         assert!((c.lon - 10.0005).abs() < 1e-9 && c.accuracy.is_none(), "{c:?}");
+        // Accuracies out of all measure, or of nothing, still weigh: none is infinite or nothing.
+        let e = average(&[fix(10.0, 20.0, Some(1e300), None), fix(10.001, 20.0, Some(1e300), None)]).unwrap();
+        assert!((e.lon - 10.0005).abs() < 1e-9, "{e:?}");
+        let z = average(&[fix(10.0, 20.0, Some(0.0), None), fix(10.001, 20.0, Some(5.0), None)]).unwrap();
+        assert!((z.lon - 10.0).abs() < 1e-6, "{z:?}");
         // Either side of the antimeridian: a place between them, not the other side of the Earth.
         let d = average(&[fix(179.9999, 0.0, None, None), fix(-179.9999, 0.0, None, None)]).unwrap();
         assert!(d.lon.abs() > 179.99, "{d:?}");
@@ -261,7 +278,7 @@ mod tests {
         // Positions reported before a track starts aren't in it.
         app.report_position(fix(30.0, -2.0, Some(4.0), Some(0)));
         take(&mut app, &ctx);
-        set_field(&ctx, Field { track: Some(Track::default()), averaging: Some(Vec::new()) });
+        set_field(&ctx, Field { track: Some(Track::default()), averaging: Some(Arc::default()) });
         for (i, accuracy) in [4.0, 4.0, 80.0, 4.0].into_iter().enumerate() {
             app.report_position(fix(30.0 + i as f64 * 0.001, -2.0, Some(accuracy), Some(i as i64 * 60_000)));
         }
@@ -270,7 +287,7 @@ mod tests {
         let state = field(&ctx);
         let track = state.track.clone().unwrap();
         assert_eq!((track.points.len(), track.poor), (3, 1));
-        assert_eq!(state.averaging.as_ref().map(Vec::len), Some(4));
+        assert_eq!(state.averaging.as_ref().map(|a| a.len()), Some(4));
         // Added as one line to a new Tracks layer, and the position left out said.
         let mark = app.session.notice_mark();
         assert!(finish(&mut app, track.clone()));
@@ -283,7 +300,7 @@ mod tests {
         assert_eq!(app.session.map().layers.iter().filter(|l| l.name == TRACKS).count(), 1);
         // Too short: nothing, said as an error.
         let mark = app.session.notice_mark();
-        assert!(!finish(&mut app, Track { points: vec![fix(1.0, 1.0, None, None)], ..Track::default() }));
+        assert!(!finish(&mut app, Track { points: Arc::new(vec![fix(1.0, 1.0, None, None)]), ..Track::default() }));
         assert!(app.session.notices_since(mark).iter().any(|n| n.error));
     }
 }
