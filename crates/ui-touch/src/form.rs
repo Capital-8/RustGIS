@@ -20,11 +20,16 @@ pub(crate) fn stored(value: &Value) -> String {
 }
 
 /// Whether the form's text `got` is the value `want`: a number by its value, so `3.0` and `03`
-/// are `3`; yes and no as the chips hold them; anything else by its text.
+/// are `3` (a whole number exactly, past what a float holds); yes and no as the chips hold them;
+/// anything else by its text.
 fn holds(want: &Value, got: &str) -> bool {
     let number = |n: f64| got.trim().parse::<f64>().is_ok_and(|g| g == n);
     match want {
-        Value::Int(i) => number(*i as f64),
+        Value::Int(i) => match got.trim().parse::<i64>() {
+            Ok(g) => g == *i,
+            // `3.0`: a whole number written with a fraction, within what a float holds exactly.
+            Err(_) => got.trim().parse::<f64>().is_ok_and(|g| g.fract() == 0.0 && g.abs() < 9.0e15 && g as i64 == *i),
+        },
         Value::Float(f) => number(*f),
         Value::Bool(b) => got.trim() == if *b { "true" } else { "false" },
         Value::Text(t) => t == got,
@@ -311,6 +316,12 @@ mod tests {
             let chosen = BTreeMap::from([("kind".to_string(), typed.to_string())]);
             assert_eq!(contingent(&numbers, "size", &chosen), Some(vec!["restricted".into()]), "{typed}");
         }
+        // Whole numbers past a float's precision stay apart.
+        numbers.design.contingent[0].combos =
+            vec![vec![Value::Int(9_007_199_254_740_992), text("A")], vec![Value::Int(9_007_199_254_740_993), text("B")]];
+        let chosen = BTreeMap::from([("kind".to_string(), "9007199254740993".to_string())]);
+        assert_eq!(contingent(&numbers, "size", &chosen), Some(vec!["B".into()]));
+        numbers.design.contingent[0].combos = vec![vec![Value::Int(1), text("restricted")], vec![Value::Float(2.5), text("open")]];
         let chosen = BTreeMap::from([("kind".to_string(), "2.50".to_string())]);
         assert_eq!(contingent(&numbers, "size", &chosen), Some(vec!["open".into()]));
         // Nothing fits: no value is left.

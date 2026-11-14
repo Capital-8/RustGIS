@@ -51,7 +51,7 @@ impl Track {
     pub fn minutes(&self) -> Option<i64> {
         let first = self.points.first()?.time?;
         let last = self.points.last()?.time?;
-        Some((last - first).max(0) / 60_000)
+        Some(last.saturating_sub(first).max(0) / 60_000)
     }
 }
 
@@ -78,7 +78,9 @@ pub(crate) fn take(app: &mut RustGisApp, ctx: &egui::Context) {
     if app.fixes.is_empty() {
         return;
     }
-    let mut state = field(ctx);
+    // Taken out of egui's memory while positions go in, so the points' `Arc` has one owner and
+    // `make_mut` adds to it in place instead of copying the track.
+    let mut state: Field = ctx.data_mut(|d| d.remove_temp(egui::Id::unique("touch_field"))).unwrap_or_default();
     for fix in app.fixes.drain(..) {
         if let Some(fixes) = &mut state.averaging {
             Arc::make_mut(fixes).push(fix);
@@ -195,21 +197,39 @@ pub(crate) fn finish(app: &mut RustGisApp, track: Track) -> bool {
         left_out(app);
         return false;
     }
-    app.session.notify(i18n::fmt("Added the track to {layer}: {notes}.", &[("layer", TRACKS), ("notes", &notes)]), false);
+    let named = app.session.map().layer(layer).map_or_else(|| TRACKS.to_string(), |l| l.name.clone());
+    app.session.notify(i18n::fmt("Added the track to {layer}: {notes}.", &[("layer", &named), ("notes", &notes)]), false);
     left_out(app);
     true
 }
 
-/// The map's Tracks layer: its line layer of that name, or one made for it (with a name and a
-/// notes field).
+/// The map's Tracks layer: its line layer of that name with a text `name` and `notes` field, or
+/// one made for it with them. A Tracks layer without them is passed over: the track's name and
+/// notes would be dropped from it.
 fn tracks_layer(app: &mut RustGisApp) -> Option<u32> {
-    use rustgis_ui_egui::rustgis_engine::data::GeometryType;
-    let found = app.session.map().layers.iter().find(|l| l.name == TRACKS && l.geometry_type() == GeometryType::Polyline).map(|l| l.id);
+    use rustgis_ui_egui::rustgis_engine::data::{FieldType, GeometryType};
+    let has = |l: &rustgis_ui_egui::rustgis_engine::map::Layer, name: &str| {
+        l.dataset.fields.iter().any(|f| f.name.eq_ignore_ascii_case(name) && f.ty == FieldType::Text)
+    };
+    let found = app
+        .session
+        .map()
+        .layers
+        .iter()
+        .find(|l| tracks_name(&l.name) && l.geometry_type() == GeometryType::Polyline && has(l, "name") && has(l, "notes"))
+        .map(|l| l.id);
     if found.is_some() {
         return found;
     }
     let made = app.run_by_user("layer.template", json!({"template": "lines", "name": TRACKS})).ok()?;
     made.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok())
+}
+
+/// Whether a layer's name is a Tracks layer's: `Tracks`, or `Tracks (2)`… as one made beside
+/// another is named.
+fn tracks_name(name: &str) -> bool {
+    let numbered = name.strip_prefix(TRACKS).and_then(|n| n.strip_prefix(" (")).and_then(|n| n.strip_suffix(')'));
+    name == TRACKS || numbered.is_some_and(|n| n.parse::<u32>().is_ok())
 }
 
 /// Milliseconds since 1970 as a date and time in UTC, to the minute (`2026-11-14 10:05Z`).
@@ -268,6 +288,11 @@ mod tests {
         track.push(fix(1.2, 1.0, None, Some(600_000)));
         assert_eq!((track.points.len(), track.poor), (2, 1));
         assert_eq!(track.minutes(), Some(10));
+        // Times out of all measure don't overflow.
+        let wide = Track { points: Arc::new(vec![fix(0.0, 0.0, None, Some(i64::MAX)), fix(1.0, 0.0, None, Some(0))]), ..Track::default() };
+        assert_eq!(wide.minutes(), Some(0));
+        let wide = Track { points: Arc::new(vec![fix(0.0, 0.0, None, Some(0)), fix(1.0, 0.0, None, Some(i64::MAX))]), ..Track::default() };
+        assert_eq!(wide.minutes(), Some(i64::MAX / 60_000));
         assert_eq!(stamp(1_794_614_460_123).as_deref(), Some("2026-11-14 00:01Z"));
     }
 
@@ -296,8 +321,17 @@ mod tests {
         let said: Vec<String> = app.session.notices_since(mark).iter().map(|n| n.text.clone()).collect();
         assert!(said.iter().any(|t| t.contains("left out")), "{said:?}");
         // A second goes to the same layer.
-        assert!(finish(&mut app, track));
+        assert!(finish(&mut app, track.clone()));
         assert_eq!(app.session.map().layers.iter().filter(|l| l.name == TRACKS).count(), 1);
+        // A Tracks layer without the fields is passed over: one with them is made.
+        let tracks = app.session.map().layers.iter().find(|l| l.name == TRACKS).map(|l| l.id).unwrap();
+        app.run_by_user("edit.deleteField", json!({"layer": tracks, "field": "notes"})).unwrap();
+        assert!(finish(&mut app, track.clone()));
+        assert_eq!(app.session.map().layers.iter().filter(|l| tracks_name(&l.name)).count(), 2);
+        // And it is the one the next track goes to.
+        assert!(finish(&mut app, track));
+        assert_eq!(app.session.map().layers.iter().filter(|l| tracks_name(&l.name)).count(), 2);
+        assert!(tracks_name("Tracks (2)") && !tracks_name("Tracks of deer") && !tracks_name("My Tracks"));
         // Too short: nothing, said as an error.
         let mark = app.session.notice_mark();
         assert!(!finish(&mut app, Track { points: Arc::new(vec![fix(1.0, 1.0, None, None)]), ..Track::default() }));
