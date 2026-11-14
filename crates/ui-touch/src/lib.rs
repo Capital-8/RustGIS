@@ -747,9 +747,9 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let fresh = stale.is_none();
     // The feature being edited, while it is still there (an undo may have taken it away).
     let picked = state.editing.and_then(|e| edit::row_of(app, target.id, e.feature).map(|row| (row, e)));
-    if picked.is_none() {
-        state.editing = None;
-    }
+    // A picked vertex an Undo moved or took away is let go.
+    let picked = picked.map(|(row, e)| (row, e.checked(edit::shape(app, target.id, row).as_ref())));
+    state.editing = picked.map(|(_, e)| e);
     // The cross's place, snapped with snapping on: a vertex being moved doesn't snap to itself.
     let moving = picked.filter(|_| state.edit_mode).and_then(|(row, e)| e.vertex.map(|v| (target.id, row, v)));
     state.snap = cross_place(app).and_then(|at| edit::snap(app, at, moving));
@@ -1010,7 +1010,7 @@ fn edit_sheet(
         ui.label(RichText::new(says).size(14.0).color(t.text));
         if action(ui, t, tl!("Pick Feature at Cross"), width, true, true) {
             match edit::feature_at_cross(app, target.id) {
-                Some(feature) => state.editing = Some(edit::Editing { feature, vertex: None }),
+                Some(feature) => state.editing = Some(edit::Editing::feature(feature)),
                 None => app
                     .session
                     .notify(rustgis_ui_egui::i18n::fmt("No feature of {layer} is under the cross.", &[("layer", &target.name)]), true),
@@ -1039,7 +1039,7 @@ fn edit_sheet(
         if action(ui, t, tl!("Pick Vertex at Cross"), width, !has, true) {
             let middle = app.map.view_rect.map(|(rect, _)| rect.center());
             match middle.and_then(|at| edit::vertex_near(app, &shape, at)) {
-                Some(v) => state.editing = Some(edit::Editing { vertex: Some(v), ..editing }),
+                Some(v) => state.editing = Some(editing.picking(Some(v), Some(&shape))),
                 None => app.session.notify(tl!("No vertex is near the cross. Move the map so the cross is on one."), true),
             }
         }
@@ -1055,7 +1055,8 @@ fn edit_sheet(
                     if act != "delete" && at.is_none() {
                         app.session.notify(off(), true);
                     } else if let Some(next) = edit::vertex(app, target.id, row, v, act, at) {
-                        state.editing = Some(edit::Editing { vertex: next, ..editing });
+                        let now = edit::shape(app, target.id, row);
+                        state.editing = Some(editing.picking(next, now.as_ref()));
                     }
                 }
             }
@@ -1513,7 +1514,7 @@ mod tests {
             Form {
                 shown: Some(rivers.instance),
                 edit_mode: true,
-                editing: Some(edit::Editing { feature, vertex: Some(first) }),
+                editing: Some(edit::Editing::feature(feature).picking(Some(first), edit::shape(&app, rivers.id, row).as_ref())),
                 ..Form::default()
             },
         );
@@ -1597,6 +1598,25 @@ mod tests {
         assert!(defaulted(layer, &state, "status"));
         assert!(!defaulted(layer, &Form::default(), "status"));
         assert!(add_point(&mut app, cities.id, &state));
+    }
+
+    #[test]
+    fn a_picked_vertex_an_undo_moved_or_took_away_is_let_go() {
+        use rustgis_ui_egui::rustgis_engine::data::{Coord, Geometry};
+        let line = |points: &[(f64, f64)]| Geometry::Line(vec![points.iter().map(|(x, y)| Coord::new(*x, *y)).collect()]);
+        let abc = line(&[(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]);
+        // B picked, then N added after it and picked: index 2 is N.
+        let with_n = line(&[(0.0, 0.0), (1.0, 0.0), (1.5, 1.0), (2.0, 0.0)]);
+        let picked = edit::Editing::feature(7).picking(Some(VertexId::new(0, 0, 2)), Some(&with_n));
+        assert_eq!(picked.checked(Some(&with_n)), picked);
+        // Undone: index 2 is now C, elsewhere than N was: let go.
+        assert_eq!(picked.checked(Some(&abc)).vertex, None);
+        // N was the last vertex: the index is gone, and so is the pick.
+        let n_last = line(&[(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0)]);
+        let last = edit::Editing::feature(7).picking(Some(VertexId::new(0, 0, 3)), Some(&n_last));
+        assert_eq!(last.checked(Some(&abc)).vertex, None);
+        // A vertex the shape doesn't have isn't picked at all.
+        assert_eq!(edit::Editing::feature(7).picking(Some(VertexId::new(0, 0, 9)), Some(&abc)).vertex, None);
     }
 
     #[test]

@@ -117,7 +117,7 @@ feature drawn on top under it (within half a finger) and draws its vertices. For
 **Pick Vertex at Cross** picks the vertex nearest the cross, and then **Move Here** moves it to
 where the cross is next, **Add After** puts a new vertex there after it, and **Delete Vertex**
 removes it (a line keeps two, a ring three). For a point, **Move Point Here** moves it. **Delete
-Feature** deletes it (only it: the other layers' selections are cleared first), and **Done** lets
+Feature** deletes it (only it: the map's other selections are kept), and **Done** lets
 it go. Each change is one edit, undone by Undo in the More sheet.
 
 **Snap** turns the map's snapping on and off (its settings are the desktop's: Edit › Snapping).
