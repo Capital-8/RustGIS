@@ -171,8 +171,9 @@ fn rewrite_photos(map: &mut rustgis_map::Map, mut rewrite: impl FnMut(&str) -> S
 
 /// The photo files `map`'s features name that are on this device, as package entries under
 /// `photos/` (within `budget`), each feature then naming its photos there; and the photos named
-/// that couldn't be read. A photo named that isn't on this device (one named at home) is left as
-/// it is named.
+/// that couldn't be read. Only picture files ([`PICTURES`]) named by an absolute path go in, each
+/// under a plain name ([`plain_name`]): a photos field is free text, and could name any file. A
+/// photo named that isn't on this device (one named at home) is left as it is named.
 fn take_photos(map: &mut rustgis_map::Map, budget: &mut u64) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
     let (mut entries, mut unread) = (Vec::new(), Vec::new());
     let mut placed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
