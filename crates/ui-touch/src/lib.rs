@@ -1520,7 +1520,6 @@ mod tests {
         frame(&mut app, &ctx, Sheet::Capture);
         assert_eq!(form(&ctx).editing.map(|e| e.feature), Some(feature));
         // Deleted, only it: the sheet lets it go.
-        let before = count(&app, rivers.id);
         // With nothing selected anywhere it is deleted too (Pick Feature selects nothing).
         let cities = app.session.map().layers.iter().find(|l| l.geometry_type() == GeometryType::Point).unwrap().id;
         let before = count(&app, rivers.id);
