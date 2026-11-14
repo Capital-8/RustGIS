@@ -377,8 +377,12 @@ fn sample(s: &mut Session, _: &Value) -> CmdResult {
 /// Largest project package opened (1 GiB).
 const MAX_PACKAGE: u64 = 1 << 30;
 
-/// `project.open`: a project file, or a package (`.rgispkg`) opened unsaved; either must be a
-/// regular file within its limit.
+/// `project.open`: a project file, or a package (`.rgispkg`, or a field package, `.rgisfield`)
+/// opened unsaved; either must be a regular file within its limit.
+///
+/// It runs on the window's thread, as opening a project does: a package is one read, and a field
+/// package's unpacking one write of each file it holds (its tile archives, up to its limit), with
+/// no Cancel between them.
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let path = PathBuf::from(super::ps(p, "path").ok_or("path is required")?);
     // A field package opens as a package does, from where it is unpacked.

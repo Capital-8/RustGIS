@@ -178,7 +178,9 @@ out, and said.
 Opening a field package (Open Project, the picker, or a file pushed to the app's folder) unpacks it
 into a folder of its own in the app's folder (`field/<name>`, numbered when one of that name is
 there: a copy unpacked before is never written over) and opens its project there, unsaved, as a
-project package opens. Its project's paths are trusted as a project file's are. Adding an `.mbtiles` or `.pmtiles` file as data adds it as a tile layer too, an
+project package opens. Its project's paths are trusted as a project file's are. Packaging and
+opening run on the window's thread, as Package Project and opening a project do, with no Cancel:
+a large basemap archive holds the window while it is read or written. Adding an `.mbtiles` or `.pmtiles` file as data adds it as a tile layer too, an
 offline basemap with no package.
 
 ## What differs from the desktop
