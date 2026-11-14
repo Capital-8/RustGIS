@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 
 mod edit;
 mod form;
+mod track;
 
 /// The smallest side of anything a finger taps, in points (Android's guidance is 48).
 pub const TARGET: f32 = 48.0;
@@ -39,6 +40,8 @@ const TYPING_SHARE: f32 = 0.9;
 const SHEET_MARGIN: f32 = 4.0;
 /// The More sheet's rows with the position hidden.
 const MORE_ROWS: usize = 8;
+/// The More sheet's rows shown only with the position on: Go to My Position, and the track.
+const MORE_POSITION_ROWS: usize = 2;
 
 /// The sheet risen over the map.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,8 +69,27 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     let t = Tokens::get(&ctx);
     let shown = sheet(&ctx);
+    // Each position the shell reported goes to the average and the track being taken.
+    track::take(app, &ctx);
     let frame = egui::Frame::NONE.fill(t.pane).stroke(Stroke::new(1.0, t.border));
     egui::Panel::bottom("touch_bar").exact_size(BAR).frame(frame).show(ui, |ui| bar(app, ui, &t, shown));
+    // A track being recorded says so over the bar, with its Stop, whatever sheet is up.
+    if let Some(recording) = track::field(&ctx).track {
+        let margin = egui::Margin::symmetric(12, 0);
+        egui::Panel::bottom("touch_track").exact_size(TARGET).frame(frame.inner_margin(margin)).show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.label(RichText::new(track::track_text(&recording, app.locate)).size(14.0).color(t.text));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if action(ui, &t, tl!("Stop"), 88.0, true, true) {
+                        stop_track(app, &ctx);
+                    }
+                    if !app.locate && action(ui, &t, tl!("Resume"), 96.0, false, true) {
+                        app.locate = true;
+                    }
+                });
+            });
+        });
+    }
     // Work running off the window's thread (a file being read, an export) shows its progress
     // and Cancel over the bar, where the desktop's status bar would.
     if app.background_busy() {
@@ -82,7 +104,7 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
         let rows = match shown {
             Sheet::Layers => (app.session.map().layers.len() + app.session.map().tiles.len()).max(1),
             // Go to My Position is there only while the position is shown.
-            Sheet::More => MORE_ROWS + usize::from(app.locate),
+            Sheet::More => MORE_ROWS + if app.locate { MORE_POSITION_ROWS } else { 0 },
             Sheet::Capture => capture_rows(app, &ctx),
             Sheet::None => 0,
         };
@@ -109,6 +131,17 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
         if let (Some(fix), Some((map, _))) = (app.position, app.map.view_rect) {
             position(app, &ui.painter().with_clip_rect(map), fix, &t);
         }
+        // The track being recorded, as it grows.
+        if let (Some(recording), Some((map, _))) = (track::field(&ctx).track, app.map.view_rect) {
+            let painter = ui.painter().with_clip_rect(map);
+            let points: Vec<Option<egui::Pos2>> = recording.points.iter().map(|f| app.lonlat_to_screen(f.lon, f.lat)).collect();
+            for pair in points.windows(2) {
+                if let [Some(a), Some(b)] = pair {
+                    painter.line_segment([*a, *b], Stroke::new(5.0, Color32::WHITE));
+                    painter.line_segment([*a, *b], Stroke::new(3.0, t.green));
+                }
+            }
+        }
         if shown == Sheet::Capture
             && let Some((map, _)) = app.map.view_rect
         {
@@ -128,6 +161,24 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
             cross(ui.painter(), map.center(), &t);
         }
     });
+}
+
+/// Starts recording a track, turning the device's position on when it is off.
+fn start_track(app: &mut RustGisApp, ctx: &egui::Context) {
+    let mut state = track::field(ctx);
+    state.track = Some(track::Track::new());
+    track::set_field(ctx, state);
+    app.locate = true;
+    app.session.notify(tl!("Recording a track: its positions are drawn on the map. Stop adds it to the Tracks layer."), false);
+}
+
+/// Stops the track being recorded and adds it to the map.
+fn stop_track(app: &mut RustGisApp, ctx: &egui::Context) {
+    let mut state = track::field(ctx);
+    if let Some(recorded) = state.track.take() {
+        track::set_field(ctx, state);
+        track::finish(app, recorded);
+    }
 }
 
 /// Draws where the device is: a dot, in a ring as wide as the position is good to.
@@ -435,7 +486,8 @@ fn capture_rows(app: &RustGisApp, ctx: &egui::Context) -> usize {
         return 4 + buttons + usize::from(app.locate);
     }
     let calendar = if state.calendar.is_some() { form::CALENDAR_ROWS } else { 0 };
-    1 + fields + calendar + if target.kind == GeometryType::Point { 3 } else { 4 } + usize::from(app.locate)
+    let averaging = usize::from(app.locate && track::field(ctx).averaging.is_some());
+    1 + averaging + fields + calendar + if target.kind == GeometryType::Point { 3 } else { 4 } + usize::from(app.locate)
 }
 
 /// A value typed for a field, as the command takes it: a number for a field of numbers, a truth
@@ -754,9 +806,10 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     };
     ui.label(RichText::new(place).size(13.0).color(t.text_dim));
     let width = ui.available_width();
-    // With the device's position shown, one tap puts the cross on it.
-    if app.locate && action(ui, t, tl!("Go to My Position"), width, false, app.position.is_some()) {
-        go_to_position(app);
+    // With the device's position shown, one tap puts the cross on it; or the positions that come
+    // while Average runs are averaged, and Use Average puts the cross on their average.
+    if app.locate {
+        position_buttons(app, ui, t, &ctx, width);
     }
     // Add or Edit, and Snap.
     ui.horizontal(|ui| {
@@ -970,6 +1023,45 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     set_form(&ctx, state);
 }
 
+/// The Capture sheet's buttons for the device's position: Go to My Position and Average, or,
+/// while an average is being taken, what it holds, Use Average and Cancel.
+fn position_buttons(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, ctx: &egui::Context, width: f32) {
+    let mut state = track::field(ctx);
+    let half = (width - ui.spacing().item_spacing.x) / 2.0;
+    match &state.averaging {
+        None => {
+            ui.horizontal(|ui| {
+                if action(ui, t, tl!("Go to My Position"), half, false, app.position.is_some()) {
+                    go_to_position(app);
+                }
+                if action(ui, t, tl!("Average Position"), half, false, true) {
+                    state.averaging = Some(Vec::new());
+                }
+            });
+        }
+        Some(fixes) => {
+            ui.label(RichText::new(track::averaging_text(fixes)).size(14.0).color(t.text));
+            let found = track::average(fixes);
+            ui.horizontal(|ui| {
+                let label = match found {
+                    Some(a) => rustgis_ui_egui::i18n::fmt("Use Average ({n})", &[("n", &a.count.to_string())]),
+                    None => tl!("Use Average").to_string(),
+                };
+                if action(ui, t, &label, half, found.is_some(), found.is_some())
+                    && let Some(a) = found
+                {
+                    run(app, "map.goToXY", json!({"lon": a.lon, "lat": a.lat}));
+                    state.averaging = None;
+                }
+                if action(ui, t, tl!("Cancel"), half, false, true) {
+                    state.averaging = None;
+                }
+            });
+        }
+    }
+    track::set_field(ctx, state);
+}
+
 /// A chip a finger's height, `width` wide, marked while `on`. Says whether it was tapped.
 fn toggle_chip(ui: &mut Ui, t: &Tokens, label: &str, width: f32, on: bool) -> bool {
     let text = RichText::new(label).size(15.0).color(if on { t.accent_text } else { t.text });
@@ -1079,14 +1171,32 @@ fn more(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
         }
         // The device's position, where the shell can report one (it asks the user's leave first).
+        let ctx = ui.ctx().clone();
         let locate = if app.locate { tl!("Hide My Position") } else { tl!("Show My Position") };
         if row(ui, t, "explore", locate) {
-            set_sheet(ui.ctx(), Sheet::None);
+            set_sheet(&ctx, Sheet::None);
+            // Hidden, no more positions come: a track being recorded is added as it is.
+            if app.locate {
+                stop_track(app, &ctx);
+            }
             app.locate = !app.locate;
         }
         if app.locate && row(ui, t, "zoom_full", tl!("Go to My Position")) {
-            set_sheet(ui.ctx(), Sheet::None);
+            set_sheet(&ctx, Sheet::None);
             go_to_position(app);
+        }
+        // A track: where the device goes, drawn as it goes, and added to the map when stopped.
+        let recording = track::field(&ctx).track.is_some();
+        if app.locate || recording {
+            let label = if recording { tl!("Stop the Track") } else { tl!("Record a Track") };
+            if row(ui, t, "line_tool", label) {
+                set_sheet(&ctx, Sheet::None);
+                if recording {
+                    stop_track(app, &ctx);
+                } else {
+                    start_track(app, &ctx);
+                }
+            }
         }
         // The whole of RustGIS is still there, for a tablet or a job the touch interface has no
         // button for yet. The Project page's Start brings this interface back at the next start.
@@ -1417,14 +1527,14 @@ mod tests {
         assert_eq!(app.session.notices_since(mark).len(), 1);
         // With one, the map's middle (the capture cross) goes to it.
         app.locate = true;
-        app.position = Some(Fix { lon: 30.0, lat: -2.0, accuracy: Some(5.0) });
+        app.position = Some(Fix { lon: 30.0, lat: -2.0, accuracy: Some(5.0), time: None });
         go_to_position(&mut app);
         let (lon, lat) = cross_place(&app).unwrap();
         assert!((lon - 30.0).abs() < 1e-6 && (lat + 2.0).abs() < 1e-6, "{lon} {lat}");
         // Every sheet draws with the position on the map, its ring too (a wide one, to be drawn).
         // An accuracy out of all measure draws too, without its ring.
         for accuracy in [500_000.0, 1e300, f64::INFINITY] {
-            app.position = Some(Fix { lon: 30.0, lat: -2.0, accuracy: Some(accuracy) });
+            app.position = Some(Fix { lon: 30.0, lat: -2.0, accuracy: Some(accuracy), time: None });
             for shown in [Sheet::None, Sheet::Capture, Sheet::More] {
                 frame(&mut app, &ctx, shown);
             }
