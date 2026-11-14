@@ -506,15 +506,11 @@ fn home_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 menu_item(ui, app, "", "From URL…", "ui.addUrl", Value::Null);
                 menu_item(ui, app, "", "From Service…", "ui.addService", Value::Null);
                 menu_item(ui, app, "", "Zarr…", "ui.dialog", json!({"name": "zarr"}));
-                // Databases are read through DuckDB, a program the browser can't run. A phone
-                // can't either: there the row stays, unavailable, and says why (#1902).
+                // Databases are read through DuckDB, a program the browser can't run. A phone keeps
+                // the row: its PostGIS, MySQL and SQL Server connections need no program, and a
+                // DuckDB database refused there says why (#1902).
                 #[cfg(not(target_arch = "wasm32"))]
-                if rustgis_engine::data::RUNS_PROGRAMS {
-                    menu_item(ui, app, "", "Database…", "ui.dialog", json!({"name": "addDatabase"}));
-                } else {
-                    crate::widgets::menu_row(ui, "", tl!("Database…"), "", false)
-                        .on_disabled_hover_text(tl!("Databases are read through DuckDB, a program a phone can't run."));
-                }
+                menu_item(ui, app, "", "Database…", "ui.dialog", json!({"name": "addDatabase"}));
                 #[cfg(not(target_arch = "wasm32"))]
                 menu_item(ui, app, "", "Edit GeoPackage Table…", "ui.dialog", json!({"name": "gpkgAddLayer"}));
                 menu_item(ui, app, "", "S3…", "ui.dialog", json!({"name": "s3"}));
