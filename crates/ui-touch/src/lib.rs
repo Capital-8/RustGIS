@@ -403,7 +403,15 @@ fn capture_rows(app: &RustGisApp, ctx: &egui::Context) -> usize {
     let layer = app.session.map().layer(target.id);
     let fields = layer
         .map_or(0, |l| l.dataset.fields.len() + usize::from(!l.design.templates.is_empty()) + usize::from(!form::required(l).is_empty()));
-    let calendar = if state.calendar.is_some() { form::CALENDAR_ROWS } else { 0 };
+    // A date and time's calendar has its Now row too.
+    let calendar = match (&state.calendar, layer) {
+        (Some((name, _)), Some(l)) => {
+            let timed =
+                l.dataset.fields.iter().any(|f| &f.name == name && f.ty == rustgis_ui_egui::rustgis_engine::data::FieldType::DateTime);
+            form::CALENDAR_ROWS + usize::from(timed)
+        }
+        _ => 0,
+    };
     fields + calendar + if target.kind == GeometryType::Point { 3 } else { 4 } + usize::from(app.locate)
 }
 
@@ -546,8 +554,13 @@ fn defaulted(layer: &rustgis_ui_egui::rustgis_engine::map::Layer, form: &Form, n
         defaults.iter().any(|(field, value)| field.eq_ignore_ascii_case(name) && !value.is_null())
     };
     let template = form.template.as_ref().and_then(|t| layer.design.templates.iter().find(|x| &x.name == t));
+    // The subtype the form chose, or else the one the template gives, as the engine reads it.
     let subtype = layer.design.subtypes.as_ref().and_then(|s| {
-        let code = form.values.iter().find(|(field, _)| field.eq_ignore_ascii_case(&s.field))?.1.trim().parse::<i64>().ok()?;
+        let typed = form.values.iter().find(|(field, v)| field.eq_ignore_ascii_case(&s.field) && !v.trim().is_empty());
+        let code = match typed {
+            Some((_, v)) => v.trim().parse::<i64>().ok()?,
+            None => template?.defaults.iter().find(|(field, _)| field.eq_ignore_ascii_case(&s.field))?.1.as_f64()? as i64,
+        };
         s.subtypes.iter().find(|x| x.code == code)
     });
     template.is_some_and(|t| has(&t.defaults)) || subtype.is_some_and(|s| has(&s.defaults))
@@ -871,7 +884,8 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                                 None
                             } else {
                                 let day = form::day_of(value).or_else(form::today);
-                                let month = day.map_or((2026, 1), |d| {
+                                // Without a clock, the calendar starts at 1970's first month.
+                                let month = day.map_or((1970, 1), |d| {
                                     let (y, m, _) = d.ymd();
                                     (y, m)
                                 });
@@ -1308,6 +1322,29 @@ mod tests {
         set_form(&ctx, Form { shown: Some(cities.instance), calendar: Some((text, (2026, 3))), ..Form::default() });
         frame(&mut app, &ctx, Sheet::Capture);
         assert!(form(&ctx).calendar.is_some());
+    }
+
+    #[test]
+    fn a_subtype_the_template_chooses_fills_a_required_field_with_its_default() {
+        let mut app = RustGisApp::with_sample();
+        let cities = target(&mut app, GeometryType::Point);
+        run(&mut app, "edit.addField", json!({"layer": cities.id, "name": "kind", "type": "long"}));
+        run(&mut app, "edit.addField", json!({"layer": cities.id, "name": "status", "type": "text"}));
+        let subtypes =
+            json!({"layer": cities.id, "field": "kind", "subtypes": [{"code": 1, "name": "Well", "defaults": {"status": "active"}}]});
+        run(&mut app, "data.subtypes", subtypes);
+        run(
+            &mut app,
+            "data.attributeRule",
+            json!({"layer": cities.id, "name": "status", "kind": "constraint", "expression": "status IS NOT NULL"}),
+        );
+        run(&mut app, "edit.template", json!({"layer": cities.id, "name": "Well", "defaults": {"kind": 1}}));
+        let layer = app.session.map().layer(cities.id).unwrap();
+        // The template gives the subtype, whose default fills the required field.
+        let state = Form { template: Some("Well".into()), ..Form::default() };
+        assert!(defaulted(layer, &state, "status"));
+        assert!(!defaulted(layer, &Form::default(), "status"));
+        assert!(add_point(&mut app, cities.id, &state));
     }
 
     #[test]
