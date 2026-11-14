@@ -102,7 +102,7 @@ time, **Now**.
 While a field is typed in, the sheet takes most of the window and stays above the soft keyboard:
 the activity's Java half counts the keyboard in the window's bottom inset, the app looks again
 for it while a field wants the keyboard (Android doesn't wake the app when it comes or goes), the
-field is scrolled into view, and closing the keyboard ends the typing.
+field is scrolled into view, and closing the keyboard ends the typing (Android 11 and later, which say when it goes; before, the field keeps the focus until the next tap, and the keyboard's room isn't counted).
 
 **Show My Position**, in the More sheet, asks Android for the device's position (and the user,
 the first time, for leave to use it). The position is drawn on the map as a dot in a ring as wide
