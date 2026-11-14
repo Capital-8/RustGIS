@@ -19,10 +19,24 @@ pub(crate) fn stored(value: &Value) -> String {
     }
 }
 
+/// Whether the form's text `got` is the value `want`: a number by its value, so `3.0` and `03`
+/// are `3`; yes and no as the chips hold them; anything else by its text.
+fn holds(want: &Value, got: &str) -> bool {
+    let number = |n: f64| got.trim().parse::<f64>().is_ok_and(|g| g == n);
+    match want {
+        Value::Int(i) => number(*i as f64),
+        Value::Float(f) => number(*f),
+        Value::Bool(b) => got.trim() == if *b { "true" } else { "false" },
+        Value::Text(t) => t == got,
+        other => other.to_string() == got,
+    }
+}
+
 /// The fields a layer's constraint rules require to hold a value, by name, in the layer's field
 /// order: those a rule asks `IS NOT NULL` of, alone or as one of the clauses joined by `AND` at
 /// its top. A rule that can't be read, or that asks it only under a condition (inside an `OR`),
 /// requires nothing here; the engine still checks the rule itself when the feature is added.
+/// A field a calculation rule sets isn't asked for either: the engine fills it before it checks.
 pub(crate) fn required(layer: &Layer) -> Vec<String> {
     use rustgis_ui_egui::rustgis_engine::map::design::RuleKind;
     let mut found = vec![false; layer.dataset.fields.len()];
@@ -31,7 +45,8 @@ pub(crate) fn required(layer: &Layer) -> Vec<String> {
             not_null(&e, &mut found);
         }
     }
-    layer.dataset.fields.iter().zip(found).filter(|(_, on)| *on).map(|(f, _)| f.name.clone()).collect()
+    let calculated = |name: &str| layer.design.rules.iter().any(|r| r.kind == RuleKind::Calculation && r.field.eq_ignore_ascii_case(name));
+    layer.dataset.fields.iter().zip(found).filter(|(f, on)| *on && !calculated(&f.name)).map(|(f, _)| f.name.clone()).collect()
 }
 
 /// Marks in `found` the fields `e` requires to hold a value, looking through `AND`s only.
@@ -76,7 +91,7 @@ pub(crate) fn contingent(layer: &Layer, field: &str, values: &BTreeMap<String, S
             })
             .collect();
         let fits =
-            |combo: &&Vec<Value>| combo.iter().zip(&chosen).all(|(want, got)| want.is_null() || got.is_none_or(|got| stored(want) == got));
+            |combo: &&Vec<Value>| combo.iter().zip(&chosen).all(|(want, got)| want.is_null() || got.is_none_or(|got| holds(want, got)));
         let mut these: Vec<String> = Vec::new();
         let mut open = false;
         for combo in set.combos.iter().filter(fits) {
@@ -257,6 +272,9 @@ mod tests {
         assert!(required(&l).is_empty());
         l.design.rules = vec![rule("name IS NOT NULL AND (size = 'big' OR size IS NOT NULL)"), rule("NOT surveyed IS NULL")];
         assert_eq!(required(&l), ["name", "surveyed"]);
+        // A field a calculation rule fills isn't asked for.
+        l.design.rules.push(AttributeRule { kind: RuleKind::Calculation, field: "name".into(), ..rule("'x'") });
+        assert_eq!(required(&l), ["surveyed"]);
         // Only under a condition, or in a calculation rule, or unreadable: not required.
         l.design.rules = vec![rule("name IS NOT NULL OR kind = 'oak'"), rule("no_such_field IS NOT NULL")];
         l.design.rules.push(AttributeRule { kind: RuleKind::Calculation, ..rule("kind IS NOT NULL") });
@@ -282,6 +300,19 @@ mod tests {
         values.insert("size".to_string(), "big".to_string());
         assert_eq!(contingent(&l, "size", &values), Some(vec!["big".into(), "small".into()]));
         assert_eq!(contingent(&l, "kind", &values), Some(vec!["oak".into()]));
+        // A number typed another way is the same number.
+        let mut numbers = layer();
+        numbers.design.contingent = vec![ContingentSet {
+            name: "count".into(),
+            fields: vec!["kind".into(), "size".into()],
+            combos: vec![vec![Value::Int(1), text("restricted")], vec![Value::Float(2.5), text("open")]],
+        }];
+        for typed in ["01", "1.0"] {
+            let chosen = BTreeMap::from([("kind".to_string(), typed.to_string())]);
+            assert_eq!(contingent(&numbers, "size", &chosen), Some(vec!["restricted".into()]), "{typed}");
+        }
+        let chosen = BTreeMap::from([("kind".to_string(), "2.50".to_string())]);
+        assert_eq!(contingent(&numbers, "size", &chosen), Some(vec!["open".into()]));
         // Nothing fits: no value is left.
         values.insert("kind".to_string(), "birch".to_string());
         assert_eq!(contingent(&l, "size", &values), Some(vec![]));

@@ -378,7 +378,8 @@ public class MainActivity extends NativeActivity {
 
     /**
      * The room the system's bars, a camera cutout and the soft keyboard take at the window's
-     * edges, in pixels, as "left top right bottom"; empty before the window is laid out.
+     * edges, in pixels, as "left top right bottom", then (Android 11 and later) 1 or 0 for
+     * whether the keyboard is up; empty before the window is laid out.
      */
     public String insets() {
         return insets;
@@ -396,6 +397,10 @@ public class MainActivity extends NativeActivity {
             // above it. (The Rust side looks again while a field wants the keyboard, so the
             // room comes back when it goes.)
             bottom = Math.max(bars.bottom, insets.getInsets(android.view.WindowInsets.Type.ime()).bottom);
+            // Whether the keyboard is up, which its height alone doesn't tell (it shrinks when
+            // the phone turns): the Rust side ends the typing only when it goes.
+            boolean keyboard = insets.isVisible(android.view.WindowInsets.Type.ime());
+            return left + " " + top + " " + right + " " + bottom + " " + (keyboard ? 1 : 0);
         } else {
             left = insets.getSystemWindowInsetLeft();
             top = insets.getSystemWindowInsetTop();
