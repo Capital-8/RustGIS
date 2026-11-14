@@ -51,6 +51,8 @@ pub fn is_field_package(name: &str) -> bool {
 /// Project does: each archive is one read and the zip one write, with no Cancel between them.
 pub(crate) fn package(s: &mut Session, p: &Value) -> Result<(String, Vec<u8>), String> {
     let returning = s.map().name.strip_suffix(OFFLINE).map(str::to_string);
+    // Only a map coming back carries its photos: going out, the photos named are at home.
+    let coming_back = returning.is_some();
     let (area, mut map) = match returning {
         Some(area) => (area, s.map().clone()),
         None => {
@@ -115,7 +117,7 @@ pub(crate) fn package(s: &mut Session, p: &Value) -> Result<(String, Vec<u8>), S
         s.notify(format!("{} tile archive(s) couldn't be put in the field package: {}", unread.len(), unread.join(", ")), true);
     }
     // Coming back, the photos taken in the field go with their features.
-    if returning_map(&map) {
+    if coming_back {
         let (photos, unread) = take_photos(&mut map, &mut budget);
         if !unread.is_empty() {
             s.notify(format!("{} photo(s) couldn't be put in the field package: {}", unread.len(), unread.join(", ")), true);
@@ -180,13 +182,15 @@ fn take_photos(map: &mut rustgis_map::Map, budget: &mut u64) -> (Vec<(String, Ve
             return entry.clone();
         }
         let file = Path::new(path);
-        if !file.is_absolute() || !file.is_file() {
+        // A picture only: a photos field is free text, and could name any file on the device.
+        let picture = file.extension().is_some_and(|e| PICTURES.iter().any(|p| e.eq_ignore_ascii_case(p)));
+        if !file.is_absolute() || !picture || !file.is_file() {
             return path.to_string();
         }
         match crate::project::read_file(file, *budget) {
             Ok(bytes) => {
                 *budget = budget.saturating_sub(bytes.len() as u64);
-                let stem = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "photo.jpg".into());
+                let stem = file.file_name().map(|n| plain_name(&n.to_string_lossy())).unwrap_or_else(|| "photo.jpg".into());
                 let mut name = stem.clone();
                 for n in 2.. {
                     if taken.insert(name.to_ascii_lowercase()) {
@@ -208,11 +212,29 @@ fn take_photos(map: &mut rustgis_map::Map, budget: &mut u64) -> (Vec<(String, Ve
     (entries, unread)
 }
 
+/// The extensions of the picture files a returning field package carries.
+const PICTURES: &[&str] = &["jpg", "jpeg", "png", "heic", "heif", "webp"];
+
+/// A file name with nothing a package's photo entry may not hold: no folder separator or drive
+/// colon, and not hidden (a leading dot).
+fn plain_name(name: &str) -> String {
+    let name: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect();
+    match name.strip_prefix('.') {
+        Some(rest) => format!("_{rest}"),
+        None => name,
+    }
+}
+
 /// Brings a field package's edits back (`offline.bringBack`): the package (`path`, or `data` in
 /// base64) holds an offline area's map, which must be an area of this project. Its photos go in a
 /// folder beside this project (`<area> photos`), or the app's own `field photos/<area>` for a
-/// project not saved yet, and its features name them there. Then its edits are copied back to the
-/// area's map by feature, as Sync does (`sync_area`), which says the conflicts.
+/// project not saved yet, and its features name them there; one whose name is taken there by
+/// other bytes gets a name of its own (`2-<name>`), and an entry that isn't a plain file name is
+/// left out and counted. Then its edits are copied back to the area's map by feature, as Sync does
+/// (`sync_area`), which says the conflicts.
+///
+/// It runs where it is called, on the window's thread, as Sync does: the package is one read, each
+/// photo one write, and the sync one pass over the area's features, with no Cancel between them.
 pub(crate) fn bring_back(s: &mut Session, p: &Value) -> Result<Value, String> {
     let bytes = match super::ps(p, "path") {
         Some(path) => crate::project::read_file(Path::new(path), MOST_UNPACKED as u64)?,
@@ -225,6 +247,8 @@ pub(crate) fn bring_back(s: &mut Session, p: &Value) -> Result<Value, String> {
     let entries = rustgis_data::zip::read(&bytes)?;
     let mut text = None;
     let mut photos = Vec::new();
+    // Photo entries that aren't a plain file name, left out.
+    let mut strange = 0usize;
     for (name, data) in entries {
         if !name.contains('/') && crate::project::is_project_file(&name) {
             text = Some(String::from_utf8(data).map_err(|_| "the field package's project is damaged".to_string())?);
@@ -232,6 +256,8 @@ pub(crate) fn bring_back(s: &mut Session, p: &Value) -> Result<Value, String> {
             // A photo's own name only: nothing that would put it outside its folder.
             if !file.is_empty() && !file.contains(['/', '\\', ':']) && file != ".." && !file.starts_with('.') {
                 photos.push((file.to_string(), data));
+            } else {
+                strange += 1;
             }
         }
     }
@@ -250,6 +276,7 @@ pub(crate) fn bring_back(s: &mut Session, p: &Value) -> Result<Value, String> {
     })?;
     // The photos, beside the project, and the features naming them there.
     let mut put = 0usize;
+    let mut renamed = 0usize;
     let mut folder = None;
     if !photos.is_empty() {
         let dir = match s.path.as_deref().and_then(Path::parent) {
@@ -262,7 +289,19 @@ pub(crate) fn bring_back(s: &mut Session, p: &Value) -> Result<Value, String> {
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut written = std::collections::HashMap::new();
         for (name, data) in photos {
-            let path = dir.join(&name);
+            // A file of that name already there (an earlier package's) is kept: the same bytes
+            // are that photo, other bytes get a name of their own.
+            let mut path = dir.join(&name);
+            for n in 2.. {
+                match std::fs::read(&path) {
+                    Ok(there) if there == data => break,
+                    Ok(_) => path = dir.join(format!("{n}-{name}")),
+                    Err(_) => break,
+                }
+            }
+            if path.file_name().is_some_and(|f| f.to_string_lossy() != name) {
+                renamed += 1;
+            }
             std::fs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))?;
             written.insert(format!("{PHOTOS}/{name}"), path.display().to_string());
             put += 1;
@@ -285,6 +324,12 @@ pub(crate) fn bring_back(s: &mut Session, p: &Value) -> Result<Value, String> {
     );
     if let Some(dir) = &folder {
         summary.push_str(&format!("; {put} photo(s) put in {dir}"));
+        if renamed > 0 {
+            summary.push_str(&format!(" ({renamed} under a new name: one of its name was there already)"));
+        }
+    }
+    if strange > 0 {
+        s.notify(format!("{strange} photo(s) in the field package weren't brought back: their names aren't plain file names"), true);
     }
     s.notify(summary, false);
     if let Some(o) = done.as_object_mut() {
@@ -601,6 +646,46 @@ mod tests {
         let mut other = sample();
         let e = other.run("offline.bringBack", &json!({"path": sent.display().to_string()})).unwrap_err();
         assert!(e.contains("no offline area 'Trip'"), "{e}");
+    }
+
+    #[test]
+    fn photos_go_back_only_as_pictures_and_never_replace_one_already_home() {
+        let temp = Temp::new("photos");
+        let mut home = sample();
+        home.path = Some(temp.path().join("home.rgis"));
+        let cities = layer(&home, "Cities");
+        home.run("edit.addField", &json!({"layer": cities, "name": "photos", "type": "text"})).unwrap();
+        let secret = temp.path().join("notes.txt");
+        let picture = temp.path().join(".pending.jpg");
+        std::fs::write(&secret, b"not a picture").unwrap();
+        std::fs::write(&picture, b"first").unwrap();
+        let named = format!("{};{}", secret.display(), picture.display());
+        home.run("edit.setValue", &json!({"layer": cities, "row": 0, "field": "photos", "value": named})).unwrap();
+        // Going out: no photos, whatever the features name.
+        let (_, out) = package(&mut home, &json!({"name": "Pics", "extent": [-180.0, -85.0, 180.0, 85.0]})).unwrap();
+        assert!(rustgis_data::zip::read(&out).unwrap().iter().all(|(n, _)| !n.starts_with("photos/")));
+        // Coming back: the picture only, under a plain name; the text file stays named as it was.
+        let unpacked = temp.path().join("field");
+        let text = unpack_into(&out, &unpacked).unwrap();
+        let mut field = Session::new(project_in(&text, &unpacked).unwrap());
+        let back = |field: &mut Session| package(field, &Value::Null).unwrap().1;
+        let entries = rustgis_data::zip::read(&back(&mut field)).unwrap();
+        let photos: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).filter(|n| n.starts_with("photos/")).collect();
+        assert_eq!(photos, ["photos/_pending.jpg"]);
+        let first = back(&mut field);
+        // A second package's photo of that name, other bytes: kept beside the first, renamed.
+        std::fs::write(&picture, b"second").unwrap();
+        let second = back(&mut field);
+        let path = temp.path().join("back.rgisfield");
+        std::fs::write(&path, &first).unwrap();
+        home.run("offline.bringBack", &json!({"path": path.display().to_string()})).unwrap();
+        std::fs::write(&path, &second).unwrap();
+        let mark = home.notice_mark();
+        home.run("offline.bringBack", &json!({"path": path.display().to_string()})).unwrap();
+        let dir = temp.path().join("Pics photos");
+        assert_eq!(std::fs::read(dir.join("_pending.jpg")).unwrap(), b"first");
+        assert_eq!(std::fs::read(dir.join("2-_pending.jpg")).unwrap(), b"second");
+        assert!(home.notices_since(mark).iter().any(|n| n.text.contains("under a new name")));
     }
 
     #[test]
