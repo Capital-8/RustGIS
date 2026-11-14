@@ -68,6 +68,10 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onCreate(android.os.Bundle saved) {
         super.onCreate(saved);
+        // A photo being taken when Android ended the app (the camera app in front): its file.
+        if (saved != null && saved.getString("photo") != null) {
+            photo = new File(saved.getString("photo"));
+        }
         // The insets are read where Android hands them over, on the main thread, and kept for
         // the Rust side to ask for from its own.
         getWindow().getDecorView().setOnApplyWindowInsetsListener((view, given) -> {
@@ -312,6 +316,15 @@ public class MainActivity extends NativeActivity {
         super.onDestroy();
     }
 
+    /** Keeps the photo being taken's file, should Android end the app while the camera is up. */
+    @Override
+    protected void onSaveInstanceState(android.os.Bundle out) {
+        super.onSaveInstanceState(out);
+        if (photo != null) {
+            out.putString("photo", photo.getAbsolutePath());
+        }
+    }
+
     /**
      * Asks the camera app for a photo, written to the app's photos folder through PhotoProvider:
      * a "photo" event follows, or "cancelled". The device's own camera app takes it, so RustGIS
@@ -502,7 +515,11 @@ public class MainActivity extends NativeActivity {
                 if (file != null) {
                     file.delete();
                 }
-                add(result == RESULT_OK ? "failed\tThe camera app said it took a photo, but wrote none." : "cancelled");
+                if (file == null && result == RESULT_OK) {
+                    add("failed\tThe camera app took a photo, but RustGIS lost track of it: look in its photos folder.");
+                } else {
+                    add(result == RESULT_OK ? "failed\tThe camera app said it took a photo, but wrote none." : "cancelled");
+                }
             }
             answered();
             return;

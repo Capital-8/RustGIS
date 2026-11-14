@@ -488,11 +488,8 @@ fn capture_rows(app: &RustGisApp, ctx: &egui::Context) -> usize {
     let state = form(ctx);
     let Some(target) = capture_layer(app, &state) else { return 2 };
     let layer = app.session.map().layer(target.id);
-    let fields = layer.map_or(0, |l| {
-        l.dataset.fields.len() - usize::from(photos::field(l).is_some())
-            + usize::from(!l.design.templates.is_empty())
-            + usize::from(!form::required(l).is_empty())
-    });
+    let fields = layer
+        .map_or(0, |l| l.dataset.fields.len() + usize::from(!l.design.templates.is_empty()) + usize::from(!form::required(l).is_empty()));
     // The mode row, then in Edit mode its words, its buttons and the layers; else the form.
     if state.edit_mode {
         let buttons = match (state.editing, target.kind) {
@@ -614,6 +611,8 @@ fn add_feature(app: &mut RustGisApp, id: u32, form: &Form, geometry: Value) -> b
     let empty: Vec<String> = form::required(layer)
         .into_iter()
         .filter(|name| !attributes.contains_key(name) && !defaulted(layer, form, name))
+        // The photos taken fill the photos field.
+        .filter(|name| form.photos.is_empty() || photos::field(layer).as_deref() != Some(name.as_str()))
         .map(|name| layer.dataset.fields.iter().find(|f| f.name == name).map_or(name.clone(), |f| f.display().to_string()))
         .collect();
     if !empty.is_empty() {
@@ -630,7 +629,9 @@ fn add_feature(app: &mut RustGisApp, id: u32, form: &Form, geometry: Value) -> b
     // The photos taken for it go in the layer's photos field, made when it has none.
     if !form.photos.is_empty() {
         let Some(field) = photos::ensure_field(app, id) else { return false };
-        attributes.insert(field, json!(photos::joined("", &form.photos)));
+        // After what was typed in the field, if it was.
+        let typed = attributes.get(&field).and_then(Value::as_str).unwrap_or_default().to_string();
+        attributes.insert(field, json!(photos::joined(&typed, &form.photos)));
     }
     let mut feature = json!({"layer": id, "geometry": geometry, "attributes": attributes});
     // A template chosen while the layer still has it: one removed since is not asked for.
@@ -831,7 +832,14 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let taken = std::mem::take(&mut app.photos);
         match picked.filter(|_| state.edit_mode) {
             Some((row, _)) => {
-                photos::attach(app, target.id, row, &taken);
+                // Not attached (the refusal is said): where the photos are kept is said too.
+                if !photos::attach(app, target.id, row, &taken) {
+                    let kept = taken.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+                    app.session.notify(
+                        rustgis_ui_egui::i18n::fmt("The photo wasn't attached to the feature. It is kept at {paths}.", &[("paths", &kept)]),
+                        true,
+                    );
+                }
             }
             None => state.photos.extend(taken),
         }
@@ -959,8 +967,6 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let left: Vec<Option<Vec<String>>> =
             fields.iter().map(|f| layer.and_then(|l| form::contingent(l, &f.name, &state.values))).collect();
         let ranges: Vec<Option<(f64, f64)>> = fields.iter().map(|f| layer.and_then(|l| range_of(l, &f.name))).collect();
-        // The photos field is filled from the photos row above, not typed into.
-        let photo_field = layer.and_then(photos::field);
         let described: Vec<Option<Vec<(String, String)>>> =
             fields.iter().map(|f| layer.and_then(|l| l.design.domain(&f.name)).map(described)).collect();
         if !required.is_empty() {
@@ -986,9 +992,6 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         state.window = window;
         for (i, (field, list)) in fields.iter().zip(lists).enumerate() {
             use rustgis_ui_egui::rustgis_engine::data::FieldType;
-            if photo_field.as_deref() == Some(field.name.as_str()) {
-                continue;
-            }
             let name = field.alias.clone().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| field.name.clone());
             let needed = required.contains(&field.name);
             let label = if needed { format!("{name} *") } else { name };
@@ -1863,6 +1866,28 @@ mod tests {
         app.locate = false;
         frame(&mut app, &ctx, Sheet::Capture);
         assert!(track::field(&ctx).averaging.is_none());
+    }
+
+    #[test]
+    fn a_photos_field_the_layer_has_stays_typeable_and_one_not_of_text_is_said() {
+        let mut app = RustGisApp::with_sample();
+        let cities = target(&mut app, GeometryType::Point);
+        run(&mut app, "edit.addField", json!({"layer": cities.id, "name": "Photo", "type": "text"}));
+        // What is typed in it stays, the photo after it.
+        let mut state = Form { photos: vec!["/data/photos/b.jpg".into()], ..Form::default() };
+        state.values.insert("Photo".into(), "site.jpg".into());
+        assert!(add_point(&mut app, cities.id, &state));
+        let layer = app.session.map().layer(cities.id).unwrap();
+        let column = layer.dataset.field_index("Photo").unwrap();
+        assert_eq!(layer.dataset.value(layer.dataset.features.len() - 1, column).to_string(), "site.jpg;/data/photos/b.jpg");
+        // A field of that name that isn't text: nothing is added, and the field is named.
+        let rivers = target(&mut app, GeometryType::Polyline);
+        run(&mut app, "edit.addField", json!({"layer": rivers.id, "name": "photos", "type": "long"}));
+        let mark = app.session.notice_mark();
+        let line = geometry(GeometryType::Polyline, &[(1.0, 1.0), (2.0, 2.0)]).unwrap();
+        assert!(!add_feature(&mut app, rivers.id, &Form { photos: vec!["/data/photos/c.jpg".into()], ..Form::default() }, line));
+        let said: Vec<_> = app.session.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|t| t.contains("photos") && t.contains("isn't a text field")), "{said:?}");
     }
 
     #[test]
