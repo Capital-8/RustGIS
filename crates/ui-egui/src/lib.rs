@@ -1165,6 +1165,9 @@ pub struct RustGisApp {
     /// or an average needs each, including those that arrived together after the app was out of
     /// sight.
     pub fixes: std::collections::VecDeque<rustgis_engine::platform::Fix>,
+    /// Whether the interface wants positions while the app is out of sight too (a track being
+    /// recorded): a phone's shell keeps them coming then, with the notice its system requires.
+    pub keep_locating: bool,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1435,6 +1438,7 @@ impl RustGisApp {
             locate: false,
             position: None,
             fixes: std::collections::VecDeque::new(),
+            keep_locating: false,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]

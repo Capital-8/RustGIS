@@ -30,6 +30,9 @@ public class MainActivity extends NativeActivity {
     private static final int PICK = 1;
     private static final int SAVE = 2;
     private static final int LOCATION = 3;
+    private static final int NOTIFY = 4;
+    /** The most events kept for the Rust side: two days of a position a second out of sight. */
+    private static final int MOST_EVENTS = 200_000;
     private static final int COPY_BUFFER = 1 << 16;
 
     private final ArrayList<String> events = new ArrayList<>();
@@ -40,6 +43,12 @@ public class MainActivity extends NativeActivity {
     private String purpose = "";
     /** Whether positions are wanted (the main thread's alone). */
     private boolean locating;
+    /** Whether positions are wanted out of sight too, with TrackService running (the main thread's alone). */
+    private boolean keepLocating;
+    /** Events dropped past MOST_EVENTS since the Rust side last took them (guarded by events). */
+    private int dropped;
+    /** Why TrackService couldn't run, until takeEvents says so. */
+    private static volatile String refusal;
     /** The listener positions arrive on, while they are asked for. */
     private android.location.LocationListener positions;
     /** The user is being asked for leave to use the location, and hasn't answered. */
@@ -109,6 +118,18 @@ public class MainActivity extends NativeActivity {
     @Override
     public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(request, permissions, results);
+        // Leave to show notifications only shows TrackService's notice: it runs either way. A
+        // notice posted before the leave was given isn't shown, so the service posts it again.
+        if (request == NOTIFY) {
+            if (keepLocating && results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                try {
+                    startForegroundService(new Intent(this, TrackService.class));
+                } catch (RuntimeException e) {
+                    add("failed\tThe track's notice can't be shown: " + e.getMessage());
+                }
+            }
+            return;
+        }
         if (request != LOCATION) {
             return;
         }
@@ -145,12 +166,52 @@ public class MainActivity extends NativeActivity {
         add("stopped");
     }
 
-    /** Positions are not asked for while the app is out of sight: they would only pile up. */
+    /**
+     * Positions are not asked for while the app is out of sight, where they would only pile up,
+     * unless a track wants them (keepLocating): TrackService then keeps the app in the foreground
+     * for Android, and they wait in the events.
+     */
     @Override
     protected void onStop() {
         started = false;
-        stopLocating();
+        if (!keepLocating) {
+            stopLocating();
+        }
         super.onStop();
+    }
+
+    /**
+     * Keeps positions coming while the app is out of sight (on), for a track, or lets them stop
+     * there again (off). On starts TrackService, a foreground service with its notification, and
+     * asks for leave to show notifications where Android wants it (13 and later; refused, the
+     * service still runs, its notice unseen). Called while the app is in sight.
+     */
+    public void keepLocating(final boolean on) {
+        runOnUiThread(() -> {
+            keepLocating = on;
+            Intent service = new Intent(this, TrackService.class);
+            if (!on) {
+                stopService(service);
+                if (!started) {
+                    stopLocating();
+                }
+                return;
+            }
+            if (android.os.Build.VERSION.SDK_INT >= 33 && !allowed("android.permission.POST_NOTIFICATIONS")) {
+                requestPermissions(new String[] {"android.permission.POST_NOTIFICATIONS"}, NOTIFY);
+            }
+            try {
+                startForegroundService(service);
+            } catch (RuntimeException e) {
+                keepLocating = false;
+                add("failed\tPositions can't be kept while RustGIS is out of sight: " + e.getMessage());
+            }
+        });
+    }
+
+    /** TrackService was refused by Android: takeEvents says why. */
+    static void serviceRefused(String why) {
+        refusal = why;
     }
 
     /** Back in sight: positions are asked for again, if they were wanted and are still allowed. */
@@ -242,6 +303,7 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onDestroy() {
         stopLocating();
+        stopService(new Intent(this, TrackService.class));
         super.onDestroy();
     }
 
@@ -292,11 +354,26 @@ public class MainActivity extends NativeActivity {
 
     /** What happened since the last call, oldest first, one event to a line. */
     public String takeEvents() {
+        String why = refusal;
+        if (why != null) {
+            refusal = null;
+            keepLocatingRefused();
+            add("failed\t" + why);
+        }
         synchronized (events) {
+            if (dropped > 0) {
+                events.add(0, "failed\t" + dropped + " positions found while RustGIS was out of sight were dropped: more were waiting than it keeps.");
+                dropped = 0;
+            }
             String taken = String.join("\n", events);
             events.clear();
             return taken;
         }
+    }
+
+    /** TrackService didn't start: positions stop out of sight again. */
+    private void keepLocatingRefused() {
+        runOnUiThread(() -> keepLocating = false);
     }
 
     /**
@@ -350,6 +427,11 @@ public class MainActivity extends NativeActivity {
 
     private void add(String event) {
         synchronized (events) {
+            // Out of sight for days, the oldest go first, and how many is said.
+            if (events.size() >= MOST_EVENTS) {
+                events.remove(0);
+                dropped++;
+            }
             events.add(event.replaceAll("[\\n\\r]", " "));
         }
     }
