@@ -78,10 +78,6 @@ mod android {
     /// it: long enough for the keyboard to finish closing.
     const KEYBOARD_SETTLES: std::time::Duration = std::time::Duration::from_millis(1500);
 
-    /// How much the window's bottom room shrinks, in points, when the soft keyboard closes, at the
-    /// least: more than the navigation bar coming and going.
-    const KEYBOARD_LEAST: f32 = 120.0;
-
     /// What a service couldn't do, kept until the next frame says it in the window (a service has
     /// no session to tell).
     type Refusals = Rc<RefCell<Vec<String>>>;
@@ -96,9 +92,6 @@ mod android {
         poll: Option<u64>,
         /// Whether the phone was last asked for positions (`RustGisApp::locate`, as last seen).
         locating: bool,
-        /// The room last taken at the window's bottom, in points: the soft keyboard's going
-        /// shows as it shrinking.
-        bottom: Option<f32>,
         /// Whether the soft keyboard was up, where the phone says.
         keyboard: Option<bool>,
         /// Until when the window looks again for the soft keyboard's room: a moment after the
@@ -387,18 +380,12 @@ mod android {
             // The soft keyboard closed (Back, or its own button) while a field still has the
             // focus: typing is over, so the field lets it go. Kept, the interface would stay laid
             // out for typing until the next tap, and move what that tap was aimed at. Android 11
-            // and later say when the keyboard goes; before, the room it took shrinking a lot is
-            // taken for it going (a keyboard that only shrinks, as on turning, may end it there).
-            if let Some((egui::SafeAreaInsets(edges), keyboard)) = room {
-                let gone = match (self.keyboard, keyboard) {
-                    (Some(true), Some(false)) => true,
-                    (_, Some(_)) => false,
-                    _ => self.bottom.is_some_and(|before| edges.bottom < before - KEYBOARD_LEAST),
-                };
-                if gone && ctx.egui_wants_keyboard_input() {
+            // and later say when the keyboard goes. Before, it isn't reported at all (nor its
+            // room), and the field keeps the focus until the next tap.
+            if let Some((_, keyboard)) = room {
+                if self.keyboard == Some(true) && keyboard == Some(false) && ctx.egui_wants_keyboard_input() {
                     ctx.memory_mut(|m| m.stop_text_input());
                 }
-                self.bottom = Some(edges.bottom);
                 self.keyboard = keyboard;
             }
             self.take_phone_events(ctx, raw_input);
@@ -535,7 +522,6 @@ mod android {
                     poll: None,
                     locating: false,
                     typing: None,
-                    bottom: None,
                     keyboard: None,
                     bars_light: None,
                     pushed,
