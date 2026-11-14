@@ -344,19 +344,36 @@ fn take_new_fields(s: &mut Session, ai: usize, edited: &rustgis_map::Map) -> Vec
 fn unpack_dir(stem: &str) -> Result<PathBuf, String> {
     let base =
         rustgis_data::dirs::app_data_dir().ok_or("this computer gives RustGIS no folder of its own to unpack the field package into")?;
-    Ok(base.join("field").join(super::items::safe(stem)))
+    Ok(fresh_dir(&base.join("field"), &super::items::safe(stem)))
 }
 
-/// Unpacks a field package's `bytes` into its folder (emptied first: it holds only an earlier
-/// copy of a package of this name) and returns the folder and the project's text. An entry
-/// that would land outside the folder is refused, and the package with it.
+/// A folder in `base` named `name`, or `name 2`, `name 3`… when one is there: a copy unpacked
+/// before (another package of the same name, perhaps still open) is never written over.
+fn fresh_dir(base: &Path, name: &str) -> PathBuf {
+    let mut dir = base.join(name);
+    for n in 2.. {
+        if !dir.exists() {
+            break;
+        }
+        dir = base.join(format!("{name} {n}"));
+    }
+    dir
+}
+
+/// Unpacks a field package's `bytes` into a folder of its own in the app's folder (`field/<name>`,
+/// numbered when that is taken) and returns the folder and the project's text. An entry that
+/// would land outside the folder is refused, and the package with it.
+///
+/// The project's own paths are trusted as a project file's are: a package from someone else can
+/// name files outside the folder, as a `.rgis` can.
 pub(crate) fn unpack(bytes: &[u8], stem: &str) -> Result<(PathBuf, String), String> {
     let dir = unpack_dir(stem)?;
     let text = unpack_into(bytes, &dir)?;
     Ok((dir, text))
 }
 
-/// Unpacks a field package's `bytes` into `dir` (see [`unpack`]) and returns the project's text.
+/// Unpacks a field package's `bytes` into `dir`, a folder not there yet (see [`unpack`]), and
+/// returns the project's text. A write that fails removes what was written.
 fn unpack_into(bytes: &[u8], dir: &Path) -> Result<String, String> {
     let entries = rustgis_data::zip::read(bytes)?;
     let mut project = None;
@@ -374,14 +391,21 @@ fn unpack_into(bytes: &[u8], dir: &Path) -> Result<String, String> {
     }
     let text = project.ok_or("the field package holds no project")?;
     if dir.exists() {
-        std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        return Err(format!("{}: the folder is already there", dir.display()));
     }
-    for (rel, data) in files {
-        let path = dir.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    let written = (|| {
+        for (rel, data) in files {
+            let path = dir.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+            std::fs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))?;
         }
-        std::fs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok::<(), String>(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_dir_all(dir);
+        return Err(e);
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(text)
@@ -390,6 +414,16 @@ fn unpack_into(bytes: &[u8], dir: &Path) -> Result<String, String> {
 /// Reads a field package's project, its relative paths resolved against `dir`.
 pub(crate) fn project_in(text: &str, dir: &Path) -> Result<Project, String> {
     Project::from_import_json(text, Some(dir))
+}
+
+/// Removes the offline areas past the first `had` of this project: those a field package just made,
+/// when it wasn't saved after all (the save was cancelled or failed). Says so.
+pub fn forget_new_areas(s: &mut Session, had: usize) {
+    let made: Vec<String> = s.project.offline_areas.iter().skip(had).map(|a| a.name.clone()).collect();
+    for name in made {
+        s.project.offline_areas.retain(|a| a.name != name);
+        s.notify(format!("The field package wasn't saved, so its offline area '{name}' was removed too"), false);
+    }
 }
 
 /// What `offline.package` returns.
@@ -461,10 +495,29 @@ mod tests {
         let base = map.tiles.iter().find(|t| t.name == "Site").unwrap();
         assert_eq!(Path::new(&base.url), into.join("basemaps/site.mbtiles"));
         assert!(into.join("basemaps/site.mbtiles").is_file());
-        // Unpacked again: the folder holds the one copy.
-        std::fs::write(into.join("stale.txt"), b"x").unwrap();
-        unpack_into(&bytes, &into).unwrap();
-        assert!(!into.join("stale.txt").exists());
+        // Unpacked again: into a folder of its own, the first left as it is.
+        assert!(unpack_into(&bytes, &into).unwrap_err().contains("already there"));
+        let again = fresh_dir(temp.path(), "unpacked");
+        assert_eq!(again, temp.path().join("unpacked 2"));
+        unpack_into(&bytes, &again).unwrap();
+        assert!(into.join("basemaps/site.mbtiles").is_file() && again.join("basemaps/site.mbtiles").is_file());
+    }
+
+    #[test]
+    fn a_field_package_not_saved_leaves_no_offline_area() {
+        let mut s = sample();
+        let had = s.project.offline_areas.len();
+        // A place that can't be written: the command is refused, and the area made for it goes.
+        let e = s.run("offline.package", &json!({"path": "/no/such/folder/site.rgisfield", "name": "Lost"})).unwrap_err();
+        assert!(e.contains("site.rgisfield"), "{e}");
+        assert_eq!(s.project.offline_areas.len(), had);
+        // As the front end does when its Save is cancelled: the area goes, and that is said.
+        package(&mut s, &json!({"name": "Cancelled"})).unwrap();
+        assert_eq!(s.project.offline_areas.len(), had + 1);
+        let mark = s.notice_mark();
+        forget_new_areas(&mut s, had);
+        assert_eq!(s.project.offline_areas.len(), had);
+        assert!(s.notices_since(mark).iter().any(|n| n.text.contains("'Cancelled' was removed")));
     }
 
     #[test]

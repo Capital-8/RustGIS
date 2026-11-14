@@ -3995,6 +3995,8 @@ impl RustGisApp {
             // Project items: save (a file dialog, or a download on the web) and open.
             "ui.saveItem" => {
                 let kind = p.get("kind").and_then(Value::as_str).ok_or("kind is required")?;
+                // A field package makes an offline area first: one not saved after all goes again.
+                let areas = self.session.project.offline_areas.len();
                 let session = &mut self.session;
                 let (name, bytes) =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::cmd::items::item_bytes(session, kind, p)))
@@ -4005,9 +4007,15 @@ impl RustGisApp {
                 } else {
                     let (ext, label) =
                         rustgis_engine::cmd::items::ITEMS.iter().find(|i| i.0 == kind).map_or(("json", "File"), |i| (i.1, i.2));
-                    if let Some(path) = dialogs::pick_save(&name, &[ext], tl!(label)) {
-                        rustgis_engine::data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| e.to_string())?;
-                        self.session.notify(i18n::fmt("Saved {name}", &[("name", &path)]), false);
+                    match dialogs::pick_save(&name, &[ext], tl!(label)) {
+                        Some(path) => {
+                            if let Err(e) = rustgis_engine::data::io::write_atomic(std::path::Path::new(&path), &bytes) {
+                                rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas);
+                                return Err(e.to_string());
+                            }
+                            self.session.notify(i18n::fmt("Saved {name}", &[("name", &path)]), false);
+                        }
+                        None => rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas),
                     }
                 }
             }

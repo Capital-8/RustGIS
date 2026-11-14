@@ -151,7 +151,9 @@ names them in its layer's photos field: a text field `photos` (or `photo`) listi
 path, separated by `;`, as a report's attachments field does. A layer without one gets one when its
 first photo is attached, and the sheet says so; the form doesn't offer that field for typing. In Edit
 mode, **Add Photo** attaches a photo to the feature picked, after the ones it has (one edit, which
-undoes).
+undoes; a layer's first photo also adds its photos field, an edit of its own). A photos field the
+layer already has stays in the form: the photos go after what is typed in it. A field named
+`photos` that isn't text can't list them, and the sheet says so.
 
 **Snap** turns the map's snapping on and off (its settings are the desktop's: Edit › Snapping).
 With it on, the cross's place snaps to a vertex, a line's end or an edge in reach, for adding and
@@ -175,8 +177,9 @@ from the web stay in it and show only online; the package says which. Raster lay
 out, and said.
 
 Opening a field package (Open Project, the picker, or a file pushed to the app's folder) unpacks it
-into the app's own `field/<name>` folder and opens its project there, unsaved, as a project
-package opens. Adding an `.mbtiles` or `.pmtiles` file as data adds it as a tile layer too, an
+into a folder of its own in the app's folder (`field/<name>`, numbered when one of that name is
+there: a copy unpacked before is never written over) and opens its project there, unsaved, as a
+project package opens. Its project's paths are trusted as a project file's are. Adding an `.mbtiles` or `.pmtiles` file as data adds it as a tile layer too, an
 offline basemap with no package.
 
 The edits come back the same way. With a field package's map open, **Send Field Package** in the
