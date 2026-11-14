@@ -35,7 +35,8 @@ public class MainActivity extends NativeActivity {
     private static final int MOST_EVENTS = 200_000;
     private static final int COPY_BUFFER = 1 << 16;
 
-    private final ArrayList<String> events = new ArrayList<>();
+    /** Oldest first; a deque, so the oldest goes at once when MOST_EVENTS wait. */
+    private final java.util.ArrayDeque<String> events = new java.util.ArrayDeque<>();
     /** Pickers shown and not yet answered in full (guarded by events). */
     private int asked;
     /** The window's insets as insets() gives them, written on the main thread. */
@@ -362,7 +363,7 @@ public class MainActivity extends NativeActivity {
         }
         synchronized (events) {
             if (dropped > 0) {
-                events.add(0, "failed\t" + dropped + " positions found while RustGIS was out of sight were dropped: more were waiting than it keeps.");
+                events.addFirst("failed\t" + dropped + " positions found while RustGIS was out of sight were dropped: more were waiting than it keeps.");
                 dropped = 0;
             }
             String taken = String.join("\n", events);
@@ -434,7 +435,7 @@ public class MainActivity extends NativeActivity {
         synchronized (events) {
             // Out of sight for days, the oldest go first, and how many is said.
             if (events.size() >= MOST_EVENTS) {
-                events.remove(0);
+                events.pollFirst();
                 dropped++;
             }
             events.add(event.replaceAll("[\\n\\r]", " "));
