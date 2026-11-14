@@ -126,7 +126,9 @@ public class MainActivity extends NativeActivity {
                 try {
                     startForegroundService(new Intent(this, TrackService.class));
                 } catch (RuntimeException e) {
-                    add("failed\tThe track's notice can't be shown: " + e.getMessage());
+                    // Not started again: positions aren't kept out of sight after all.
+                    keepLocating = false;
+                    add("failed\tPositions can't be kept while RustGIS is out of sight: " + e.getMessage());
                 }
             }
             return;

@@ -140,7 +140,6 @@ mod android {
                 self.app.session.notify(text, true);
             }
             let Some(phone) = self.phone.clone() else { return };
-            // Positioning follows what the interface asks for; off, the last position is let go.
             // Positions out of sight follow what the interface asks for (a track being recorded).
             if self.app.keep_locating != self.keeping {
                 self.keeping = self.app.keep_locating;
@@ -148,6 +147,7 @@ mod android {
                     self.app.session.notify(e, true);
                 }
             }
+            // Positioning follows what the interface asks for; off, the last position is let go.
             if self.app.locate != self.locating {
                 self.locating = self.app.locate;
                 if let Err(e) = phone.locate(self.locating) {
