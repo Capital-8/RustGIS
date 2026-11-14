@@ -432,7 +432,7 @@ fn embed_layer(mut l: Layer, budget: &mut u64) -> Layer {
     l
 }
 
-fn embedded_map(m: &Map, budget: &mut u64) -> Map {
+pub(crate) fn embedded_map(m: &Map, budget: &mut u64) -> Map {
     let mut m = m.clone();
     m.layers = m.layers.into_iter().map(|l| embed_layer(l, budget)).collect();
     m
@@ -707,7 +707,7 @@ fn package_project(s: &mut Session) -> Result<Vec<u8>, String> {
     ])
 }
 
-fn safe(name: &str) -> String {
+pub(crate) fn safe(name: &str) -> String {
     let s: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') { c } else { '_' }).collect();
     if s.trim().is_empty() { "project".into() } else { s }
 }
@@ -1501,6 +1501,7 @@ pub const ITEMS: &[(&str, &str, &str)] = &[
     ("ramps", "rgisramp", "RustGIS colour ramps"),
     ("template", "rgistemplate", "RustGIS project template"),
     ("projectPackage", "rgispkg", "RustGIS project package"),
+    ("fieldPackage", "rgisfield", "RustGIS field package"),
     ("mapPackage", "rgismpk", "RustGIS map package"),
     ("mobilePackage", "rgismpk", "RustGIS mobile map package"),
     ("gpPackage", "rgisgpk", "RustGIS results package"),
@@ -1580,6 +1581,7 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
             (name, bytes)
         }
         "projectPackage" => (s.project.name.clone(), package_project(s)?),
+        "fieldPackage" => super::field::package(s, p)?,
         "mapPackage" | "mobilePackage" => {
             let tol = f(p, "tolerance").unwrap_or(0.001).clamp(0.0, 1.0);
             (s.map().name.clone(), package_map(s, kind == "mobilePackage", tol)?)

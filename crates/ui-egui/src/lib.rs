@@ -3844,7 +3844,7 @@ impl RustGisApp {
                     open("project");
                     self.ui.backstage = false;
                 } else if let Some(path) = dialogs::pick_open(
-                    &["rgis", "rgisx", "rgispkg", "qgs", "qgz", "geolibre", "json"],
+                    &["rgis", "rgisx", "rgispkg", "rgisfield", "qgs", "qgz", "geolibre", "json"],
                     tl!("Projects and JSON data (RustGIS, QGIS, GeoLibre)"),
                 ) {
                     // A QGIS project opens as a new map of this one.

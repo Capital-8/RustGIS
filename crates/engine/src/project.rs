@@ -38,7 +38,9 @@ pub const PACKAGE_EXTENSION: &str = "rgispkg";
 /// Whether a file name or path opens as a project: a project file or a project package, ignoring
 /// case. Unlike [`is_project_file`], this includes packages, which a project never saves to.
 pub fn opens_as_project(name: &str) -> bool {
-    is_project_file(name) || name.to_ascii_lowercase().strip_suffix(PACKAGE_EXTENSION).is_some_and(|s| s.ends_with('.'))
+    is_project_file(name)
+        || name.to_ascii_lowercase().strip_suffix(PACKAGE_EXTENSION).is_some_and(|s| s.ends_with('.'))
+        || crate::cmd::field::is_field_package(name)
 }
 
 /// The command that opens a file given by its path, as the desktop app's command line and a file

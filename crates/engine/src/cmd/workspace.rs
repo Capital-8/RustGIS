@@ -242,6 +242,15 @@ pub fn commands() -> Vec<C> {
         // Offline areas.
         C::new("offline.download", "Download Map", "Data › Offline", offline_download).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"name"?: string, "extent"?: [minLon, minLat, maxLon, maxLat] (the map view when omitted)}"#),
+        C::new("offline.package", "Package for the Field", "Data › Offline", |s, p| {
+            let path = super::ps(p, "path").ok_or("path is required")?.to_string();
+            let (area, bytes) = super::field::package(s, p)?;
+            rustgis_data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+            Ok(super::field::packaged(&path, &area, bytes.len()))
+        })
+        .roles(&[])
+        .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        .params(r#"{"path": "*.rgisfield", "name"?: offline area name, "extent"?: [minLon, minLat, maxLon, maxLat]}"#),
         C::new("offline.sync", "Sync", "Data › Offline", offline_sync).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"name": offline area}"#),
         C::new("offline.remove", "Remove", "Data › Offline", |s, p| {
             let n = ps(p, "name").ok_or("name is required")?;
@@ -622,7 +631,7 @@ fn snapshot(m: &mut rustgis_map::Map, e: &Extent) -> rustgis_map::Map {
 /// Most offline areas a project keeps (each holds a copy of its features).
 const MAX_AREAS: usize = 20;
 
-fn offline_download(s: &mut Session, p: &Value) -> CmdResult {
+pub(crate) fn offline_download(s: &mut Session, p: &Value) -> CmdResult {
     crate::project::ensure_map_imports_complete(s.map())?;
     let e = match p.get("extent").and_then(Value::as_array) {
         Some(a) => {

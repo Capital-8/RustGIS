@@ -988,6 +988,18 @@ fn offline_group(app: &mut RustGisApp, ui: &mut Ui) {
             false,
             false,
         );
+        // The same, as a file for a phone (#1902): the data in view and the map's tile archives.
+        big(
+            ui,
+            app,
+            "package",
+            "Package for\nthe Field",
+            "Save the data in view, with the map's MBTiles and PMTiles basemaps, as a field package to open on a phone.",
+            "ui.saveItem",
+            json!({"kind": "fieldPackage"}),
+            false,
+            false,
+        );
         col(ui, |ui| {
             for (icon, label, cmd, desc) in [
                 ("redo", "Sync", "offline.sync", "Send offline edits back and refresh."),

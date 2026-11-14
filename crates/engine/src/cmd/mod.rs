@@ -16,6 +16,7 @@ pub mod effects;
 pub mod embeddings;
 pub mod exports;
 pub mod extensions;
+pub mod field;
 pub mod geocode;
 pub mod geolibre;
 pub mod gp;

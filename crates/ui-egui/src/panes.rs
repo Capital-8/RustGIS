@@ -2676,6 +2676,7 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         "rgis",
                         "rgisx",
                         "rgispkg",
+                        "rgisfield",
                         "rgismap",
                         "rgismpk",
                         "rgislyr",
