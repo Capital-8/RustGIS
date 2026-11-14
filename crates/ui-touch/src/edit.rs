@@ -21,6 +21,31 @@ pub(crate) const REACH: f32 = super::TARGET / 2.0;
 pub(crate) struct Editing {
     pub feature: u64,
     pub vertex: Option<VertexId>,
+    /// Where the picked vertex was when it was picked or last changed here: one found elsewhere
+    /// (an Undo moved or took it away, or its index now names another) is let go.
+    pub at: Option<(f64, f64)>,
+}
+
+impl Editing {
+    /// The feature `feature`, with no vertex picked.
+    pub fn feature(feature: u64) -> Editing {
+        Editing { feature, vertex: None, at: None }
+    }
+
+    /// The same feature with vertex `v` of `shape` picked (none when `shape` has no such vertex).
+    pub fn picking(self, v: Option<VertexId>, shape: Option<&Geometry>) -> Editing {
+        let at = v.and_then(|v| shape?.vertex(v)).map(|c| (c.x, c.y));
+        Editing { vertex: v.filter(|_| at.is_some()), at, ..self }
+    }
+
+    /// Lets the picked vertex go when `shape` has it elsewhere than it was, or not at all.
+    pub fn checked(self, shape: Option<&Geometry>) -> Editing {
+        match self.vertex {
+            Some(v) if shape.and_then(|g| g.vertex(v)).map(|c| (c.x, c.y)) == self.at => self,
+            Some(_) => Editing { vertex: None, at: None, ..self },
+            None => self,
+        }
+    }
 }
 
 /// The place the cross snapped to, as longitude and latitude, and what it snapped to (`vertex`,
@@ -123,10 +148,7 @@ pub(crate) fn vertex(
         return Some(None);
     }
     let read = |k: &str| done.get(k).and_then(serde_json::Value::as_u64).and_then(|n| usize::try_from(n).ok());
-    Some(match (read("part"), read("ring"), read("index")) {
-        (Some(part), Some(ring), Some(index)) => Some(VertexId::new(part, ring, index)),
-        _ => Some(v),
-    })
+    Some(Some(VertexId::new(read("part")?, read("ring")?, read("index")?)))
 }
 
 /// Deletes the feature in row `row` of layer `id`, as one edit that undoes. Says whether it was.

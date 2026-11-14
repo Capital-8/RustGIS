@@ -81,7 +81,13 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
             track::set_field(&ctx, state);
         }
     }
-    app.keep_locating = track::field(&ctx).track.is_some();
+    // Only while positioning is on: Android ending it (or Hide) needs no service out of sight.
+    // Changed, a frame follows at once, so the phone hears of it before the app leaves sight.
+    let keep = app.locate && track::field(&ctx).track.is_some();
+    if keep != app.keep_locating {
+        app.keep_locating = keep;
+        ctx.request_repaint();
+    }
     let frame = egui::Frame::NONE.fill(t.pane).stroke(Stroke::new(1.0, t.border));
     egui::Panel::bottom("touch_bar").exact_size(BAR).frame(frame).show(ui, |ui| bar(app, ui, &t, shown));
     // A track being recorded says so over the bar, with its Stop, whatever sheet is up.
@@ -145,12 +151,19 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
         // The track being recorded, as it grows.
         if let (Some(recording), Some((map, _))) = (track::field(&ctx).track, app.map.view_rect) {
             let painter = ui.painter().with_clip_rect(map);
-            let points: Vec<Option<egui::Pos2>> = recording.points.iter().map(|f| app.lonlat_to_screen(f.lon, f.lat)).collect();
-            for pair in points.windows(2) {
-                if let [Some(a), Some(b)] = pair {
-                    painter.line_segment([*a, *b], Stroke::new(5.0, Color32::WHITE));
-                    painter.line_segment([*a, *b], Stroke::new(3.0, t.green));
+            // One line for each run of points the view shows (a point behind the globe breaks it),
+            // a point on the pixel of the last left out: hours of a track stay a few shapes.
+            let mut runs: Vec<Vec<egui::Pos2>> = vec![Vec::new()];
+            for at in recording.points.iter().map(|f| app.lonlat_to_screen(f.lon, f.lat)) {
+                match (at, runs.last_mut()) {
+                    (Some(p), Some(run)) if run.last().is_none_or(|q| q.distance(p) >= 1.0) => run.push(p),
+                    (Some(_), _) => {}
+                    (None, _) => runs.push(Vec::new()),
                 }
+            }
+            for run in runs.into_iter().filter(|r| r.len() > 1) {
+                painter.add(egui::Shape::line(run.clone(), Stroke::new(5.0, Color32::WHITE)));
+                painter.add(egui::Shape::line(run, Stroke::new(3.0, t.green)));
             }
         }
         if shown == Sheet::Capture
@@ -823,9 +836,9 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let fresh = stale.is_none();
     // The feature being edited, while it is still there (an undo may have taken it away).
     let picked = state.editing.and_then(|e| edit::row_of(app, target.id, e.feature).map(|row| (row, e)));
-    if picked.is_none() {
-        state.editing = None;
-    }
+    // A picked vertex an Undo moved or took away is let go.
+    let picked = picked.map(|(row, e)| (row, e.checked(edit::shape(app, target.id, row).as_ref())));
+    state.editing = picked.map(|(_, e)| e);
     // Photos the camera took: for the feature being edited, attached to it now; else kept for
     // the next feature.
     if !app.photos.is_empty() {
@@ -1182,7 +1195,7 @@ fn edit_sheet(
         ui.label(RichText::new(says).size(14.0).color(t.text));
         if action(ui, t, tl!("Pick Feature at Cross"), width, true, true) {
             match edit::feature_at_cross(app, target.id) {
-                Some(feature) => state.editing = Some(edit::Editing { feature, vertex: None }),
+                Some(feature) => state.editing = Some(edit::Editing::feature(feature)),
                 None => app
                     .session
                     .notify(rustgis_ui_egui::i18n::fmt("No feature of {layer} is under the cross.", &[("layer", &target.name)]), true),
@@ -1211,7 +1224,7 @@ fn edit_sheet(
         if action(ui, t, tl!("Pick Vertex at Cross"), width, !has, true) {
             let middle = app.map.view_rect.map(|(rect, _)| rect.center());
             match middle.and_then(|at| edit::vertex_near(app, &shape, at)) {
-                Some(v) => state.editing = Some(edit::Editing { vertex: Some(v), ..editing }),
+                Some(v) => state.editing = Some(editing.picking(Some(v), Some(&shape))),
                 None => app.session.notify(tl!("No vertex is near the cross. Move the map so the cross is on one."), true),
             }
         }
@@ -1227,7 +1240,8 @@ fn edit_sheet(
                     if act != "delete" && at.is_none() {
                         app.session.notify(off(), true);
                     } else if let Some(next) = edit::vertex(app, target.id, row, v, act, at) {
-                        state.editing = Some(edit::Editing { vertex: next, ..editing });
+                        let now = edit::shape(app, target.id, row);
+                        state.editing = Some(editing.picking(next, now.as_ref()));
                     }
                 }
             }
@@ -1708,7 +1722,7 @@ mod tests {
             Form {
                 shown: Some(rivers.instance),
                 edit_mode: true,
-                editing: Some(edit::Editing { feature, vertex: Some(first) }),
+                editing: Some(edit::Editing::feature(feature).picking(Some(first), edit::shape(&app, rivers.id, row).as_ref())),
                 ..Form::default()
             },
         );
@@ -1781,6 +1795,13 @@ mod tests {
         assert!(app.locate);
         frame(&mut app, &ctx, Sheet::None);
         assert!(app.keep_locating);
+        // Positioning ended by Android, the track still recording: no service out of sight.
+        app.locate = false;
+        frame(&mut app, &ctx, Sheet::None);
+        assert!(!app.keep_locating);
+        app.locate = true;
+        frame(&mut app, &ctx, Sheet::None);
+        assert!(app.keep_locating);
         // Stopped: no longer, and the track (too short here) is said, not kept.
         stop_track(&mut app, &ctx);
         frame(&mut app, &ctx, Sheet::None);
@@ -1813,12 +1834,7 @@ mod tests {
         let feature = layer.dataset.features[row].id;
         set_form(
             &ctx,
-            Form {
-                shown: Some(cities.instance),
-                edit_mode: true,
-                editing: Some(edit::Editing { feature, vertex: None }),
-                ..Form::default()
-            },
+            Form { shown: Some(cities.instance), edit_mode: true, editing: Some(edit::Editing::feature(feature)), ..Form::default() },
         );
         app.photos.push("/data/photos/b.jpg".into());
         frame(&mut app, &ctx, Sheet::Capture);
@@ -1888,6 +1904,25 @@ mod tests {
         assert!(!add_feature(&mut app, rivers.id, &Form { photos: vec!["/data/photos/c.jpg".into()], ..Form::default() }, line));
         let said: Vec<_> = app.session.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
         assert!(said.iter().any(|t| t.contains("photos") && t.contains("isn't a text field")), "{said:?}");
+    }
+
+    #[test]
+    fn a_picked_vertex_an_undo_moved_or_took_away_is_let_go() {
+        use rustgis_ui_egui::rustgis_engine::data::{Coord, Geometry};
+        let line = |points: &[(f64, f64)]| Geometry::Line(vec![points.iter().map(|(x, y)| Coord::new(*x, *y)).collect()]);
+        let abc = line(&[(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]);
+        // B picked, then N added after it and picked: index 2 is N.
+        let with_n = line(&[(0.0, 0.0), (1.0, 0.0), (1.5, 1.0), (2.0, 0.0)]);
+        let picked = edit::Editing::feature(7).picking(Some(VertexId::new(0, 0, 2)), Some(&with_n));
+        assert_eq!(picked.checked(Some(&with_n)), picked);
+        // Undone: index 2 is now C, elsewhere than N was: let go.
+        assert_eq!(picked.checked(Some(&abc)).vertex, None);
+        // N was the last vertex: the index is gone, and so is the pick.
+        let n_last = line(&[(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0)]);
+        let last = edit::Editing::feature(7).picking(Some(VertexId::new(0, 0, 3)), Some(&n_last));
+        assert_eq!(last.checked(Some(&abc)).vertex, None);
+        // A vertex the shape doesn't have isn't picked at all.
+        assert_eq!(edit::Editing::feature(7).picking(Some(VertexId::new(0, 0, 9)), Some(&abc)).vertex, None);
     }
 
     #[test]

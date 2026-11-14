@@ -46,17 +46,25 @@ pub(crate) fn ensure_field(app: &mut RustGisApp, id: u32) -> Option<String> {
     app.session.map().layer(id).and_then(field)
 }
 
-/// A photos field's text with `more` photos after what it held: paths separated by `;`, none
-/// listed twice.
+/// A photos field's text with `more` photos after what it held: what it held as it was (its outer
+/// spaces aside), then each photo it doesn't list already, separated by `;`.
 pub(crate) fn joined(held: &str, more: &[PathBuf]) -> String {
-    let mut all: Vec<String> = held.split(';').map(str::trim).filter(|p| !p.is_empty()).map(String::from).collect();
+    let mut text = held.trim().to_string();
+    let listed: Vec<String> = text.split(';').map(|p| p.trim().to_string()).collect();
+    let mut added: Vec<String> = Vec::new();
     for path in more {
         let path = path.display().to_string();
-        if !all.contains(&path) {
-            all.push(path);
+        if !listed.contains(&path) && !added.contains(&path) {
+            added.push(path);
         }
     }
-    all.join(";")
+    for path in added {
+        if !text.is_empty() {
+            text.push(';');
+        }
+        text.push_str(&path);
+    }
+    text
 }
 
 /// Attaches `more` photos to the feature in row `row` of layer `id`, after the ones it has: one
@@ -101,7 +109,11 @@ mod tests {
         let b = PathBuf::from("/data/photos/b.jpg");
         assert_eq!(joined("", std::slice::from_ref(&a)), "/data/photos/a.jpg");
         assert_eq!(joined("/data/photos/a.jpg", &[a.clone(), b.clone()]), "/data/photos/a.jpg;/data/photos/b.jpg");
-        assert_eq!(joined(" ; /x.jpg ;", &[]), "/x.jpg");
+        // What was held stays as it was typed, spaces and repeats and all.
+        assert_eq!(joined("Front; back", std::slice::from_ref(&b)), "Front; back;/data/photos/b.jpg");
+        assert_eq!(joined("a.jpg; a.jpg", &[]), "a.jpg; a.jpg");
+        assert_eq!(joined("  x  ", &[]), "x");
+        assert_eq!(joined("", &[a.clone(), a.clone()]), "/data/photos/a.jpg");
         assert_eq!(name(&b), "b.jpg");
     }
 }

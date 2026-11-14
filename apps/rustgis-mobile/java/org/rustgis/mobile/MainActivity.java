@@ -71,6 +71,10 @@ public class MainActivity extends NativeActivity {
         // A photo being taken when Android ended the app (the camera app in front): its file.
         if (saved != null && saved.getString("photo") != null) {
             photo = new File(saved.getString("photo"));
+            // The camera's answer is still to come: answered() balances this.
+            synchronized (events) {
+                asked++;
+            }
         }
         // The insets are read where Android hands them over, on the main thread, and kept for
         // the Rust side to ask for from its own.
@@ -134,7 +138,9 @@ public class MainActivity extends NativeActivity {
                 try {
                     startForegroundService(new Intent(this, TrackService.class));
                 } catch (RuntimeException e) {
-                    add("failed\tThe track's notice can't be shown: " + e.getMessage());
+                    // Not started again: positions aren't kept out of sight after all.
+                    keepLocating = false;
+                    add("failed\tPositions can't be kept while RustGIS is out of sight: " + e.getMessage());
                 }
             }
             return;
