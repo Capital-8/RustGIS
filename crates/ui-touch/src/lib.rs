@@ -1834,12 +1834,7 @@ mod tests {
         let feature = layer.dataset.features[row].id;
         set_form(
             &ctx,
-            Form {
-                shown: Some(cities.instance),
-                edit_mode: true,
-                editing: Some(edit::Editing::feature(feature)),
-                ..Form::default()
-            },
+            Form { shown: Some(cities.instance), edit_mode: true, editing: Some(edit::Editing::feature(feature)), ..Form::default() },
         );
         app.photos.push("/data/photos/b.jpg".into());
         frame(&mut app, &ctx, Sheet::Capture);
