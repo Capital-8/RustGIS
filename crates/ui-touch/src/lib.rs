@@ -485,7 +485,15 @@ fn capture_rows(app: &RustGisApp, ctx: &egui::Context) -> usize {
         };
         return 4 + buttons + usize::from(app.locate);
     }
-    let calendar = if state.calendar.is_some() { form::CALENDAR_ROWS } else { 0 };
+    // A date and time's calendar has its Now row too.
+    let calendar = match (&state.calendar, layer) {
+        (Some((name, _)), Some(l)) => {
+            let timed =
+                l.dataset.fields.iter().any(|f| &f.name == name && f.ty == rustgis_ui_egui::rustgis_engine::data::FieldType::DateTime);
+            form::CALENDAR_ROWS + usize::from(timed)
+        }
+        _ => 0,
+    };
     let averaging = usize::from(app.locate && track::field(ctx).averaging.is_some());
     1 + averaging + fields + calendar + if target.kind == GeometryType::Point { 3 } else { 4 } + usize::from(app.locate)
 }
@@ -629,8 +637,13 @@ fn defaulted(layer: &rustgis_ui_egui::rustgis_engine::map::Layer, form: &Form, n
         defaults.iter().any(|(field, value)| field.eq_ignore_ascii_case(name) && !value.is_null())
     };
     let template = form.template.as_ref().and_then(|t| layer.design.templates.iter().find(|x| &x.name == t));
+    // The subtype the form chose, or else the one the template gives, as the engine reads it.
     let subtype = layer.design.subtypes.as_ref().and_then(|s| {
-        let code = form.values.iter().find(|(field, _)| field.eq_ignore_ascii_case(&s.field))?.1.trim().parse::<i64>().ok()?;
+        let typed = form.values.iter().find(|(field, v)| field.eq_ignore_ascii_case(&s.field) && !v.trim().is_empty());
+        let code = match typed {
+            Some((_, v)) => v.trim().parse::<i64>().ok()?,
+            None => template?.defaults.iter().find(|(field, _)| field.eq_ignore_ascii_case(&s.field))?.1.as_f64()? as i64,
+        };
         s.subtypes.iter().find(|x| x.code == code)
     });
     template.is_some_and(|t| has(&t.defaults)) || subtype.is_some_and(|s| has(&s.defaults))
@@ -993,7 +1006,8 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                                 None
                             } else {
                                 let day = form::day_of(value).or_else(form::today);
-                                let month = day.map_or((2026, 1), |d| {
+                                // Without a clock, the calendar starts at 1970's first month.
+                                let month = day.map_or((1970, 1), |d| {
                                     let (y, m, _) = d.ymd();
                                     (y, m)
                                 });
@@ -1616,14 +1630,22 @@ mod tests {
         frame(&mut app, &ctx, Sheet::Capture);
         assert_eq!(form(&ctx).editing.map(|e| e.feature), Some(feature));
         // Deleted, only it: the sheet lets it go.
-        let before = count(&app, rivers.id);
-        // A selection on another layer is left alone.
+        // With nothing selected anywhere it is deleted too (Pick Feature selects nothing).
         let cities = app.session.map().layers.iter().find(|l| l.geometry_type() == GeometryType::Point).unwrap().id;
-        run(&mut app, "select.rows", json!({"layer": cities, "rows": [0]}));
+        let before = count(&app, rivers.id);
+        let last = before - 1;
+        assert!(app.session.map().layers.iter().all(|l| l.selection.is_empty()));
+        assert!(edit::delete_feature(&mut app, rivers.id, last));
+        assert_eq!(count(&app, rivers.id), before - 1);
+        run(&mut app, "edit.undo", Value::Null);
+        assert_eq!(count(&app, rivers.id), before);
+        // A selection on another layer is left as it was.
+        run(&mut app, "select.rows", json!({"layer": cities, "rows": [0, 2]}));
         let cities_before = count(&app, cities);
         assert!(edit::delete_feature(&mut app, rivers.id, row));
         assert_eq!(count(&app, rivers.id), before - 1);
         assert_eq!(count(&app, cities), cities_before);
+        assert_eq!(app.session.map().layer(cities).unwrap().selection, [0, 2]);
         assert_eq!(edit::row_of(&app, rivers.id, feature), None);
         frame(&mut app, &ctx, Sheet::Capture);
         assert_eq!(form(&ctx).editing, None);
@@ -1662,6 +1684,29 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_subtype_the_template_chooses_fills_a_required_field_with_its_default() {
+        let mut app = RustGisApp::with_sample();
+        let cities = target(&mut app, GeometryType::Point);
+        run(&mut app, "edit.addField", json!({"layer": cities.id, "name": "kind", "type": "long"}));
+        run(&mut app, "edit.addField", json!({"layer": cities.id, "name": "status", "type": "text"}));
+        let subtypes =
+            json!({"layer": cities.id, "field": "kind", "subtypes": [{"code": 1, "name": "Well", "defaults": {"status": "active"}}]});
+        run(&mut app, "data.subtypes", subtypes);
+        run(
+            &mut app,
+            "data.attributeRule",
+            json!({"layer": cities.id, "name": "status", "kind": "constraint", "expression": "status IS NOT NULL"}),
+        );
+        run(&mut app, "edit.template", json!({"layer": cities.id, "name": "Well", "defaults": {"kind": 1}}));
+        let layer = app.session.map().layer(cities.id).unwrap();
+        // The template gives the subtype, whose default fills the required field.
+        let state = Form { template: Some("Well".into()), ..Form::default() };
+        assert!(defaulted(layer, &state, "status"));
+        assert!(!defaulted(layer, &Form::default(), "status"));
+        assert!(add_point(&mut app, cities.id, &state));
     }
 
     #[test]

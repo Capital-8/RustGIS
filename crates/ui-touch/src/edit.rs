@@ -130,14 +130,25 @@ pub(crate) fn vertex(
 }
 
 /// Deletes the feature in row `row` of layer `id`, as one edit that undoes. Says whether it was.
+/// The map's selections are set aside while it is (Delete takes every layer's selection) and
+/// put back after, the rows of layer `id` past it moved up one.
 pub(crate) fn delete_feature(app: &mut RustGisApp, id: u32, row: usize) -> bool {
     if !ensure_editing(app) {
         return false;
     }
-    // Only this feature: Delete takes every layer's selection.
-    app.run_by_user("select.clear", serde_json::Value::Null).is_ok()
-        && app.run_by_user("select.rows", json!({"layer": id, "rows": [row]})).is_ok()
-        && app.run_by_user("edit.delete", serde_json::Value::Null).is_ok()
+    let kept: Vec<(u32, Vec<usize>)> = app.session.map_mut().layers.iter_mut().map(|l| (l.id, std::mem::take(&mut l.selection))).collect();
+    let deleted = app.run_by_user("select.rows", json!({"layer": id, "rows": [row]})).is_ok()
+        && app.run_by_user("edit.delete", serde_json::Value::Null).is_ok();
+    for (layer, mut rows) in kept {
+        if layer == id && deleted {
+            rows.retain(|r| *r != row);
+            rows.iter_mut().filter(|r| **r > row).for_each(|r| *r -= 1);
+        }
+        if let Some(l) = app.session.map_mut().layer_mut(layer) {
+            l.selection = rows;
+        }
+    }
+    deleted
 }
 
 /// Draws the feature being edited over the map: every vertex, the picked one larger and filled.
