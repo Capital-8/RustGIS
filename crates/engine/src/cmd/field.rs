@@ -40,8 +40,8 @@ pub fn is_field_package(name: &str) -> bool {
 
 /// A field package of the active map, as (name, bytes).
 ///
-/// An offline area's map (`<area> (offline)`, as a field package opens) is packaged as it is, to
-/// bring its edits back. Any other map is first made an offline area of this project (`extent`
+/// An offline area's map (`<area> (offline)` of one of this project's areas, or the map of a
+/// project opened from a field package) is packaged as it is, to bring its edits back. Any other map is first made an offline area of this project (`extent`
 /// and `name` as for `offline.download`, the view by default), whose map is packaged.
 ///
 /// Never silent: the raster layers an offline area leaves behind, the tile layers that stay
@@ -50,7 +50,15 @@ pub fn is_field_package(name: &str) -> bool {
 /// It runs where it is called, on the window's thread from Save (`ui.saveItem`), as Package
 /// Project does: each archive is one read and the zip one write, with no Cancel between them.
 pub(crate) fn package(s: &mut Session, p: &Value) -> Result<(String, Vec<u8>), String> {
-    let returning = s.map().name.strip_suffix(OFFLINE).map(str::to_string);
+    // An offline area's map: named for one of this project's areas, or opened from a field
+    // package (the phone's project holds no areas). A map only named so is packaged as any other.
+    let opened_field = s.opened_package.as_deref().is_some_and(|p| is_field_package(&p.to_string_lossy()));
+    let returning = s
+        .map()
+        .name
+        .strip_suffix(OFFLINE)
+        .map(str::to_string)
+        .filter(|area| opened_field || s.project.offline_areas.iter().any(|a| a.name.eq_ignore_ascii_case(area)));
     // Only a map coming back carries its photos: going out, the photos named are at home.
     let coming_back = returning.is_some();
     let (area, mut map) = match returning {
@@ -567,6 +575,47 @@ mod tests {
     }
 
     #[test]
+    fn what_a_package_leaves_behind_is_said_and_a_clean_one_says_nothing() {
+        let temp = Temp::new("notices");
+        let archive = temp.path().join("base.pmtiles");
+        std::fs::write(&archive, b"tiles").unwrap();
+        // Clean: one local archive, no raster, no web layer: no notice of anything left behind.
+        let mut s = sample();
+        s.map_mut().layers.retain(|l| !l.is_raster());
+        s.map_mut().tiles.push(TileLayer::new("Base", TileKind::PmTiles, archive.display().to_string()));
+        let mark = s.notice_mark();
+        package(&mut s, &json!({"name": "Clean"})).unwrap();
+        let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().all(|t| !t.contains("left out") && !t.contains("from the web") && !t.contains("couldn't be put")), "{said:?}");
+        // An archive that can't be read, and a raster layer: each said.
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 10.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let r =
+            Raster::new("relief", 2, 2, vec![vec![1.0; 4]], gt, Crs::from_epsg(4326).unwrap(), None, ColorHint::Gray, "Float32").unwrap();
+        let tif = temp.path().join("relief.tif");
+        std::fs::write(&tif, geotiff::write(&r, 0).unwrap()).unwrap();
+        s.run("layer.addData", &json!({"path": tif.display().to_string()})).unwrap();
+        assert!(s.map().layers.iter().any(|l| l.is_raster()));
+        s.map_mut().tiles.push(TileLayer::new("Gone", TileKind::MbTiles, temp.path().join("gone.mbtiles").display().to_string()));
+        let mark = s.notice_mark();
+        package(&mut s, &json!({"name": "Lossy"})).unwrap();
+        let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|t| t.contains("couldn't be put") && t.contains("Gone")), "{said:?}");
+        assert!(said.iter().any(|t| t.contains("raster layer(s) were left out")), "{said:?}");
+    }
+
+    #[test]
+    fn a_map_only_named_offline_is_packaged_as_any_other() {
+        let mut s = sample();
+        s.run("map.rename", &json!({"name": "Plan (offline)"})).unwrap();
+        let had = s.project.offline_areas.len();
+        // A new area, named past the map that already holds "Plan (offline)".
+        let (area, _) = package(&mut s, &json!({"name": "Plan"})).unwrap();
+        assert_eq!(area, "Plan 2");
+        assert_eq!(s.project.offline_areas.len(), had + 1);
+    }
+
+    #[test]
     fn an_offline_map_is_packaged_as_it_is_to_go_back() {
         let mut s = sample();
         s.run("offline.download", &json!({"name": "Back", "extent": [-20.0, -40.0, 60.0, 40.0]})).unwrap();
@@ -602,6 +651,8 @@ mod tests {
         let unpacked = temp.path().join("field");
         let text = unpack_into(&out, &unpacked).unwrap();
         let mut field = Session::new(project_in(&text, &unpacked).unwrap());
+        // As `project.open` marks a project opened from a field package.
+        field.opened_package = Some(temp.path().join("sent.rgisfield"));
         assert_eq!(field.map().name, "Trip (offline)");
         let cities = layer(&field, "Cities");
         let name =
@@ -669,6 +720,8 @@ mod tests {
         let unpacked = temp.path().join("field");
         let text = unpack_into(&out, &unpacked).unwrap();
         let mut field = Session::new(project_in(&text, &unpacked).unwrap());
+        // As `project.open` marks a project opened from a field package.
+        field.opened_package = Some(temp.path().join("sent.rgisfield"));
         let back = |field: &mut Session| package(field, &Value::Null).unwrap().1;
         let entries = rustgis_data::zip::read(&back(&mut field)).unwrap();
         let photos: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).filter(|n| n.starts_with("photos/")).collect();

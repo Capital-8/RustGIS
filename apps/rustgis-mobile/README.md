@@ -103,7 +103,7 @@ time, **Now**.
 While a field is typed in, the sheet takes most of the window and stays above the soft keyboard:
 the activity's Java half counts the keyboard in the window's bottom inset, the app looks again
 for it while a field wants the keyboard (Android doesn't wake the app when it comes or goes), the
-field is scrolled into view, and closing the keyboard ends the typing.
+field is scrolled into view, and closing the keyboard ends the typing (Android 11 and later, which say when it goes; before, the field keeps the focus until the next tap, and the keyboard's room isn't counted).
 
 **Show My Position**, in the More sheet, asks Android for the device's position (and the user,
 the first time, for leave to use it). The position is drawn on the map as a dot in a ring as wide
@@ -140,7 +140,7 @@ feature drawn on top under it (within half a finger) and draws its vertices. For
 **Pick Vertex at Cross** picks the vertex nearest the cross, and then **Move Here** moves it to
 where the cross is next, **Add After** puts a new vertex there after it, and **Delete Vertex**
 removes it (a line keeps two, a ring three). For a point, **Move Point Here** moves it. **Delete
-Feature** deletes it (only it: the other layers' selections are cleared first), and **Done** lets
+Feature** deletes it (only it: the map's other selections are kept), and **Done** lets
 it go. Each change is one edit, undone by Undo in the More sheet.
 
 **Take Photo**, over the Capture sheet's fields, asks the device's camera app for a photo
@@ -179,7 +179,9 @@ out, and said.
 Opening a field package (Open Project, the picker, or a file pushed to the app's folder) unpacks it
 into a folder of its own in the app's folder (`field/<name>`, numbered when one of that name is
 there: a copy unpacked before is never written over) and opens its project there, unsaved, as a
-project package opens. Its project's paths are trusted as a project file's are. Adding an `.mbtiles` or `.pmtiles` file as data adds it as a tile layer too, an
+project package opens. Its project's paths are trusted as a project file's are. Packaging and
+opening run on the window's thread, as Package Project and opening a project do, with no Cancel:
+a large basemap archive holds the window while it is read or written. Adding an `.mbtiles` or `.pmtiles` file as data adds it as a tile layer too, an
 offline basemap with no package.
 
 The edits come back the same way. With a field package's map open, **Send Field Package** in the
