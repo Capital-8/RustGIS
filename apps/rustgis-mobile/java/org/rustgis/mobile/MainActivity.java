@@ -37,7 +37,8 @@ public class MainActivity extends NativeActivity {
     private static final int MOST_EVENTS = 200_000;
     private static final int COPY_BUFFER = 1 << 16;
 
-    private final ArrayList<String> events = new ArrayList<>();
+    /** Oldest first; a deque, so the oldest goes at once when MOST_EVENTS wait. */
+    private final java.util.ArrayDeque<String> events = new java.util.ArrayDeque<>();
     /** Pickers shown and not yet answered in full (guarded by events). */
     private int asked;
     /** The window's insets as insets() gives them, written on the main thread. */
@@ -67,6 +68,10 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onCreate(android.os.Bundle saved) {
         super.onCreate(saved);
+        // A photo being taken when Android ended the app (the camera app in front): its file.
+        if (saved != null && saved.getString("photo") != null) {
+            photo = new File(saved.getString("photo"));
+        }
         // The insets are read where Android hands them over, on the main thread, and kept for
         // the Rust side to ask for from its own.
         getWindow().getDecorView().setOnApplyWindowInsetsListener((view, given) -> {
@@ -311,6 +316,15 @@ public class MainActivity extends NativeActivity {
         super.onDestroy();
     }
 
+    /** Keeps the photo being taken's file, should Android end the app while the camera is up. */
+    @Override
+    protected void onSaveInstanceState(android.os.Bundle out) {
+        super.onSaveInstanceState(out);
+        if (photo != null) {
+            out.putString("photo", photo.getAbsolutePath());
+        }
+    }
+
     /**
      * Asks the camera app for a photo, written to the app's photos folder through PhotoProvider:
      * a "photo" event follows, or "cancelled". The device's own camera app takes it, so RustGIS
@@ -401,7 +415,7 @@ public class MainActivity extends NativeActivity {
         }
         synchronized (events) {
             if (dropped > 0) {
-                events.add(0, "failed\t" + dropped + " positions found while RustGIS was out of sight were dropped: more were waiting than it keeps.");
+                events.addFirst("failed\t" + dropped + " positions found while RustGIS was out of sight were dropped: more were waiting than it keeps.");
                 dropped = 0;
             }
             String taken = String.join("\n", events);
@@ -417,7 +431,8 @@ public class MainActivity extends NativeActivity {
 
     /**
      * The room the system's bars, a camera cutout and the soft keyboard take at the window's
-     * edges, in pixels, as "left top right bottom"; empty before the window is laid out.
+     * edges, in pixels, as "left top right bottom", then (Android 11 and later) 1 or 0 for
+     * whether the keyboard is up; empty before the window is laid out.
      */
     public String insets() {
         return insets;
@@ -435,6 +450,10 @@ public class MainActivity extends NativeActivity {
             // above it. (The Rust side looks again while a field wants the keyboard, so the
             // room comes back when it goes.)
             bottom = Math.max(bars.bottom, insets.getInsets(android.view.WindowInsets.Type.ime()).bottom);
+            // Whether the keyboard is up, which its height alone doesn't tell (it shrinks when
+            // the phone turns): the Rust side ends the typing only when it goes.
+            boolean keyboard = insets.isVisible(android.view.WindowInsets.Type.ime());
+            return left + " " + top + " " + right + " " + bottom + " " + (keyboard ? 1 : 0);
         } else {
             left = insets.getSystemWindowInsetLeft();
             top = insets.getSystemWindowInsetTop();
@@ -468,7 +487,7 @@ public class MainActivity extends NativeActivity {
         synchronized (events) {
             // Out of sight for days, the oldest go first, and how many is said.
             if (events.size() >= MOST_EVENTS) {
-                events.remove(0);
+                events.pollFirst();
                 dropped++;
             }
             events.add(event.replaceAll("[\\n\\r]", " "));
@@ -496,7 +515,11 @@ public class MainActivity extends NativeActivity {
                 if (file != null) {
                     file.delete();
                 }
-                add(result == RESULT_OK ? "failed\tThe camera app said it took a photo, but wrote none." : "cancelled");
+                if (file == null && result == RESULT_OK) {
+                    add("failed\tThe camera app took a photo, but RustGIS lost track of it: look in its photos folder.");
+                } else {
+                    add(result == RESULT_OK ? "failed\tThe camera app said it took a photo, but wrote none." : "cancelled");
+                }
             }
             answered();
             return;

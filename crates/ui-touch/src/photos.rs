@@ -1,7 +1,8 @@
 //! Photos attached to features: the device's camera takes one (`Services::take_photo`), and the
 //! feature names it in its layer's photos field, a text field listing each photo's path,
 //! separated by `;` (as a report's attachments field does). A layer without one gets a `photos`
-//! field when its first photo is attached, and the sheet says so.
+//! field when its first photo is attached, and the sheet says so. The field stays in the form, to
+//! be typed into as any other: the photos taken go after what is typed there.
 
 use rustgis_ui_egui::rustgis_engine::data::FieldType;
 use rustgis_ui_egui::rustgis_engine::map::Layer;
@@ -23,13 +24,23 @@ pub(crate) fn field(layer: &Layer) -> Option<String> {
 }
 
 /// Layer `id`'s photos field, added (and said) when it has none. `None` when it couldn't be
-/// added (the front end says why).
+/// added (the front end says why), and when the layer has a field of that name that isn't text,
+/// which is said by name.
 pub(crate) fn ensure_field(app: &mut RustGisApp, id: u32) -> Option<String> {
     let layer = app.session.map().layer(id)?;
     if let Some(found) = field(layer) {
         return Some(found);
     }
     let name = layer.name.clone();
+    let other = layer.dataset.fields.iter().find(|f| f.name.eq_ignore_ascii_case(FIELD) || f.name.eq_ignore_ascii_case("photo"));
+    if let Some(other) = other {
+        let text = i18n::fmt(
+            "The photos weren't kept with the feature: {layer}'s field {field} isn't a text field to list them in.",
+            &[("layer", &name), ("field", &other.name)],
+        );
+        app.session.notify(text, true);
+        return None;
+    }
     app.run_by_user("edit.addField", json!({"layer": id, "name": FIELD, "type": "text"})).ok()?;
     app.session.notify(i18n::fmt("Added a photos field to {layer}: it lists each feature's photos.", &[("layer", &name)]), false);
     app.session.map().layer(id).and_then(field)
@@ -49,7 +60,8 @@ pub(crate) fn joined(held: &str, more: &[PathBuf]) -> String {
 }
 
 /// Attaches `more` photos to the feature in row `row` of layer `id`, after the ones it has: one
-/// edit, which undoes. Says whether they were attached.
+/// edit, which undoes (the first photo of a layer without a photos field also adds the field, an
+/// edit of its own). Says whether they were attached.
 pub(crate) fn attach(app: &mut RustGisApp, id: u32, row: usize, more: &[PathBuf]) -> bool {
     if more.is_empty() {
         return true;
