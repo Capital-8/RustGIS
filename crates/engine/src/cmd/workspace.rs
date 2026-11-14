@@ -251,6 +251,10 @@ pub fn commands() -> Vec<C> {
         .roles(&[])
         .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .params(r#"{"path": "*.rgisfield", "name"?: offline area name, "extent"?: [minLon, minLat, maxLon, maxLat]}"#),
+        C::new("offline.bringBack", "Bring Back Edits", "Data › Offline", super::field::bring_back)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+            .params(r#"{"path"?: "*.rgisfield", "data"?: base64 of one}"#),
         C::new("offline.sync", "Sync", "Data › Offline", offline_sync).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"name": offline area}"#),
         C::new("offline.remove", "Remove", "Data › Offline", |s, p| {
             let n = ps(p, "name").ok_or("name is required")?;
@@ -689,6 +693,14 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
     let area = s.project.offline_areas.get(ai).cloned().ok_or("no such area")?;
     let offline_map = format!("{} (offline)", area.name);
     let edited = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(&offline_map)).cloned().unwrap_or_else(|| area.data.clone());
+    sync_area(s, ai, &edited)
+}
+
+/// Copies the edits `edited` holds of offline area `ai` (its offline map, here or from a field
+/// package) back to the area's source map, as [`offline_sync`] describes, and refreshes the area.
+pub(crate) fn sync_area(s: &mut Session, ai: usize, edited: &rustgis_map::Map) -> CmdResult {
+    let area = s.project.offline_areas.get(ai).cloned().ok_or("no such area")?;
+    let offline_map = format!("{} (offline)", area.name);
     let si = s
         .project
         .maps

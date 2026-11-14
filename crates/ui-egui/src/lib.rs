@@ -4029,6 +4029,8 @@ impl RustGisApp {
                     "presentation" => ("presentation.import", &["rgispres"], "RustGIS presentation"),
                     "notebook" => ("notebook.open", &["rgisnb", "ipynb"], "RustGIS or Jupyter notebook"),
                     "dlPackage" => ("dl.import", &["rgisdlpk"], "RustGIS deep learning package"),
+                    // A field package sent back from a phone: its edits, to the area it came from.
+                    "fieldPackage" => ("offline.bringBack", &["rgisfield"], "RustGIS field package"),
                     k => return Err(format!("unknown item '{k}'")),
                 };
                 if let Some(open) = &self.services.open_async {

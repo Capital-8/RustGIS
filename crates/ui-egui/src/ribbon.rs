@@ -1001,6 +1001,19 @@ fn offline_group(app: &mut RustGisApp, ui: &mut Ui) {
             false,
         );
         col(ui, |ui| {
+            // A field package sent back from a phone: its edits and photos, to its offline area.
+            crate::widgets::small(
+                ui,
+                app,
+                "open",
+                "Bring Back",
+                "Bring a field package's edits and photos back to the offline area it was made from.",
+                "ui.openItem",
+                json!({"kind": "fieldPackage"}),
+                false,
+            );
+        });
+        col(ui, |ui| {
             for (icon, label, cmd, desc) in [
                 ("redo", "Sync", "offline.sync", "Send offline edits back and refresh."),
                 ("map", "Open", "offline.open", "Open an offline area to edit."),

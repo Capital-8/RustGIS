@@ -107,7 +107,9 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
         let rows = match shown {
             Sheet::Layers => (app.session.map().layers.len() + app.session.map().tiles.len()).max(1),
             // Go to My Position is there only while the position is shown.
-            Sheet::More => MORE_ROWS + if app.locate { MORE_POSITION_ROWS } else { 0 },
+            Sheet::More => {
+                MORE_ROWS + if app.locate { MORE_POSITION_ROWS } else { 0 } + usize::from(app.session.map().name.ends_with(" (offline)"))
+            }
             Sheet::Capture => capture_rows(app, &ctx),
             Sheet::None => 0,
         };
@@ -1271,6 +1273,12 @@ fn more(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     start_track(app, &ctx);
                 }
             }
+        }
+        // A map opened from a field package goes back as one: its edits and photos, for Bring Back
+        // on the computer it came from.
+        if app.session.map().name.ends_with(" (offline)") && row(ui, t, "package", tl!("Send Field Package")) {
+            set_sheet(&ctx, Sheet::None);
+            run(app, "ui.saveItem", json!({"kind": "fieldPackage"}));
         }
         // The whole of RustGIS is still there, for a tablet or a job the touch interface has no
         // button for yet. The Project page's Start brings this interface back at the next start.

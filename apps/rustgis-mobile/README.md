@@ -4,7 +4,8 @@ RustGIS on Android ([#1902](https://github.com/opengeos/RustGIS/issues/1902)). I
 front end (`rustgis-ui-egui`) in a `NativeActivity`, with the system's file picker for opening and
 saving, and the touch interface (`rustgis-ui-touch`) around its map, which can capture points,
 lines and polygons with their attributes, edit their shapes, snap, and show where the device is.
-It averages positions, records tracks (also out of sight) and attaches photos to features.
+It averages positions, records tracks (also out of sight), attaches photos to features, and takes a
+map with its offline basemap to the field and its edits back (see Field packages).
 
 ## Build
 
@@ -177,6 +178,17 @@ Opening a field package (Open Project, the picker, or a file pushed to the app's
 into the app's own `field/<name>` folder and opens its project there, unsaved, as a project
 package opens. Adding an `.mbtiles` or `.pmtiles` file as data adds it as a tile layer too, an
 offline basemap with no package.
+
+The edits come back the same way. With a field package's map open, **Send Field Package** in the
+More sheet saves the map as a field package again (through Android's picker), with the photos its
+features name, under `photos/`, each feature naming its photos there. On the computer, in the
+project the package was made from (saved after packaging, so it holds the offline area), **Data ›
+Offline › Bring Back** (`offline.bringBack`) reads it: the photos go in a `<area> photos` folder
+beside the project and the features name them there; a field the phone added to a layer (its
+photos field) is added to the layer at home; and the edits are copied back by feature, as Sync
+does for an offline area: changed and new features update the map, deleted ones are removed from
+it, and a feature changed at home too takes the field's version, said by name (Undo brings the
+home versions back). A package for an area the project doesn't have is refused, by name.
 
 ## What differs from the desktop
 
