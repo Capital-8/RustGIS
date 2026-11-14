@@ -1521,13 +1521,22 @@ mod tests {
         assert_eq!(form(&ctx).editing.map(|e| e.feature), Some(feature));
         // Deleted, only it: the sheet lets it go.
         let before = count(&app, rivers.id);
-        // A selection on another layer is left alone.
+        // With nothing selected anywhere it is deleted too (Pick Feature selects nothing).
         let cities = app.session.map().layers.iter().find(|l| l.geometry_type() == GeometryType::Point).unwrap().id;
-        run(&mut app, "select.rows", json!({"layer": cities, "rows": [0]}));
+        let before = count(&app, rivers.id);
+        let last = before - 1;
+        assert!(app.session.map().layers.iter().all(|l| l.selection.is_empty()));
+        assert!(edit::delete_feature(&mut app, rivers.id, last));
+        assert_eq!(count(&app, rivers.id), before - 1);
+        run(&mut app, "edit.undo", Value::Null);
+        assert_eq!(count(&app, rivers.id), before);
+        // A selection on another layer is left as it was.
+        run(&mut app, "select.rows", json!({"layer": cities, "rows": [0, 2]}));
         let cities_before = count(&app, cities);
         assert!(edit::delete_feature(&mut app, rivers.id, row));
         assert_eq!(count(&app, rivers.id), before - 1);
         assert_eq!(count(&app, cities), cities_before);
+        assert_eq!(app.session.map().layer(cities).unwrap().selection, [0, 2]);
         assert_eq!(edit::row_of(&app, rivers.id, feature), None);
         frame(&mut app, &ctx, Sheet::Capture);
         assert_eq!(form(&ctx).editing, None);
