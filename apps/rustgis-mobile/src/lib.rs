@@ -168,6 +168,7 @@ mod android {
                 match event {
                     Event::Picked { purpose, name, path } => self.waiting.push((purpose, name, path)),
                     Event::Cancelled => {}
+                    Event::Photo { path, .. } => self.app.photos.push(path),
                     Event::Saved { name } => self.app.session.notify(i18n::fmt("Saved {name}.", &[("name", &name)]), false),
                     Event::Position(fix) if self.locating => self.app.report_position(fix),
                     // A fix that was on its way when positioning was turned off.
@@ -347,6 +348,8 @@ mod android {
         let saver = phone.clone();
         app.services.download = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes)));
         app.services.inbox = Some(inbox.clone());
+        let camera = phone.clone();
+        app.services.take_photo = Some(Box::new(move || camera.take_photo()));
     }
 
     impl eframe::App for App {

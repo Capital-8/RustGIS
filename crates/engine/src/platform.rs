@@ -1,9 +1,7 @@
 //! What a phone provides that a computer's window doesn't: the system's file picker, the device's
-//! position and (to come) the camera. A mobile shell implements [`Platform`] for
-//! its system; a front end asks through it and collects what happened with
-//! [`Platform::take_events`], as nothing here waits for the user.
-//!
-//! The camera is added with its first implementation (#1902, phase 3).
+//! position and the camera. A mobile shell implements [`Platform`] for its system; a front end
+//! asks through it and collects what happened with [`Platform::take_events`], as nothing here
+//! waits for the user.
 
 use std::path::PathBuf;
 
@@ -40,6 +38,13 @@ pub enum Event {
         /// The name it was offered under.
         name: String,
     },
+    /// A photo the camera took ([`Platform::take_photo`]), written where it can be opened by path.
+    Photo {
+        /// The photo's file name.
+        name: String,
+        /// Where it is.
+        path: PathBuf,
+    },
     /// The device's position, while [`Platform::locate`] is on.
     Position(Fix),
     /// Positioning ended without [`Platform::locate`] turning it off (leave refused or taken
@@ -51,7 +56,7 @@ pub enum Event {
 
 impl Event {
     /// Reads an event a shell passed as one line of tab-separated fields (`picked`, `cancelled`,
-    /// `saved`, `position`, `stopped`, `failed`). A line that is none of these is a failure that quotes it: nothing a
+    /// `saved`, `photo`, `position`, `stopped`, `failed`). A line that is none of these is a failure that quotes it: nothing a
     /// shell reports is dropped. A position is `position`, longitude, latitude, accuracy (empty
     /// when unknown) and, optionally, its time in milliseconds since 1970.
     pub fn parse(line: &str) -> Event {
@@ -61,6 +66,7 @@ impl Event {
                 Event::Picked { purpose: purpose.to_string(), name: name.to_string(), path: PathBuf::from(path) }
             }
             ["cancelled"] => Event::Cancelled,
+            ["photo", name, path] if !path.is_empty() => Event::Photo { name: name.to_string(), path: PathBuf::from(path) },
             ["stopped"] => Event::Stopped,
             // A name is the user's own text and may hold a tab: the rest of the line is the name.
             ["saved", name @ ..] if !name.is_empty() => Event::Saved { name: name.join("\t") },
@@ -121,6 +127,11 @@ pub trait Platform {
     /// together when the app is back. Asked while the app is in sight.
     fn keep_locating(&self, on: bool) -> Result<(), String>;
 
+    /// Asks the device's camera for a photo: an [`Event::Photo`] follows with where it was
+    /// written (in the app's own storage), or [`Event::Cancelled`] when the user took none. `Ok`
+    /// means the camera was asked, not that a photo was taken.
+    fn take_photo(&self) -> Result<(), String>;
+
     /// What happened since the last call, oldest first.
     fn take_events(&self) -> Vec<Event>;
 }
@@ -136,6 +147,10 @@ mod tests {
             Event::Picked { purpose: "data".into(), name: "parcels.gpkg".into(), path: PathBuf::from("/data/picked/1/parcels.gpkg") }
         );
         assert_eq!(Event::parse("cancelled"), Event::Cancelled);
+        assert_eq!(
+            Event::parse("photo\tphoto-1.jpg\t/data/photos/photo-1.jpg"),
+            Event::Photo { name: "photo-1.jpg".into(), path: PathBuf::from("/data/photos/photo-1.jpg") }
+        );
         assert_eq!(Event::parse("stopped"), Event::Stopped);
         assert_eq!(
             Event::parse("position\t-83.92\t35.96\t4.5"),
@@ -161,6 +176,8 @@ mod tests {
             "picked\tdata",
             "moved\tx",
             "saved",
+            "photo\ta.jpg",
+            "photo\ta.jpg\t",
             "position\t200\t20\t5",
             "position\tx\t20\t5",
             "position\tNaN\t20\t5",

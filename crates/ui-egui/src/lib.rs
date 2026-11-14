@@ -361,6 +361,9 @@ pub struct Services {
     /// Opens a file picker for `"data"`, `"project"`, or `"shapefile"`; results land in `inbox`.
     /// Shapefile picks carry [`SHAPEFILE_PICK`] after sidecars are gathered into ZIPs.
     pub open_async: Option<Box<dyn Fn(&str)>>,
+    /// Asks the device's camera for a photo (a phone's shell): the photo arrives in
+    /// [`RustGisApp::photos`]. `None` where there is no camera to ask.
+    pub take_photo: Option<Box<dyn Fn() -> Result<(), String>>>,
     /// Offers bytes as a download named `file_name`; success means submission to the host's
     /// download mechanism. Browsers do not expose confirmation that the file was saved.
     pub download: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
@@ -1168,6 +1171,9 @@ pub struct RustGisApp {
     /// Whether the interface wants positions while the app is out of sight too (a track being
     /// recorded): a phone's shell keeps them coming then, with the notice its system requires.
     pub keep_locating: bool,
+    /// Photos the camera took ([`Services::take_photo`]), by where they were written, until an
+    /// interface takes them.
+    pub photos: Vec<std::path::PathBuf>,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1439,6 +1445,7 @@ impl RustGisApp {
             position: None,
             fixes: std::collections::VecDeque::new(),
             keep_locating: false,
+            photos: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]

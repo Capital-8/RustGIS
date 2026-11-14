@@ -20,6 +20,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- The camera apps that can take a photo for RustGIS (Android 11 and later list only those named). -->
+    <queries>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+    </queries>
+
     <application
         android:label="RustGIS"
         android:hasCode="true"
@@ -37,6 +44,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Where the camera app writes a photo for RustGIS (MainActivity.takePhoto). -->
+        <provider
+            android:name=".PhotoProvider"
+            android:authorities="org.rustgis.mobile.photos"
+            android:exported="false"
+            android:grantUriPermissions="true" />
         <service
             android:name=".TrackService"
             android:exported="false"

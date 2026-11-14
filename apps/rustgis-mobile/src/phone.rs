@@ -115,6 +115,10 @@ impl Platform for Phone {
         })
     }
 
+    fn take_photo(&self) -> Result<(), String> {
+        self.java(|env, activity| env.call_method(activity, jni_str!("takePhoto"), jni_sig!(() -> void), &[])?.v())
+    }
+
     fn take_events(&self) -> Vec<Event> {
         let lines = self.java(|env, activity| {
             let taken = env.call_method(activity, jni_str!("takeEvents"), jni_sig!(() -> JString), &[])?.l()?;

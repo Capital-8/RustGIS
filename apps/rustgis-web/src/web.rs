@@ -1120,6 +1120,8 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
     let arcgis_ctx = ctx.clone();
     let clipboard_ctx = ctx.clone();
     Services {
+        // The browser's camera isn't asked yet (a phone's shell asks its own).
+        take_photo: None,
         // A text field's Paste: the page reads the clipboard (Firefox and Safari show a Paste
         // button to confirm, Chrome asks once); only over HTTPS, where the browser offers it.
         read_clipboard: clipboard().map(|clipboard| -> Box<dyn Fn(Slot<Result<String, String>>)> {

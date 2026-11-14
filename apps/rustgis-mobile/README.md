@@ -4,8 +4,7 @@ RustGIS on Android ([#1902](https://github.com/opengeos/RustGIS/issues/1902)). I
 front end (`rustgis-ui-egui`) in a `NativeActivity`, with the system's file picker for opening and
 saving, and the touch interface (`rustgis-ui-touch`) around its map, which can capture points,
 lines and polygons with their attributes, edit their shapes, snap, and show where the device is.
-It averages positions and records tracks, also out of sight. It is not a field app yet: there are
-no photos.
+It averages positions, records tracks (also out of sight) and attaches photos to features.
 
 ## Build
 
@@ -52,8 +51,8 @@ of the app.
 ## The phone, from Rust
 
 `rustgis_engine::platform::Platform` is what a front end asks a phone for: files from the system's
-picker, a place to save, the device's position, and positions kept coming out of sight. The camera is added to it with its first
-implementation. `src/phone.rs` implements it for Android by calling the activity's Java half,
+picker, a place to save, the device's position, positions kept coming out of sight, and the
+camera. `src/phone.rs` implements it for Android by calling the activity's Java half,
 `java/org/rustgis/mobile/MainActivity.java`, which is the only code that can show the picker (the
 Storage Access Framework) and receive its answer.
 
@@ -142,6 +141,16 @@ where the cross is next, **Add After** puts a new vertex there after it, and **D
 removes it (a line keeps two, a ring three). For a point, **Move Point Here** moves it. **Delete
 Feature** deletes it (only it: the other layers' selections are cleared first), and **Done** lets
 it go. Each change is one edit, undone by Undo in the More sheet.
+
+**Take Photo**, over the Capture sheet's fields, asks the device's camera app for a photo
+(`Platform::take_photo`). The camera writes it to the app's photos folder (`files/photos`) through
+a content address the activity's `PhotoProvider` offers, so RustGIS needs no camera permission. Each
+photo taken shows as a chip (a tap takes it off again; the file stays), and the next feature added
+names them in its layer's photos field: a text field `photos` (or `photo`) listing each photo's
+path, separated by `;`, as a report's attachments field does. A layer without one gets one when its
+first photo is attached, and the sheet says so; the form doesn't offer that field for typing. In Edit
+mode, **Add Photo** attaches a photo to the feature picked, after the ones it has (one edit, which
+undoes).
 
 **Snap** turns the map's snapping on and off (its settings are the desktop's: Edit › Snapping).
 With it on, the cross's place snaps to a vertex, a line's end or an edge in reach, for adding and

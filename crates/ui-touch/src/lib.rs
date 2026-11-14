@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 
 mod edit;
 mod form;
+mod photos;
 mod track;
 
 /// The smallest side of anything a finger taps, in points (Android's guidance is 48).
@@ -394,6 +395,9 @@ struct Form {
     editing: Option<edit::Editing>,
     /// Where the cross's place snapped to on the last frame, with snapping on.
     snap: Option<edit::Snapped>,
+    /// The photos taken for the next feature, by where they were written. Kept when the layer
+    /// changes: they are of the place, not of a layer.
+    photos: Vec<std::path::PathBuf>,
     /// The height of the window the sheet was last drawn in: when it changes (the soft keyboard
     /// came or went), the field being typed in is scrolled back into view.
     window: f32,
@@ -476,8 +480,11 @@ fn capture_rows(app: &RustGisApp, ctx: &egui::Context) -> usize {
     let state = form(ctx);
     let Some(target) = capture_layer(app, &state) else { return 2 };
     let layer = app.session.map().layer(target.id);
-    let fields = layer
-        .map_or(0, |l| l.dataset.fields.len() + usize::from(!l.design.templates.is_empty()) + usize::from(!form::required(l).is_empty()));
+    let fields = layer.map_or(0, |l| {
+        l.dataset.fields.len() - usize::from(photos::field(l).is_some())
+            + usize::from(!l.design.templates.is_empty())
+            + usize::from(!form::required(l).is_empty())
+    });
     // The mode row, then in Edit mode its words, its buttons and the layers; else the form.
     if state.edit_mode {
         let buttons = match (state.editing, target.kind) {
@@ -489,7 +496,8 @@ fn capture_rows(app: &RustGisApp, ctx: &egui::Context) -> usize {
     }
     let calendar = if state.calendar.is_some() { form::CALENDAR_ROWS } else { 0 };
     let averaging = usize::from(app.locate && track::field(ctx).averaging.is_some());
-    1 + averaging + fields + calendar + if target.kind == GeometryType::Point { 3 } else { 4 } + usize::from(app.locate)
+    let photo_row = usize::from(app.services.take_photo.is_some() || !state.photos.is_empty());
+    1 + averaging + photo_row + fields + calendar + if target.kind == GeometryType::Point { 3 } else { 4 } + usize::from(app.locate)
 }
 
 /// A value typed for a field, as the command takes it: a number for a field of numbers, a truth
@@ -602,6 +610,11 @@ fn add_feature(app: &mut RustGisApp, id: u32, form: &Form, geometry: Value) -> b
             return false;
         }
         app.session.notify(tl!("Editing was turned on for this map."), false);
+    }
+    // The photos taken for it go in the layer's photos field, made when it has none.
+    if !form.photos.is_empty() {
+        let Some(field) = photos::ensure_field(app, id) else { return false };
+        attributes.insert(field, json!(photos::joined("", &form.photos)));
     }
     let mut feature = json!({"layer": id, "geometry": geometry, "attributes": attributes});
     // A template chosen while the layer still has it: one removed since is not asked for.
@@ -791,6 +804,17 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     if picked.is_none() {
         state.editing = None;
     }
+    // Photos the camera took: for the feature being edited, attached to it now; else kept for
+    // the next feature.
+    if !app.photos.is_empty() {
+        let taken = std::mem::take(&mut app.photos);
+        match picked.filter(|_| state.edit_mode) {
+            Some((row, _)) => {
+                photos::attach(app, target.id, row, &taken);
+            }
+            None => state.photos.extend(taken),
+        }
+    }
     // The cross's place, snapped with snapping on: a vertex being moved doesn't snap to itself.
     let moving = picked.filter(|_| state.edit_mode).and_then(|(row, e)| e.vertex.map(|v| (target.id, row, v)));
     state.snap = cross_place(app).and_then(|at| edit::snap(app, at, moving));
@@ -836,6 +860,7 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     } else if target.kind == GeometryType::Point {
         if action(ui, t, tl!("Add Point Here"), width, true, true) && fresh && add_point(app, target.id, &state) {
             state.values.clear();
+            state.photos.clear();
         }
     } else {
         let placed = state.vertices.len();
@@ -869,6 +894,7 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             {
                 state.values.clear();
                 state.vertices.clear();
+                state.photos.clear();
             }
         });
     }
@@ -893,6 +919,10 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         if edit_mode {
             return;
         }
+        // Photos for the next feature, where the device has a camera to ask.
+        if app.services.take_photo.is_some() || !state.photos.is_empty() {
+            photo_row(app, ui, t, &mut state.photos);
+        }
         // Read first: the rows change the form, not the layer.
         let layer = app.session.map().layer(target.id);
         let (fields, templates, lists, required): (Vec<_>, Vec<String>, Vec<Option<Vec<(String, String)>>>, Vec<String>) = match layer {
@@ -908,6 +938,8 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let left: Vec<Option<Vec<String>>> =
             fields.iter().map(|f| layer.and_then(|l| form::contingent(l, &f.name, &state.values))).collect();
         let ranges: Vec<Option<(f64, f64)>> = fields.iter().map(|f| layer.and_then(|l| range_of(l, &f.name))).collect();
+        // The photos field is filled from the photos row above, not typed into.
+        let photo_field = layer.and_then(photos::field);
         let described: Vec<Option<Vec<(String, String)>>> =
             fields.iter().map(|f| layer.and_then(|l| l.design.domain(&f.name)).map(described)).collect();
         if !required.is_empty() {
@@ -933,6 +965,9 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         state.window = window;
         for (i, (field, list)) in fields.iter().zip(lists).enumerate() {
             use rustgis_ui_egui::rustgis_engine::data::FieldType;
+            if photo_field.as_deref() == Some(field.name.as_str()) {
+                continue;
+            }
             let name = field.alias.clone().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| field.name.clone());
             let needed = required.contains(&field.name);
             let label = if needed { format!("{name} *") } else { name };
@@ -1064,6 +1099,38 @@ fn position_buttons(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, ctx: &egui::C
     track::set_field(ctx, state);
 }
 
+/// The row of photos for the next feature: Take Photo, and a chip for each photo taken, which a
+/// tap takes off (the file stays in the app's photos folder).
+fn photo_row(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, taken: &mut Vec<std::path::PathBuf>) {
+    egui::ScrollArea::horizontal().id_salt("touch_capture_photos").show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.set_min_height(TARGET);
+            if app.services.take_photo.is_some() && action(ui, t, tl!("Take Photo"), 140.0, false, true) {
+                take_photo(app);
+            }
+            let mut gone = None;
+            for (i, path) in taken.iter().enumerate() {
+                let text = RichText::new(format!("{}  ×", photos::name(path))).size(14.0).color(t.text);
+                let chip = egui::Button::new(text).fill(t.checked).min_size(Vec2::new(TARGET, TARGET - 8.0));
+                if ui.add(chip).on_hover_text(tl!("Take this photo off the feature")).clicked() {
+                    gone = Some(i);
+                }
+            }
+            if let Some(i) = gone {
+                taken.remove(i);
+            }
+        });
+    });
+}
+
+/// Asks the device's camera for a photo; what it refuses is said.
+fn take_photo(app: &mut RustGisApp) {
+    let asked = app.services.take_photo.as_ref().map(|take| take());
+    if let Some(Err(e)) = asked {
+        app.session.notify(e, true);
+    }
+}
+
 /// A chip a finger's height, `width` wide, marked while `on`. Says whether it was tapped.
 fn toggle_chip(ui: &mut Ui, t: &Tokens, label: &str, width: f32, on: bool) -> bool {
     let text = RichText::new(label).size(15.0).color(if on { t.accent_text } else { t.text });
@@ -1142,11 +1209,16 @@ fn edit_sheet(
         });
     }
     ui.horizontal(|ui| {
-        let half = (width - gap) / 2.0;
-        if action(ui, t, tl!("Delete Feature"), half, false, true) && edit::delete_feature(app, target.id, row) {
+        // A photo taken now is attached to this feature when it arrives.
+        let camera = app.services.take_photo.is_some();
+        let share = if camera { (width - 2.0 * gap) / 3.0 } else { (width - gap) / 2.0 };
+        if camera && action(ui, t, tl!("Add Photo"), share, false, true) {
+            take_photo(app);
+        }
+        if action(ui, t, tl!("Delete Feature"), share, false, true) && edit::delete_feature(app, target.id, row) {
             state.editing = None;
         }
-        if action(ui, t, tl!("Done"), half, false, true) {
+        if action(ui, t, tl!("Done"), share, false, true) {
             state.editing = None;
         }
     });
@@ -1680,6 +1752,50 @@ mod tests {
         stop_track(&mut app, &ctx);
         frame(&mut app, &ctx, Sheet::None);
         assert!(!app.keep_locating);
+    }
+
+    #[test]
+    fn a_photo_taken_goes_with_the_next_feature_or_to_the_feature_being_edited() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::with_sample();
+        let cities = target(&mut app, GeometryType::Point);
+        assert!(photos::field(app.session.map().layer(cities.id).unwrap()).is_none());
+        // A photo arrives while the sheet is up: kept for the next feature.
+        app.photos.push("/data/photos/a.jpg".into());
+        set_form(&ctx, Form { shown: Some(cities.instance), ..Form::default() });
+        frame(&mut app, &ctx, Sheet::Capture);
+        assert!(app.photos.is_empty());
+        let state = form(&ctx);
+        assert_eq!(state.photos.len(), 1);
+        // Added with it: the layer gets a photos field, and the point names the photo.
+        let mark = app.session.notice_mark();
+        assert!(add_point(&mut app, cities.id, &state));
+        let layer = app.session.map().layer(cities.id).unwrap();
+        let field = photos::field(layer).unwrap();
+        let row = layer.dataset.features.len() - 1;
+        let column = layer.dataset.field_index(&field).unwrap();
+        assert_eq!(layer.dataset.value(row, column).to_string(), "/data/photos/a.jpg");
+        assert!(app.session.notices_since(mark).iter().any(|n| n.text.contains("photos field")));
+        // In Edit mode, a photo arriving goes to the feature picked, after the one it has.
+        let feature = layer.dataset.features[row].id;
+        set_form(
+            &ctx,
+            Form {
+                shown: Some(cities.instance),
+                edit_mode: true,
+                editing: Some(edit::Editing { feature, vertex: None }),
+                ..Form::default()
+            },
+        );
+        app.photos.push("/data/photos/b.jpg".into());
+        frame(&mut app, &ctx, Sheet::Capture);
+        let layer = app.session.map().layer(cities.id).unwrap();
+        assert_eq!(layer.dataset.value(row, column).to_string(), "/data/photos/a.jpg;/data/photos/b.jpg");
+        assert!(form(&ctx).photos.is_empty());
+        // One edit: Undo takes the second photo off again.
+        run(&mut app, "edit.undo", Value::Null);
+        let layer = app.session.map().layer(cities.id).unwrap();
+        assert_eq!(layer.dataset.value(row, column).to_string(), "/data/photos/a.jpg");
     }
 
     #[test]
