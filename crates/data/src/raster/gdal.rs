@@ -174,6 +174,27 @@ fn plain_ers(src: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_vsi(s: &str) -> bool {
+    s.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("/vsi"))
+}
+
+/// Checks that `src` is an existing regular file on disk, never a GDAL `/vsi…` handler, folder
+/// or pipe.
+fn local_regular_file(src: &Path) -> Result<PathBuf> {
+    if is_vsi(&src.to_string_lossy()) {
+        return Err(DataError::Format(format!("{}: not a local file", src.display())));
+    }
+    let full = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
+    if is_vsi(&full.to_string_lossy()) {
+        return Err(DataError::Format(format!("{}: not a local file", src.display())));
+    }
+    let meta = std::fs::metadata(&full)?;
+    if !meta.is_file() {
+        return Err(DataError::Format(format!("{}: not a file", src.display())));
+    }
+    Ok(full)
+}
+
 /// The subdatasets of a file (NetCDF variables, HDF datasets): GDAL's name for each, and its
 /// description. Empty for a file that is one raster.
 pub fn subdatasets(src: &Path) -> Result<Vec<(String, String)>> {
@@ -182,7 +203,7 @@ pub fn subdatasets(src: &Path) -> Result<Vec<(String, String)>> {
 
 /// Lists subdatasets with the downloaded raster's optional workspace budget.
 fn subdatasets_with_budget(src: &Path, workspace: Option<(&Path, u64)>) -> Result<Vec<(String, String)>> {
-    let full = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
+    let full = local_regular_file(src)?;
     // Its type and header first, so a file that isn't read says so whether GDAL is installed or not.
     let drivers = drivers(&full)?;
     plain_ers(&full)?;
@@ -291,6 +312,49 @@ pub fn convert(src: &Path, layer: Option<&str>, crs: Option<&str>) -> Result<Con
     convert_in(&dir, src, layer, crs, None)
 }
 
+/// Whether WKT text embeds a PROJ extension, grid file or pipeline directive that GDAL or PROJ
+/// would open or execute.
+fn wkt_embeds_proj_or_files(c: &str, up: &str) -> bool {
+    if (up.contains("EXTENSION") && up.contains("PROJ")) || up.contains("PARAMETERFILE") || up.contains("/VSI") {
+        return true;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for (i, &b) in c.as_bytes().iter().enumerate() {
+        if b == b'+'
+            && let Some(rest) = c.get(i + 1..)
+        {
+            let key_len = rest.bytes().take_while(|&x| is_ident(x)).count();
+            if key_len > 0 {
+                let key = rest.get(..key_len).unwrap_or("");
+                let after_key = rest.get(key_len..).unwrap_or("").trim_start();
+                let val = after_key
+                    .strip_prefix('=')
+                    .map(|v| {
+                        let v = v.trim_start();
+                        let n = v.bytes().take_while(|&x| is_ident(x)).count();
+                        v.get(..n).unwrap_or("")
+                    })
+                    .unwrap_or("");
+                if super::crs::proj_key_refused(key, val) {
+                    return true;
+                }
+            }
+        }
+        if b == b'=' {
+            let before = c.get(..i).unwrap_or("").trim_end();
+            let key_len = before.bytes().rev().take_while(|&x| is_ident(x)).count();
+            let key = before.get(before.len().saturating_sub(key_len)..).unwrap_or("");
+            let after = c.get(i + 1..).unwrap_or("").trim_start();
+            let val_len = after.bytes().take_while(|&x| is_ident(x)).count();
+            let val = after.get(..val_len).unwrap_or("");
+            if !key.is_empty() && super::crs::proj_key_refused(key, val) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Whether a coordinate system given for GDAL is one: an authority code (`EPSG:32633`), an OGC
 /// URN, a PROJ string or WKT — never a file path or address, which GDAL would open.
 fn valid_crs(c: &str) -> bool {
@@ -306,7 +370,8 @@ fn valid_crs(c: &str) -> bool {
     let wkt = ["PROJCS", "GEOGCS", "PROJCRS", "GEOGCRS", "GEODCRS", "COMPD_CS", "COMPOUNDCRS", "LOCAL_CS", "ENGCRS", "BOUNDCRS"]
         .iter()
         .any(|k| up.starts_with(k))
-        && c.contains('[');
+        && c.contains('[')
+        && !wkt_embeds_proj_or_files(c, &up);
     // PROJ parameters that name grid or definition files PROJ would look up, or build a
     // pipeline, are refused (the same check as for typed definitions).
     let proj = c.starts_with("+proj=")
@@ -319,14 +384,33 @@ fn valid_crs(c: &str) -> bool {
     !c.chars().any(char::is_control) && (code(&up) || wkt || proj || urn)
 }
 
+fn is_driver_tag(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// The file a GDAL subdataset name points into: its quoted path (`NETCDF:"/d/x.nc":air`,
 /// `HDF4_SDS:UNKNOWN:"/d/x.hdf":0`), else what lies between the driver and the last colon.
 fn subdataset_file(name: &str) -> Option<&str> {
-    if let Some((_, rest)) = name.split_once('"') {
-        return rest.split_once('"').map(|(p, _)| p);
-    }
-    let (_, rest) = name.split_once(':')?;
-    rest.rsplit_once(':').map(|(p, _)| p)
+    let path = if name.contains('"') {
+        let (prefix, rest) = name.split_once('"')?;
+        let tags = prefix.strip_suffix(':')?;
+        if tags.is_empty() || !tags.split(':').all(is_driver_tag) {
+            return None;
+        }
+        let (path, tail) = rest.split_once('"')?;
+        if !tail.is_empty() && !tail.starts_with(':') {
+            return None;
+        }
+        path
+    } else {
+        let (driver, rest) = name.split_once(':')?;
+        if !is_driver_tag(driver) {
+            return None;
+        }
+        let (path, _) = rest.rsplit_once(':')?;
+        path
+    };
+    (!path.is_empty() && !is_vsi(path)).then_some(path)
 }
 
 /// Separates a cache key file's key from what the conversion found (JSON).
@@ -356,7 +440,7 @@ fn convert_in(dir: &Path, src: &Path, layer: Option<&str>, crs: Option<&str>, bu
     {
         return Err(DataError::Format(format!("crs '{c}': give an EPSG code (EPSG:32633), a PROJ string or WKT")));
     }
-    let full = std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf());
+    let full = local_regular_file(src)?;
     let layer = layer.map(str::trim).filter(|l| !l.is_empty());
     std::fs::create_dir_all(dir)?;
     external::prune(dir, ours, KEEP);
@@ -520,6 +604,8 @@ mod tests {
             "+proj=utm +zone=33 +datum=WGS84",
             "urn:ogc:def:crs:EPSG::2263",
             "PROJCS[\"x\",GEOGCS[\"y\"]]",
+            "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]]]",
+            "PROJCRS[\"OSGB 1936 / British National Grid\",BASEGEOGCRS[\"OSGB 1936\"]]",
         ] {
             assert!(valid_crs(good), "{good}");
         }
@@ -538,13 +624,48 @@ mod tests {
             "+proj=pipeline +step +proj=hgridshift +grids=ntv2.gsb",
             "+proj=utm +zone=33 +vgrids=egm96_15.gtx",
             "+proj=deformation +xy_grids=a.tif",
+            "GEOGCS[\"WGS 84\",EXTENSION[\"PROJ4\",\"+proj=longlat +nadgrids=/tmp/grid.gsb\"]]",
+            "GEOGCS[\"WGS 84\",extension[\"proj4_grids\",\"ntv2_0.gsb\"]]",
+            "PROJCS[\"x\",GEOGCS[\"y\"],\"+geoidgrids=egm96.gtx\"]",
+            "PROJCS[\"x\",GEOGCS[\"y\"],\"+init=epsg:4326\"]",
+            "PROJCS[\"x\",GEOGCS[\"y\"],\"+proj=pipeline +step\"]",
+            "PROJCS[\"x\",GEOGCS[\"y\"],\"nadgrids=/tmp/grid.gsb\"]",
+            "PROJCS[\"x\",GEOGCS[\"y\"],\"geoidgrids=egm96.gtx\"]",
+            "BOUNDCRS[SOURCECRS[GEOGCRS[\"x\"]],TARGETCRS[GEOGCRS[\"y\"]],ABRIDGEDTRANSFORMATION[\"t\",PARAMETERFILE[\"f\",\"a.gsb\"]]]",
         ] {
             assert!(!valid_crs(bad), "{bad}");
         }
         assert_eq!(subdataset_file("NETCDF:\"/d/air.nc\":air"), Some("/d/air.nc"));
         assert_eq!(subdataset_file("HDF4_SDS:UNKNOWN:\"/d/x.hdf\":0"), Some("/d/x.hdf"));
         assert_eq!(subdataset_file("NETCDF:/d/air.nc:air"), Some("/d/air.nc"));
+        assert_eq!(subdataset_file("NETCDF:\"/d/x.nc\""), Some("/d/x.nc"));
         assert_ne!(subdataset_file("NETCDF:\"/d/air.nc.evil\":air"), Some("/d/air.nc"), "a longer name isn't the file");
+        for bad_sub in [
+            "NETCDF:/other/target:foo=\"/d/x.nc\"",
+            "NETCDF:/other/target:\"/d/x.nc\":air",
+            "NETCDF:\"/d/x.nc\"extra:air",
+            "\"/d/x.nc\":air",
+            "/d/x.nc:air",
+            "NETCDF::\"/d/x.nc\":air",
+            "NETCDF:\"\":air",
+            "NETCDF:\"/vsicurl/https://example.com/x.nc\":air",
+            "NETCDF:/vsicurl/https://example.com/x.nc:air",
+        ] {
+            assert_eq!(subdataset_file(bad_sub), None, "{bad_sub}");
+        }
+        // Virtual filesystems, missing paths and folders are refused before GDAL is looked for.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_nc = tmp.path().join("missing.nc");
+        let folder_nc = tmp.path().join("folder.nc");
+        std::fs::create_dir(&folder_nc).unwrap();
+        for p in
+            [Path::new("/vsicurl/https://example.com/x.nc"), Path::new("/VSIZIP/x.zip/x.nc"), missing_nc.as_path(), folder_nc.as_path()]
+        {
+            let err = subdatasets(p).unwrap_err().to_string();
+            assert!(!err.contains("needs GDAL"), "{}: {err}", p.display());
+            let err = convert_in(&tmp.path().join("cache"), p, None, None, None).unwrap_err().to_string();
+            assert!(!err.contains("needs GDAL"), "{}: {err}", p.display());
+        }
         // The same file however it is spelled; another isn't.
         let dir = std::env::temp_dir().join(format!("rustgis-same-file-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();

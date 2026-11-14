@@ -248,8 +248,18 @@ async fn session(client: &mut Client) -> std::result::Result<(u32, String, u32),
     Ok((major, schema, compatibility))
 }
 
+fn check_ca(config: &Config) -> Result<()> {
+    if !config.trust_cert
+        && let Some(ca) = &config.ca
+    {
+        super::read_ca_roots("ca", ca, true)?;
+    }
+    Ok(())
+}
+
 /// The deadline includes TCP, TLS, authentication and session setup, also after a dropped client.
 fn open_on(rt: &tokio::runtime::Runtime, config: &Config, password: Option<&str>) -> Result<(Client, u32, String, u32)> {
+    check_ca(config)?;
     rt.block_on(async {
         tokio::time::timeout(config.connect_timeout, async {
             let mut client = open_client(config, password).await?;
@@ -263,6 +273,7 @@ fn open_on(rt: &tokio::runtime::Runtime, config: &Config, password: Option<&str>
 }
 
 fn connect_blocking(config: &Config, password: Option<&str>) -> Result<(tokio::runtime::Runtime, Client, u32, String, u32)> {
+    check_ca(config)?;
     super::tls_provider();
     let rt =
         tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build().map_err(|e| DataError::Format(e.to_string()))?;
@@ -1030,6 +1041,42 @@ mod tests {
         for (given, expected) in [("1", 1), ("300", 300), ("301", 300), ("18446744073709551615", 300), ("0", 10), ("invalid", 10)] {
             let c = config(&format!("mssql://sa@h/gis?connect-timeout={given}")).unwrap();
             assert_eq!(c.connect_timeout, Duration::from_secs(expected), "{given}");
+        }
+    }
+
+    #[test]
+    fn ca_certificates_are_bounded_and_do_not_echo_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let (der, pem) = super::super::tests::synthetic_ca_cert();
+        let good_pem = dir.path().join("ca.pem");
+        std::fs::write(&good_pem, &pem).unwrap();
+        let good_der = dir.path().join("ca.der");
+        std::fs::write(&good_der, &der).unwrap();
+
+        let cfg_with = |p: &std::path::Path| {
+            let mut c = config("mssql://sa@127.0.0.1:1433/gis").unwrap();
+            c.ca = Some(p.to_path_buf());
+            c
+        };
+        assert!(check_ca(&cfg_with(&good_pem)).is_ok());
+        assert!(check_ca(&cfg_with(&good_der)).is_ok());
+        assert!(check_ca(&cfg_with(&dir.path().join("missing.pem"))).is_err());
+        assert!(check_ca(&cfg_with(dir.path())).is_err());
+
+        let huge = dir.path().join("huge.pem");
+        std::fs::write(&huge, vec![b'A'; (super::super::MAX_CA_BYTES as usize) + 1]).unwrap();
+        let err = check_ca(&cfg_with(&huge)).unwrap_err().to_string();
+        assert!(err.contains("larger than 1 MB"), "{err}");
+
+        let secret = "SENTINEL_MSSQL_CA_SECRET_7731";
+        for (name, body) in [
+            ("broken.pem", format!("-----BEGIN CERTIFICATE-----\n{secret}\n-----END CERTIFICATE-----\n").into_bytes()),
+            ("broken.der", secret.as_bytes().to_vec()),
+        ] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            let err = check_ca(&cfg_with(&p)).unwrap_err().to_string();
+            assert!(!err.contains(secret), "error leaked file contents: {err}");
         }
     }
 

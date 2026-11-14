@@ -1145,6 +1145,53 @@ pub(crate) fn tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Largest custom CA certificate bundle read (`sslrootcert`, `ssl-ca`, `ca`).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const MAX_CA_BYTES: u64 = 1 << 20;
+
+/// Reads and validates a custom CA certificate file (`<= 1 MiB`, regular file, valid PEM or, when
+/// `allow_der` and named `.der`, single DER), never echoing file contents in an error.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_ca_roots(label: &str, file: &Path, allow_der: bool) -> Result<rustls::RootCertStore> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    use std::io::Read;
+
+    let bad = |msg: &str| DataError::Format(format!("{label} {}: {msg}", file.display()));
+    let io_err = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => bad("no such file"),
+        std::io::ErrorKind::PermissionDenied => bad("permission denied"),
+        _ => bad("couldn't read file"),
+    };
+    let meta = std::fs::metadata(file).map_err(io_err)?;
+    if !meta.is_file() {
+        return Err(bad("not a file"));
+    }
+    if meta.len() > MAX_CA_BYTES {
+        return Err(bad("file is larger than 1 MB"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    std::fs::File::open(file).map_err(io_err)?.take(MAX_CA_BYTES + 1).read_to_end(&mut bytes).map_err(io_err)?;
+    if bytes.len() as u64 > MAX_CA_BYTES {
+        return Err(bad("file is larger than 1 MB"));
+    }
+    if bytes.is_empty() {
+        return Err(bad("no certificates"));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    if allow_der && file.extension().is_some_and(|e| e.eq_ignore_ascii_case("der")) && !bytes.windows(10).any(|w| w == b"-----BEGIN") {
+        roots.add(CertificateDer::from(bytes)).map_err(|_| bad("invalid certificate"))?;
+        return Ok(roots);
+    }
+    for cert in CertificateDer::pem_slice_iter(&bytes) {
+        let cert = cert.map_err(|_| bad("invalid certificate"))?;
+        roots.add(cert).map_err(|_| bad("invalid certificate"))?;
+    }
+    if roots.is_empty() {
+        return Err(bad("no certificates"));
+    }
+    Ok(roots)
+}
+
 #[cfg(test)]
 pub(crate) mod tests;
 

@@ -206,7 +206,8 @@ pub struct Conn {
     config: Config,
     password: Option<String>,
     server: Server,
-    /// Whether `PREFERRED` connected unencrypted, the server offering no TLS.
+    /// Whether the connection isn't encrypted (`DISABLED`, or `PREFERRED` when the server offered
+    /// no TLS).
     plain: bool,
     client: Mutex<Option<mysql::Conn>>,
 }
@@ -308,10 +309,8 @@ fn connect_client(config: &Config, password: Option<&str>) -> Result<((mysql::Co
         Tls::Prefer => vec![Some(unchecked), None],
         Tls::Require => vec![Some(unchecked)],
         Tls::Verified { ca, identity } => {
-            if let Some(file) = ca
-                && !file.is_file()
-            {
-                return Err(DataError::Format(format!("ssl-ca {}: no such file", file.display())));
+            if let Some(file) = ca {
+                super::read_ca_roots("ssl-ca", file, false)?;
             }
             let ssl = mysql::SslOpts::default().with_danger_skip_domain_validation(!identity);
             vec![Some(match ca {
@@ -333,6 +332,17 @@ fn connect_client(config: &Config, password: Option<&str>) -> Result<((mysql::Co
         }
     }
     Err(last.map(err).unwrap_or_else(|| DataError::Format("not connected".into())))
+}
+
+/// What opening a table notes when the connection isn't encrypted or doesn't check the server's
+/// certificate.
+fn tls_note(tls: &Tls, plain: bool) -> Option<&'static str> {
+    match tls {
+        Tls::Disable => Some("the connection isn't encrypted (ssl-mode=DISABLED)"),
+        Tls::Prefer if plain => Some("the connection isn't encrypted: the server offers no TLS (ssl-mode=REQUIRED refuses such a server)"),
+        Tls::Prefer | Tls::Require => Some("the server's certificate isn't checked (ssl-mode=VERIFY_IDENTITY checks it)"),
+        Tls::Verified { .. } => None,
+    }
 }
 
 /// Sets up a new connection's session: read only, `TIMESTAMP` values in UTC, and a statement
@@ -699,8 +709,8 @@ impl MysqlSource {
                 ),
             }
         }
-        if conn.plain {
-            notes.push("the connection isn't encrypted: the server offers no TLS (ssl-mode=REQUIRED refuses such a server)".into());
+        if let Some(note) = tls_note(&conn.config.tls, conn.plain) {
+            notes.push(note.into());
         }
         let reproject = Reproject::from_epsg(Some(srid), &mut notes);
         let wkb = format!("ST_AsBinary({g}{})", server.axis_option());
@@ -1082,6 +1092,39 @@ mod tests {
         assert_eq!(c.connect_timeout, CONNECT_TIMEOUT);
         // A user is always set (the client's default is the login name).
         assert!(!config("mysql://h").map(|c| c.user).unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn tls_notes_and_ca_certificates() {
+        assert_eq!(tls_note(&Tls::Disable, true), Some("the connection isn't encrypted (ssl-mode=DISABLED)"));
+        assert_eq!(
+            tls_note(&Tls::Prefer, true),
+            Some("the connection isn't encrypted: the server offers no TLS (ssl-mode=REQUIRED refuses such a server)")
+        );
+        assert_eq!(tls_note(&Tls::Prefer, false), Some("the server's certificate isn't checked (ssl-mode=VERIFY_IDENTITY checks it)"));
+        assert_eq!(tls_note(&Tls::Require, false), Some("the server's certificate isn't checked (ssl-mode=VERIFY_IDENTITY checks it)"));
+        assert_eq!(tls_note(&Tls::Verified { ca: None, identity: true }, false), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let bad_cfg = |p: &std::path::Path| {
+            let mut c = config("mysql://me@127.0.0.1:1/gis?ssl-mode=VERIFY_IDENTITY").unwrap();
+            c.tls = Tls::Verified { ca: Some(p.to_path_buf()), identity: true };
+            c.connect_timeout = Duration::from_millis(50);
+            c
+        };
+        assert!(connect_client(&bad_cfg(&dir.path().join("missing.pem")), None).is_err());
+        assert!(connect_client(&bad_cfg(dir.path()), None).is_err());
+
+        let huge = dir.path().join("huge.pem");
+        std::fs::write(&huge, vec![b'A'; (super::super::MAX_CA_BYTES as usize) + 1]).unwrap();
+        let err = connect_client(&bad_cfg(&huge), None).unwrap_err().to_string();
+        assert!(err.contains("larger than 1 MB"), "{err}");
+
+        let secret = "SENTINEL_MYSQL_CA_SECRET_9921";
+        let broken = dir.path().join("broken.pem");
+        std::fs::write(&broken, format!("-----BEGIN CERTIFICATE-----\n{secret}\n-----END CERTIFICATE-----\n")).unwrap();
+        let err = connect_client(&bad_cfg(&broken), None).unwrap_err().to_string();
+        assert!(!err.contains(secret), "error leaked file contents: {err}");
     }
 
     #[test]

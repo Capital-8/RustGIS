@@ -158,6 +158,9 @@ enum Tls {
 pub struct Conn {
     config: postgres::Config,
     tls: Tls,
+    /// Whether the connection isn't encrypted (`sslmode=disable`, or `prefer` when the server
+    /// offered no TLS).
+    plain: bool,
     /// A connection that saves edits ([`connect_writable`]); every other one is read only.
     writable: bool,
     client: Mutex<Option<postgres::Client>>,
@@ -170,7 +173,14 @@ impl Conn {
         let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
         for attempt in 0..2 {
             if guard.as_ref().is_none_or(postgres::Client::is_closed) {
-                *guard = Some(open_client(&self.config, &self.tls, self.writable)?);
+                let (client, plain) = open_client(&self.config, &self.tls, self.writable)?;
+                // A connection that was encrypted isn't continued in the clear.
+                if plain && !self.plain {
+                    return Err(DataError::Format(
+                        "the server no longer offers TLS: connect again with Home › Add › Add Data › Database… to accept that".into(),
+                    ));
+                }
+                *guard = Some(client);
             }
             let client = guard.as_mut().ok_or_else(|| DataError::Format("not connected".into()))?;
             let r = f(client);
@@ -190,7 +200,13 @@ impl Conn {
     fn once<T>(&self, f: impl FnOnce(&mut postgres::Client) -> std::result::Result<T, postgres::Error>) -> Result<T> {
         let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
         if guard.as_ref().is_none_or(postgres::Client::is_closed) {
-            *guard = Some(open_client(&self.config, &self.tls, self.writable)?);
+            let (client, plain) = open_client(&self.config, &self.tls, self.writable)?;
+            if plain && !self.plain {
+                return Err(DataError::Format(
+                    "the server no longer offers TLS: connect again with Home › Add › Add Data › Database… to accept that".into(),
+                ));
+            }
+            *guard = Some(client);
         }
         let client = guard.as_mut().ok_or_else(|| DataError::Format("not connected".into()))?;
         let r = f(client);
@@ -227,7 +243,7 @@ impl Conn {
 }
 
 /// Connects, with the password taken out of any error: a server or the client may echo what it was given.
-fn open_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Result<postgres::Client> {
+fn open_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Result<(postgres::Client, bool)> {
     connect_client(config, tls, writable).map_err(|e| redacted(config, e))
 }
 
@@ -239,11 +255,16 @@ fn redacted(config: &postgres::Config, error: DataError) -> DataError {
 }
 
 /// Connects with `config` over `tls`, setting up the session: read only unless `writable`, the
-/// statement timeout, full float precision, and dates as ISO text in UTC.
-fn connect_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Result<postgres::Client> {
+/// statement timeout, full float precision, and dates as ISO text in UTC. The second value says
+/// whether the connection is unencrypted (`sslmode=disable`, or `prefer` when the server offered
+/// no TLS).
+fn connect_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Result<(postgres::Client, bool)> {
+    let handshake = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut client = match tls {
         Tls::Disable => config.connect(postgres::NoTls),
-        Tls::Unverified | Tls::Verified(_) => config.connect(tokio_postgres_rustls::MakeRustlsConnect::new(rustls_config(tls)?)),
+        Tls::Unverified | Tls::Verified(_) => {
+            config.connect(tokio_postgres_rustls::MakeRustlsConnect::new(rustls_config_with(tls, handshake.clone())?))
+        }
     }
     .map_err(|e| {
         let message = match e.as_db_error() {
@@ -254,6 +275,11 @@ fn connect_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Resul
         };
         if refused_login(&e) { DataError::Login(message) } else { DataError::Format(message) }
     })?;
+    let plain = match tls {
+        Tls::Disable => true,
+        Tls::Unverified => !handshake.load(std::sync::atomic::Ordering::Relaxed),
+        Tls::Verified(_) => false,
+    };
     let read_only = if writable { "" } else { "SET default_transaction_read_only = on; " };
     // Dates as text in ISO 8601 whatever the server's own settings, and `timestamptz` in UTC
     // (`+00`), so a date-time with a zone reads as that instant.
@@ -262,39 +288,36 @@ fn connect_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Resul
             "{read_only}SET statement_timeout = '{STATEMENT_TIMEOUT}'; SET extra_float_digits = 3; SET DateStyle = 'ISO, YMD'; SET TimeZone = 'UTC';"
         ))
         .map_err(err)?;
-    Ok(client)
+    Ok((client, plain))
 }
 
+#[cfg(test)]
 fn rustls_config(tls: &Tls) -> Result<rustls::ClientConfig> {
+    rustls_config_with(tls, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+fn rustls_config_with(tls: &Tls, handshake: Arc<std::sync::atomic::AtomicBool>) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| DataError::Format(format!("TLS: {e}")))?;
     Ok(match tls {
         Tls::Verified(Some(file)) => {
-            use rustls::pki_types::{CertificateDer, pem::PemObject};
-            let bad = |e: String| DataError::Format(format!("sslrootcert {}: {e}", file.display()));
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in CertificateDer::pem_file_iter(file).map_err(|e| bad(e.to_string()))? {
-                roots.add(cert.map_err(|e| bad(e.to_string()))?).map_err(|e| bad(e.to_string()))?;
-            }
-            if roots.is_empty() {
-                return Err(bad("no certificates".into()));
-            }
+            let roots = super::read_ca_roots("sslrootcert", file, false)?;
             builder.with_root_certificates(roots).with_no_client_auth()
         }
         Tls::Verified(None) => {
             let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
             builder.with_root_certificates(roots).with_no_client_auth()
         }
-        _ => builder.dangerous().with_custom_certificate_verifier(Arc::new(Unchecked(provider))).with_no_client_auth(),
+        _ => builder.dangerous().with_custom_certificate_verifier(Arc::new(Unchecked(provider, handshake))).with_no_client_auth(),
     })
 }
 
 /// libpq's `sslmode=prefer`/`require`: the connection is encrypted, but the server's certificate
-/// isn't checked (its signatures are).
+/// isn't checked (its signatures are). Records whether a TLS handshake ran.
 #[derive(Debug)]
-struct Unchecked(Arc<rustls::crypto::CryptoProvider>);
+struct Unchecked(Arc<rustls::crypto::CryptoProvider>, Arc<std::sync::atomic::AtomicBool>);
 
 impl rustls::client::danger::ServerCertVerifier for Unchecked {
     fn verify_server_cert(
@@ -305,6 +328,7 @@ impl rustls::client::danger::ServerCertVerifier for Unchecked {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.1.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -328,6 +352,19 @@ impl rustls::client::danger::ServerCertVerifier for Unchecked {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// What opening a table notes when the connection isn't encrypted or doesn't check the server's
+/// certificate.
+fn tls_note(tls: &Tls, plain: bool) -> Option<&'static str> {
+    match tls {
+        Tls::Disable => Some("the connection isn't encrypted (sslmode=disable)"),
+        Tls::Unverified if plain => {
+            Some("the connection isn't encrypted: the server offers no TLS (sslmode=require refuses such a server)")
+        }
+        Tls::Unverified => Some("the server's certificate isn't checked (sslmode=verify-full checks it)"),
+        Tls::Verified(_) => None,
     }
 }
 
@@ -378,13 +415,13 @@ fn connect_as(dsn: &str, ask: bool, writable: bool) -> Result<Arc<Conn>> {
         config.password(p);
     }
     // Connecting can take as long as the timeout: other connections don't wait for it.
-    let client = open_client(&config, &tls, writable)?;
+    let (client, plain) = open_client(&config, &tls, writable)?;
     let mut live = live().lock().unwrap_or_else(|e| e.into_inner());
     // Another layer may have connected meanwhile; this one's client then just closes.
     if let Some(c) = find(&mut live) {
         return Ok(c);
     }
-    let conn = Arc::new(Conn { config, tls, writable, client: Mutex::new(Some(client)) });
+    let conn = Arc::new(Conn { config, tls, plain, writable, client: Mutex::new(Some(client)) });
     live.push((dsn.to_string(), password, writable, Arc::downgrade(&conn)));
     Ok(conn)
 }
@@ -773,6 +810,9 @@ impl PostgisSource {
                     "the geometry doesn't say its coordinate system; read as longitude/latitude (add it again with \"crs\", such as EPSG:2263)".into(),
                 ),
             }
+        }
+        if let Some(note) = tls_note(&conn.tls, conn.plain) {
+            notes.push(note.into());
         }
         let lonlat = if srid == 0 || srid == 4326 { native.clone() } else { format!("ST_Transform({native}, 4326)") };
         // Curves become lines; Z and M are dropped by the reader (opening notes them, below).
@@ -1544,7 +1584,13 @@ mod tests {
                 notes: Vec::new(),
                 zm_dropped: false,
             },
-            conn: Arc::new(Conn { config: postgres::Config::new(), tls: Tls::Disable, writable: false, client: Mutex::new(None) }),
+            conn: Arc::new(Conn {
+                config: postgres::Config::new(),
+                tls: Tls::Disable,
+                plain: true,
+                writable: false,
+                client: Mutex::new(None),
+            }),
             table: Table {
                 schema: "public".into(),
                 name: "t".into(),
@@ -1622,6 +1668,62 @@ mod tests {
         }
         let (c, _) = config("host=h connect_timeout=30").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(c.get_connect_timeout(), Some(&Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn tls_notes_and_ca_certificates() {
+        use rustls::client::danger::ServerCertVerifier;
+        assert_eq!(tls_note(&Tls::Disable, true), Some("the connection isn't encrypted (sslmode=disable)"));
+        assert_eq!(
+            tls_note(&Tls::Unverified, true),
+            Some("the connection isn't encrypted: the server offers no TLS (sslmode=require refuses such a server)")
+        );
+        assert_eq!(tls_note(&Tls::Unverified, false), Some("the server's certificate isn't checked (sslmode=verify-full checks it)"));
+        assert_eq!(tls_note(&Tls::Verified(None), false), None);
+
+        // `Unchecked` records whether a TLS handshake actually ran (`prefer` fallback vs TLS).
+        let handshake = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let verifier = Unchecked(Arc::new(rustls::crypto::ring::default_provider()), handshake.clone());
+        assert!(!handshake.load(std::sync::atomic::Ordering::Relaxed));
+        let name = rustls::pki_types::ServerName::try_from("db.example").unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &rustls::pki_types::CertificateDer::from(vec![0u8; 4]),
+                    &[],
+                    &name,
+                    &[],
+                    rustls::pki_types::UnixTime::now(),
+                )
+                .is_ok()
+        );
+        assert!(handshake.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Custom CA loader: accepts valid PEM <= 1 MiB, rejects folders, oversized files and
+        // invalid files without echoing their contents.
+        let dir = tempfile::tempdir().unwrap();
+        let (_, pem) = super::super::tests::synthetic_ca_cert();
+        let good = dir.path().join("ca.pem");
+        std::fs::write(&good, &pem).unwrap();
+        assert!(rustls_config(&Tls::Verified(Some(good))).is_ok());
+
+        assert!(rustls_config(&Tls::Verified(Some(dir.path().to_path_buf()))).is_err());
+
+        let huge = dir.path().join("huge.pem");
+        std::fs::write(&huge, vec![b'A'; (super::super::MAX_CA_BYTES as usize) + 1]).unwrap();
+        let err = rustls_config(&Tls::Verified(Some(huge))).unwrap_err().to_string();
+        assert!(err.contains("larger than 1 MB"), "{err}");
+
+        let secret = "SENTINEL_CA_SECRET_LINE_8472";
+        for (name, body) in [
+            ("plain.pem", format!("{secret}\nnot a certificate\n")),
+            ("broken.pem", format!("-----BEGIN CERTIFICATE-----\n{secret}\n-----END CERTIFICATE-----\n")),
+        ] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            let err = rustls_config(&Tls::Verified(Some(p))).unwrap_err().to_string();
+            assert!(!err.contains(secret), "error leaked file contents: {err}");
+        }
     }
 
     #[test]

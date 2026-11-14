@@ -5,6 +5,57 @@ use rustgis_geom::{Coord, lonlat_to_merc};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Builds a minimal synthetic X.509 v3 CA certificate in DER and PEM for offline CA-loader tests.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn synthetic_ca_cert() -> (Vec<u8>, String) {
+    use base64::Engine;
+    fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if body.len() < 128 {
+            out.push(body.len() as u8);
+        } else {
+            out.push(0x81);
+            out.push(body.len() as u8);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+    let alg = tlv(0x30, &[0x06, 0x03, 0x2b, 0x65, 0x70]); // Ed25519 OID 1.3.101.112
+    let cn = tlv(0x30, &[0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x02, b'c', b'a']);
+    let name = tlv(0x30, &tlv(0x31, &cn));
+    let mut times = Vec::new();
+    times.extend(tlv(0x17, b"250101000000Z"));
+    times.extend(tlv(0x17, b"350101000000Z"));
+    let validity = tlv(0x30, &times);
+    let mut pk_bits = vec![0x00];
+    pk_bits.extend_from_slice(&[0x11; 32]);
+    let mut spki_body = alg.clone();
+    spki_body.extend(tlv(0x03, &pk_bits));
+    let spki = tlv(0x30, &spki_body);
+    // BasicConstraints CA=TRUE (OID 2.5.29.19)
+    let bc_val = tlv(0x04, &tlv(0x30, &[0x01, 0x01, 0xff]));
+    let mut bc_ext = vec![0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01, 0xff];
+    bc_ext.extend(bc_val);
+    let exts = tlv(0xa3, &tlv(0x30, &tlv(0x30, &bc_ext)));
+    let mut tbs_body = vec![0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01];
+    tbs_body.extend(&alg);
+    tbs_body.extend(&name);
+    tbs_body.extend(&validity);
+    tbs_body.extend(&name);
+    tbs_body.extend(&spki);
+    tbs_body.extend(&exts);
+    let tbs = tlv(0x30, &tbs_body);
+    let mut sig_bits = vec![0x00];
+    sig_bits.extend_from_slice(&[0x22; 64]);
+    let mut cert_body = tbs;
+    cert_body.extend(&alg);
+    cert_body.extend(tlv(0x03, &sig_bits));
+    let der = tlv(0x30, &cert_body);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+    let pem = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
+    (der, pem)
+}
+
 #[test]
 fn explicit_method_1028_warns_for_known_geopackage_authorities() {
     let wkt = r#"PROJCRS["World EQC",BASEGEOGCRS["WGS 84",DATUM["WGS_1984",ELLIPSOID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0]],CONVERSION["EQC",METHOD["Equidistant Cylindrical",ID["EPSG",1028]]],CS[Cartesian,2],AXIS["Easting",east],AXIS["Northing",north],LENGTHUNIT["metre",1]]"#;
