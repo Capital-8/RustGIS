@@ -102,6 +102,8 @@ mod android {
         /// The room last taken at the window's bottom, in points: the soft keyboard's going
         /// shows as it shrinking.
         bottom: Option<f32>,
+        /// Whether the soft keyboard was up, where the phone says.
+        keyboard: Option<bool>,
         /// Until when the window looks again for the soft keyboard's room: a moment after the
         /// last frame a field wanted the keyboard.
         typing: Option<std::time::Instant>,
@@ -316,9 +318,11 @@ mod android {
     /// The room the system's bars take at the window's edges (the status bar, the navigation bar,
     /// a camera cutout), in points: egui keeps every panel out of it. `None` when the phone
     /// can't say, which leaves egui's last answer in place.
-    fn insets(phone: Option<&Phone>, pixels_per_point: f32) -> Option<egui::SafeAreaInsets> {
-        let [left, top, right, bottom] = phone?.insets()?.map(|edge| edge.max(0.0) / pixels_per_point.max(0.1));
-        Some(egui::SafeAreaInsets(egui::epaint::MarginF32 { left, top, right, bottom }))
+    /// With the room, whether the soft keyboard is up, where the phone says.
+    fn insets(phone: Option<&Phone>, pixels_per_point: f32) -> Option<(egui::SafeAreaInsets, Option<bool>)> {
+        let (edges, keyboard) = phone?.insets()?;
+        let [left, top, right, bottom] = edges.map(|edge| edge.max(0.0) / pixels_per_point.max(0.1));
+        Some((egui::SafeAreaInsets(egui::epaint::MarginF32 { left, top, right, bottom }), keyboard))
     }
 
     /// What starts the name of a file from the picker for `purpose` in the inbox, as the browser's
@@ -391,15 +395,24 @@ mod android {
         }
 
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-            raw_input.safe_area_insets = insets(self.phone.as_deref(), ctx.pixels_per_point());
+            let room = insets(self.phone.as_deref(), ctx.pixels_per_point());
+            raw_input.safe_area_insets = room.map(|(edges, _)| edges);
             // The soft keyboard closed (Back, or its own button) while a field still has the
             // focus: typing is over, so the field lets it go. Kept, the interface would stay laid
-            // out for typing until the next tap, and move what that tap was aimed at.
-            if let Some(egui::SafeAreaInsets(edges)) = raw_input.safe_area_insets {
-                if self.bottom.is_some_and(|before| edges.bottom < before - KEYBOARD_LEAST) && ctx.egui_wants_keyboard_input() {
+            // out for typing until the next tap, and move what that tap was aimed at. Android 11
+            // and later say when the keyboard goes; before, the room it took shrinking a lot is
+            // taken for it going (a keyboard that only shrinks, as on turning, may end it there).
+            if let Some((egui::SafeAreaInsets(edges), keyboard)) = room {
+                let gone = match (self.keyboard, keyboard) {
+                    (Some(true), Some(false)) => true,
+                    (_, Some(_)) => false,
+                    _ => self.bottom.is_some_and(|before| edges.bottom < before - KEYBOARD_LEAST),
+                };
+                if gone && ctx.egui_wants_keyboard_input() {
                     ctx.memory_mut(|m| m.stop_text_input());
                 }
                 self.bottom = Some(edges.bottom);
+                self.keyboard = keyboard;
             }
             self.take_phone_events(ctx, raw_input);
             // The pushed files open as files dropped on the desktop window do: once the window
@@ -537,6 +550,7 @@ mod android {
                     keeping: false,
                     typing: None,
                     bottom: None,
+                    keyboard: None,
                     bars_light: None,
                     pushed,
                     phone,
