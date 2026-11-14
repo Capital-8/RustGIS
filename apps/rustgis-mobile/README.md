@@ -176,8 +176,9 @@ from the web stay in it and show only online; the package says which. Raster lay
 out, and said.
 
 Opening a field package (Open Project, the picker, or a file pushed to the app's folder) unpacks it
-into the app's own `field/<name>` folder and opens its project there, unsaved, as a project
-package opens. Adding an `.mbtiles` or `.pmtiles` file as data adds it as a tile layer too, an
+into a folder of its own in the app's folder (`field/<name>`, numbered when one of that name is
+there: a copy unpacked before is never written over) and opens its project there, unsaved, as a
+project package opens. Its project's paths are trusted as a project file's are. Adding an `.mbtiles` or `.pmtiles` file as data adds it as a tile layer too, an
 offline basemap with no package.
 
 ## What differs from the desktop
