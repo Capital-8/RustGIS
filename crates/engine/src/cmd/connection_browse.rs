@@ -159,13 +159,16 @@ fn fetch_url(s: &Session, c: &Connection, level: &Level, conn: Option<&s3::Conne
 
 /// What a level reads, fetched here (waiting for it).
 #[cfg(not(target_arch = "wasm32"))]
-fn download(url: &str) -> Result<String, String> {
-    let bytes = crate::render::rustgis_tiles::cache::download_blocking(url)?;
-    Ok(String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+fn download(url: &str) -> Result<(String, address::Origin), String> {
+    use crate::render::rustgis_tiles::cache;
+    let fetched =
+        cache::download_blocking_with_origin_within(url, cache::MAX_DOWNLOAD, cache::BLOCKING_TIMEOUT, &[], cache::ceiling_for(url))?;
+    let text = String::from_utf8(fetched.bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    Ok((text, fetched.origin))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn download(_: &str) -> Result<String, String> {
+fn download(_: &str) -> Result<(String, address::Origin), String> {
     Err("in the web app, expand the connection under Data Sources › Connections".into())
 }
 
@@ -223,16 +226,19 @@ pub(super) fn browse(s: &mut Session, p: &Value) -> CmdResult {
         }
         _ => {
             let at = url.as_deref().unwrap_or("");
-            let text: Cow<str> = match ps(p, "answer") {
-                Some(a) => Cow::Borrowed(a),
-                None => Cow::Owned(download(at)?),
+            let (text, origin): (Cow<str>, address::Origin) = match ps(p, "answer") {
+                Some(a) => (Cow::Borrowed(a), address::Origin::named(at)),
+                None => {
+                    let (text, origin) = download(at)?;
+                    (Cow::Owned(text), origin)
+                }
             };
             let bytes = text.as_bytes();
             match &level {
                 Level::Catalogue => catalogue(s, &c, &text, &mut out)?,
-                Level::StacRoot { api } if stac::catalog::is_static(api) => catalogs(bytes, api)?,
+                Level::StacRoot { api } if stac::catalog::is_static(api) => catalogs(s, bytes, &origin)?,
                 Level::StacRoot { .. } => collections(bytes)?,
-                Level::StacCatalog { url } => catalogs(bytes, url)?,
+                Level::StacCatalog { .. } => catalogs(s, bytes, &origin)?,
                 Level::StacItem { url } => item_file(bytes, url)?,
                 Level::StacCollection { .. } => items(bytes, at)?,
                 Level::S3Root => buckets(s3::parse_buckets(bytes)?.into_iter()),
@@ -506,13 +512,16 @@ fn collections(bytes: &[u8]) -> Result<Found, String> {
 /// What a static catalog's document lists below it: its catalogs and collections (`child` links)
 /// and its items (`item` links), each a node read when it is opened (an item's file holds its
 /// assets).
-fn catalogs(bytes: &[u8], from: &str) -> Result<Found, String> {
+fn catalogs(s: &mut Session, bytes: &[u8], origin: &address::Origin) -> Result<Found, String> {
     let mut dropped = false;
+    let mut refused = 0usize;
     let mut children = Vec::new();
     for (prefix, what, list) in [
-        ("catalog", "catalog", stac::catalog::parse_children(bytes, from)?),
-        ("item", "item", stac::catalog::parse_item_links(bytes, from)?),
+        ("catalog", "catalog", stac::catalog::parse_children_noted(bytes, origin)?),
+        ("item", "item", stac::catalog::parse_item_links_noted(bytes, origin)?),
     ] {
+        let (list, skipped) = list;
+        refused += skipped;
         for c in list {
             let node = format!("{prefix}:{}", c.url);
             if node_ok(&node) {
@@ -522,8 +531,11 @@ fn catalogs(bytes: &[u8], from: &str) -> Result<Found, String> {
             }
         }
     }
+    if refused > 0 {
+        s.notify(format!("{refused} catalog links were refused by the document's network reach"), false);
+    }
     let mut found = Found::new(children);
-    found.truncated |= dropped;
+    found.truncated |= dropped || refused > 0;
     Ok(found)
 }
 
@@ -701,5 +713,33 @@ mod tests {
         assert_eq!(tiger.children.len(), 2);
         assert!(!tiger.truncated);
         assert_eq!(tiger.matched, None);
+    }
+    #[test]
+    fn catalog_browsing_reports_refused_children_and_items_and_keeps_clean_input_quiet() {
+        use crate::render::rustgis_tiles::address::Origin;
+        let mut session = crate::Session::new(crate::Project::default());
+        let from = "https://catalog.corp.example/catalog.json";
+        for (local, lossy) in [(false, false), (false, true), (true, true)] {
+            let mut links = vec![json!({"rel":"child","href":"https://public.example/child.json"})];
+            if lossy {
+                links.extend([
+                    json!({"rel":"child","href":"http://10.0.0.5/catalog.json"}),
+                    json!({"rel":"item","href":"http://10.0.0.5/item.json"}),
+                    json!({"rel":"item","href":"http://10.0.0.5/item.json"}),
+                ]);
+            }
+            let origin = if local { Origin::connected(from, "10.0.0.5".parse().unwrap()).unwrap() } else { Origin::named(from) };
+            let text = json!({"type":"Catalog","id":"test","links":links}).to_string();
+            let mark = session.notice_mark();
+            let found = super::catalogs(&mut session, text.as_bytes(), &origin).unwrap();
+            let refused = lossy && !local;
+            assert_eq!(found.truncated, refused);
+            assert_eq!(found.children.len(), if lossy && local { 3 } else { 1 });
+            let notices = session.notices_since(mark);
+            assert_eq!(notices.len(), usize::from(refused));
+            if refused {
+                assert!(notices[0].text.contains("2 catalog links were refused"));
+            }
+        }
     }
 }

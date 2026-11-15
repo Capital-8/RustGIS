@@ -135,6 +135,19 @@ pub(crate) fn caller_callback<T: Send + 'static>(
     })
 }
 
+/// A waiter's retry belongs to that request, independently of the shared loader that wakes it.
+/// Every subsequent stage still checks this captured lifetime and its own network ceiling.
+pub(crate) fn caller_retry<T: Send + 'static>(
+    then: Box<dyn FnOnce(Result<T, String>) + Send>,
+) -> Box<dyn FnOnce(Result<T, String>) + Send> {
+    let still = current_still();
+    Box::new(move |result| {
+        rustgis_data::source::remote::with_captured_still(still, || {
+            then(check_still(&current_still()).and(result));
+        });
+    })
+}
+
 type Fetcher = Box<dyn Fn(String, crate::address::Reach, FetchedDone, &'static [u16]) + Send + Sync>;
 /// Hands back a decoded picture: [`RAW`] pixels, or the encoded bytes it was given when it
 /// couldn't decode them (they are decoded here then).

@@ -3844,6 +3844,25 @@ pub fn request_origin_for<'a>(s: &Session, p: &'a Value) -> Result<(Option<&'a s
     ))
 }
 
+/// Binds an asset request without letting normalization invent a document's login selection.
+/// Registered plain assets stay anonymous until the native user names a connection; already
+/// bound document assets retain their verified binding.
+pub fn asset_request_params<'a>(s: &mut Session, p: &'a Value) -> Result<std::borrow::Cow<'a, Value>, String> {
+    let url = p.get("url").and_then(Value::as_str).map(str::trim);
+    let from = p.get("from").and_then(Value::as_str).map(str::trim);
+    let selected = p.get("connection").and_then(Value::as_str).is_some_and(|id| !id.trim().is_empty());
+    let registered_plain = url.zip(from).is_some_and(|(url, from)| {
+        let plain = crate::render::rustgis_tiles::logins::inner(url);
+        plain == url && s.document_assets.contains_key(&(plain.to_string(), from.to_string()))
+    });
+    if registered_plain && !selected {
+        let mut anonymous = p.clone();
+        anonymous["anonymous"] = json!(true);
+        return crate::service_logins::request_params(s, &anonymous).map(|p| std::borrow::Cow::Owned(p.into_owned()));
+    }
+    crate::service_logins::request_params(s, p)
+}
+
 impl Session {
     /// Records an exact asset's transport-observed provenance from trusted native UI dispatch.
     /// Non-user ingress cannot populate this runtime-only table, and a full table fails closed.
@@ -3902,7 +3921,7 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
         let _ = web_address(raw)?;
         crate::render::rustgis_tiles::address::check_reach(raw, origin_ceiling(origin, public))?;
     }
-    let bound = crate::service_logins::request_params(s, p)?;
+    let bound = asset_request_params(s, p)?;
     let p = bound.as_ref();
     let (origin, public) = request_origin_for(s, p).map_err(|e| e.to_string()).map(|(o, pub_)| (o.or(origin), pub_ || public))?;
     if !s.import_completion(p) {
@@ -6309,7 +6328,14 @@ mod tests {
         s.run("connection.login", &json!({"id":connection["id"],"apiKey":"synthetic-registered-asset"})).unwrap();
         let plain = json!({"url":asset,"from":from,"connection":connection["id"]});
         assert!(super::request_origin_for(&s, &plain).is_ok());
-        let bound = crate::service_logins::request_params(&mut s, &plain).unwrap().into_owned();
+        let mut implicit = plain.clone();
+        implicit.as_object_mut().unwrap().remove("connection");
+        assert!(super::request_origin_for(&s, &implicit).is_ok());
+        let anonymous = super::asset_request_params(&mut s, &implicit).unwrap().into_owned();
+        assert_eq!(anonymous["url"], implicit["url"], "normalization cannot invent a login selection");
+        assert!(anonymous.get("connection").is_none());
+        assert!(super::request_origin_for(&s, &anonymous).is_ok());
+        let bound = super::asset_request_params(&mut s, &plain).unwrap().into_owned();
         assert_ne!(bound["url"], plain["url"]);
         assert!(super::request_origin_for(&s, &bound).is_ok());
         let mut unselected = bound.clone();

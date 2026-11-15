@@ -5059,7 +5059,7 @@ impl RustGisApp {
                     normalized.to_mut()["url"] = json!(url);
                 }
                 std::borrow::Cow::Owned(
-                    rustgis_engine::service_logins::request_params(&mut self.session, normalized.as_ref())
+                    rustgis_engine::cmd::layer::asset_request_params(&mut self.session, normalized.as_ref())
                         .map_err(|e| connectionui::translated(&e))?
                         .into_owned(),
                 )

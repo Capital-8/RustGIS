@@ -160,6 +160,9 @@ pub fn is_tile(url: &str) -> bool {
     url.starts_with(SCHEME)
 }
 
+/// A policy change retires a read without classifying the resource as failed.
+pub(super) const REACH_CHANGED: &str = "the file's network reach changed while it was loading; retry the read";
+
 /// What a COG holds, ready to draw from.
 pub struct Info {
     /// A descendant read never exceeds the ceiling under which its header was requested.
@@ -235,8 +238,8 @@ impl Info {
 
 enum State {
     Ready(Arc<Info>, crate::address::Reach),
-    Loading(Vec<Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>>),
-    Failed(String, Instant),
+    Loading(Vec<Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>>, crate::address::Reach),
+    Failed(String, Instant, crate::address::Reach),
 }
 
 fn infos() -> &'static Mutex<HashMap<String, State>> {
@@ -250,7 +253,7 @@ enum TileState {
     /// Decoded: its bands, how many samples they hold, and when it was last used (see
     /// [`Tiles::clock`]).
     Ready(Bands, usize, u64, crate::address::Reach),
-    Loading(Vec<Box<dyn FnOnce(Result<Bands, String>) + Send>>),
+    Loading(Vec<Box<dyn FnOnce(Result<Bands, String>) + Send>>, crate::address::Reach),
 }
 
 #[derive(Default)]
@@ -268,11 +271,11 @@ struct Tiles {
 
 impl Tiles {
     /// A tile ready, marked as just used.
-    fn used(&mut self, key: &(String, usize, u32)) -> Option<Bands> {
+    fn used(&mut self, key: &(String, usize, u32), ceiling: crate::address::Reach) -> Option<Bands> {
         self.clock += 1;
         let now = self.clock;
         match self.map.get_mut(key) {
-            Some(TileState::Ready(b, _, used, reach)) if *reach <= crate::cache::ceiling_for(&key.0) => {
+            Some(TileState::Ready(b, _, used, reach)) if *reach <= ceiling.min(crate::cache::ceiling_for(&key.0)) => {
                 self.order.remove(used);
                 *used = now;
                 self.order.insert(now, key.clone());
@@ -313,10 +316,10 @@ fn tiles() -> &'static Mutex<Tiles> {
 /// Forgets every file and tile (those that failed too), so they are read again (with
 /// [`crate::cache::clear`]).
 pub(crate) fn forget() {
-    infos().lock().unwrap_or_else(|e| e.into_inner()).retain(|_, s| matches!(s, State::Loading(_)));
+    infos().lock().unwrap_or_else(|e| e.into_inner()).retain(|_, s| matches!(s, State::Loading(..)));
     raster::forget_failed(None);
     let mut t = tiles().lock().unwrap_or_else(|e| e.into_inner());
-    t.map.retain(|_, s| matches!(s, TileState::Loading(_)));
+    t.map.retain(|_, s| matches!(s, TileState::Loading(..)));
     t.order.clear();
     t.samples = 0;
 }
@@ -325,7 +328,7 @@ pub(crate) fn forget() {
 /// read under way: a failed read is made again with whatever login now signs the file's address.
 pub(crate) fn forget_file(url: &str) {
     let mut all = infos().lock().unwrap_or_else(|e| e.into_inner());
-    if all.get(url).is_some_and(|s| !matches!(s, State::Loading(_))) {
+    if all.get(url).is_some_and(|s| !matches!(s, State::Loading(..))) {
         all.remove(url);
     }
     drop(all);
@@ -356,8 +359,8 @@ pub fn info(url: &str) -> Result<Option<Arc<Info>>, String> {
         let i = infos().lock().unwrap_or_else(|e| e.into_inner());
         match i.get(url) {
             Some(State::Ready(info, reach)) if *reach <= crate::cache::ceiling_for(url) => return Ok(Some(info.clone())),
-            Some(State::Loading(_)) => return Ok(None),
-            Some(State::Failed(e, at)) => {
+            Some(State::Loading(..)) => return Ok(None),
+            Some(State::Failed(e, at, reach)) if *reach == crate::cache::ceiling_for(url) => {
                 // Not read again until its wait is over: the map draws again then.
                 let wait = crate::cache::retry_wait(e, RETRY);
                 if at.elapsed() < wait {
@@ -387,7 +390,7 @@ pub fn info_landed(url: &str) -> Option<Arc<Info>> {
 
 /// Whether a file's header is being read now (asked for, not in yet), without asking for it.
 pub fn info_loading(url: &str) -> bool {
-    matches!(infos().lock().unwrap_or_else(|e| e.into_inner()).get(split(url).0), Some(State::Loading(_)))
+    matches!(infos().lock().unwrap_or_else(|e| e.into_inner()).get(split(url).0), Some(State::Loading(..)))
 }
 
 /// How many headers have landed in this run: what looks for headers landed since it last looked
@@ -401,7 +404,13 @@ pub fn landed_count() -> u64 {
 
 /// Shares parsed headers and loading waiters, retaining retry delays only for resource failures.
 fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
+    with_info_at(url, crate::cache::ceiling_for(url), then);
+}
+
+/// Retains a waiter's original ceiling when another reader's in-flight load must finish first.
+fn with_info_at(url: &str, ceiling: crate::address::Reach, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
     let then = caller_callback(then);
+    let started_reach = ceiling.min(crate::cache::ceiling_for(url));
     if let Err(e) = crate::cache::check_still(&crate::cache::current_still()) {
         then(Err(e));
         return;
@@ -413,17 +422,22 @@ fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>)
     {
         let mut i = infos().lock().unwrap_or_else(|e| e.into_inner());
         match i.get_mut(url) {
-            Some(State::Ready(info, reach)) if *reach <= crate::cache::ceiling_for(url) => {
+            Some(State::Ready(info, reach)) if *reach <= started_reach.min(crate::cache::ceiling_for(url)) => {
                 let info = info.clone();
                 drop(i);
                 then(Ok(info));
                 return;
             }
-            Some(State::Loading(waiting)) => {
-                waiting.push(then);
+            Some(State::Loading(waiting, reach)) => {
+                if *reach == started_reach {
+                    waiting.push(then);
+                } else {
+                    let url = url.to_string();
+                    waiting.push(crate::cache::caller_retry(Box::new(move |_| with_info_at(&url, started_reach, then))));
+                }
                 return;
             }
-            Some(State::Failed(e, at)) if at.elapsed() < crate::cache::retry_wait(e, RETRY) => {
+            Some(State::Failed(e, at, reach)) if *reach == started_reach && at.elapsed() < crate::cache::retry_wait(e, RETRY) => {
                 crate::cache::notify_at(*at + crate::cache::retry_wait(e, RETRY));
                 let e = e.clone();
                 drop(i);
@@ -431,12 +445,11 @@ fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>)
                 return;
             }
             _ => {
-                i.insert(url.to_string(), State::Loading(vec![then]));
+                i.insert(url.to_string(), State::Loading(vec![then], started_reach));
             }
         }
     }
     let key = url.to_string();
-    let started_reach = crate::cache::ceiling_for(url);
     load(
         url.to_string(),
         started_reach,
@@ -451,7 +464,7 @@ fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>)
             let waiting = {
                 let mut i = infos().lock().unwrap_or_else(|e| e.into_inner());
                 if started_reach > crate::cache::ceiling_for(&key) {
-                    r = Err("the file's network reach changed while its header was loading; retry the read".into());
+                    r = Err(REACH_CHANGED.into());
                     transient = true;
                 }
                 let old = match &r {
@@ -464,11 +477,11 @@ fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>)
                         // Read again once its wait is over: the map draws again then (a 429
                         // or 503 says when).
                         crate::cache::notify_at(Instant::now() + crate::cache::retry_wait(e, RETRY));
-                        i.insert(key, State::Failed(e.clone(), Instant::now()))
+                        i.insert(key, State::Failed(e.clone(), Instant::now(), started_reach))
                     }
                 };
                 match old {
-                    Some(State::Loading(w)) => w,
+                    Some(State::Loading(w, _)) => w,
                     _ => Vec::new(),
                 }
             };
@@ -1108,7 +1121,7 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
     if len == 0 {
         let key = (url.clone(), level, idx);
         let mut t = tiles().lock().unwrap_or_else(|e| e.into_inner());
-        let empty = match t.used(&key) {
+        let empty = match t.used(&key, started_reach) {
             Some(b) => b,
             None => {
                 let b: Bands = Arc::new(vec![vec![f32::NAN; per_band]; nb].into());
@@ -1128,7 +1141,7 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
     let key = (url.clone(), level, idx);
     {
         let mut t = tiles().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(b) = t.used(&key) {
+        if let Some(b) = t.used(&key, started_reach) {
             drop(t);
             then(Ok(b));
             return;
@@ -1139,14 +1152,18 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
                     t.samples = t.samples.saturating_sub(n);
                     t.order.remove(&used);
                 }
-                t.map.insert(key.clone(), TileState::Loading(vec![then]));
+                t.map.insert(key.clone(), TileState::Loading(vec![then], started_reach));
             }
-            Some(TileState::Loading(w)) => {
-                w.push(then);
+            Some(TileState::Loading(w, reach)) => {
+                if *reach == started_reach {
+                    w.push(then);
+                } else {
+                    w.push(crate::cache::caller_retry(Box::new(move |_| get_tile(info, url, level, idx, then))));
+                }
                 return;
             }
             None => {
-                t.map.insert(key.clone(), TileState::Loading(vec![then]));
+                t.map.insert(key.clone(), TileState::Loading(vec![then], started_reach));
             }
         }
     }
@@ -1165,7 +1182,7 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
             let waiting = {
                 let mut t = tiles().lock().unwrap_or_else(|e| e.into_inner());
                 if started_reach > crate::cache::ceiling_for(&key.0) {
-                    r = Err("the file's network reach changed while its tile was loading; retry the read".into());
+                    r = Err(REACH_CHANGED.into());
                 }
                 let old = match &r {
                     // Over the budget: the tiles used longest ago make room.
@@ -1174,7 +1191,7 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
                     Err(_) => t.map.remove(&key),
                 };
                 match old {
-                    Some(TileState::Loading(w)) => w,
+                    Some(TileState::Loading(w, _)) => w,
                     _ => Vec::new(),
                 }
             };
@@ -2198,6 +2215,7 @@ mod tests {
 
     #[test]
     fn the_tiles_used_longest_ago_make_room() {
+        let _turn = crate::cache::turn();
         let mut t = Tiles::default();
         let key = |i: u32| ("https://x.org/a.tif".to_string(), 0usize, i);
         let bands: Bands = Arc::new(cog::Tile::default());
@@ -2205,14 +2223,14 @@ mod tests {
         t.keep(key(1), bands.clone(), half, crate::address::Reach::Local);
         t.keep(key(2), bands.clone(), half, crate::address::Reach::Local);
         // Tile 1 is used again (the view still shows it): tile 2 makes room for tile 3.
-        assert!(t.used(&key(1)).is_some());
+        assert!(t.used(&key(1), crate::address::Reach::Local).is_some());
         t.keep(key(3), bands.clone(), half, crate::address::Reach::Local);
-        assert!(t.used(&key(1)).is_some() && t.used(&key(3)).is_some());
-        assert!(t.used(&key(2)).is_none());
+        assert!(t.used(&key(1), crate::address::Reach::Local).is_some() && t.used(&key(3), crate::address::Reach::Local).is_some());
+        assert!(t.used(&key(2), crate::address::Reach::Local).is_none());
         assert_eq!(t.samples, 2 * half);
         // Kept again under its key: counted once, nothing else making room for it.
         t.keep(key(3), bands.clone(), half, crate::address::Reach::Local);
-        assert!(t.used(&key(1)).is_some() && t.used(&key(3)).is_some());
+        assert!(t.used(&key(1), crate::address::Reach::Local).is_some() && t.used(&key(3), crate::address::Reach::Local).is_some());
         assert_eq!((t.samples, t.order.len()), (2 * half, 2));
         forget_file_in(&mut t, "https://x.org/a.tif");
         assert_eq!((t.samples, t.order.len(), t.map.len()), (0, 0, 0));
@@ -2229,7 +2247,7 @@ mod tests {
         let _turn = crate::cache::turn();
         let _alarm = crate::cache::alarm_turn();
         let file = "test://cog/busy.tif";
-        let refused = || super::State::Failed("http status: 503 (retry after 2 s)".into(), Instant::now());
+        let refused = || super::State::Failed("http status: 503 (retry after 2 s)".into(), Instant::now(), crate::cache::ceiling_for(file));
         super::infos().lock().unwrap().insert(file.to_string(), refused());
         crate::cache::clear_alarms();
         let within = || crate::cache::next_alarm().is_some_and(|d| d <= Duration::from_secs(2));
@@ -2351,6 +2369,76 @@ mod tests {
         let mut t = Tiles::default();
         let key = (url.to_string(), 0, 0);
         t.keep(key.clone(), Arc::new(cog::Tile::default()), 0, crate::address::Reach::Local);
-        assert!(t.used(&key).is_none(), "a late Local completion cannot be relabelled Public");
+        assert!(t.used(&key, crate::address::Reach::Local).is_none(), "a late Local completion cannot be relabelled Public");
+        crate::cache::allow_named(url);
+        assert!(t.used(&key, crate::address::Reach::Public).is_none(), "a Public reader never reuses a Local tile");
+        assert!(t.used(&key, crate::address::Reach::Local).is_some(), "a Local reader can still reuse it");
+    }
+    #[test]
+    fn readers_with_different_ceilings_retry_headers_and_tiles_under_their_own_scope() {
+        use crate::address::{Origin, Reach};
+        use crate::cache::{Fetched, FetchedDone};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _turn = crate::cache::turn();
+        let file = cog::example(32, 16);
+        for (case, fail_first, retire_first) in [(0, false, false), (1, true, false), (2, false, true)] {
+            let held = Arc::new(Mutex::new(Vec::<(String, Reach, FetchedDone)>::new()));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (hold, record) = (held.clone(), seen.clone());
+            crate::cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+                record.lock().unwrap().push(ceiling);
+                hold.lock().unwrap().push((url, ceiling, done));
+            });
+            let url = format!("https://cog-pending-ceilings.example/{case}.tif");
+            let live = Arc::new(AtomicBool::new(true));
+            let first_live = live.clone();
+            let (local_tx, local_rx) = std::sync::mpsc::channel();
+            crate::cache::with_still(Arc::new(move || first_live.load(Ordering::Relaxed)), || {
+                with_info(&url, Box::new(move |r| local_tx.send(r).unwrap()));
+            });
+            crate::cache::restrict_to_public(&url);
+            let (public_tx, public_rx) = std::sync::mpsc::channel();
+            with_info(&url, Box::new(move |r| public_tx.send(r).unwrap()));
+            crate::cache::allow_named(&url);
+            live.store(!retire_first, Ordering::Relaxed);
+            let (first, reach, done) = held.lock().unwrap().pop().unwrap();
+            assert_eq!(reach, Reach::Local);
+            done(if fail_first { Err("HTTP 503".into()) } else { Ok(Fetched { bytes: file.clone(), origin: Origin::named(&first) }) });
+            let drain = || {
+                for _ in 0..100 {
+                    let pending = std::mem::take(&mut *held.lock().unwrap());
+                    if pending.is_empty() {
+                        return;
+                    }
+                    for (address, _, done) in pending {
+                        let (a, b) = crate::cache::split_range(&address).1.unwrap();
+                        done(Ok(Fetched {
+                            bytes: file[a as usize..((b + 1) as usize).min(file.len())].to_vec(),
+                            origin: Origin::named(&address),
+                        }));
+                    }
+                }
+                panic!("bounded COG fixture");
+            };
+            drain();
+            let local = local_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert_eq!(local.is_err(), fail_first || retire_first);
+            let public = public_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!(public.reach, Reach::Public);
+            assert_eq!(*seen.lock().unwrap(), vec![Reach::Local, Reach::Public]);
+            if let Ok(local) = local {
+                let mark = seen.lock().unwrap().len();
+                let (local_tx, local_rx) = std::sync::mpsc::channel();
+                get_tile(local, url.clone(), 0, 0, Box::new(move |r| local_tx.send(r).unwrap()));
+                let (public_tx, public_rx) = std::sync::mpsc::channel();
+                get_tile(public, url.clone(), 0, 0, Box::new(move |r| public_tx.send(r).unwrap()));
+                assert_eq!(held.lock().unwrap().len(), 1, "the incompatible tile waiter waits for its own retry");
+                drain();
+                assert!(local_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().is_ok());
+                assert!(public_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().is_ok());
+                assert_eq!(seen.lock().unwrap().get(mark..).unwrap(), &[Reach::Local, Reach::Public]);
+            }
+            forget_file(&url);
+        }
     }
 }

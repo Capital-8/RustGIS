@@ -95,17 +95,33 @@ pub fn parse_children_noted(bytes: &[u8], origin: &crate::address::Origin) -> Re
 /// The items (`item` links) of a catalog's or collection's document fetched from `from`: web
 /// addresses only, in the order the document gives them.
 pub fn parse_item_links(bytes: &[u8], from: &str) -> Result<Vec<Child>, String> {
+    parse_item_links_noted(bytes, &crate::address::Origin::named(from)).map(|(items, _)| items)
+}
+
+/// Lists item links with a count of unique web links refused by their document's observed reach.
+pub fn parse_item_links_noted(bytes: &[u8], origin: &crate::address::Origin) -> Result<(Vec<Child>, usize), String> {
     let v = super::json(bytes)?;
     if !v.is_object() || !matches!(v.get("type").and_then(Value::as_str), Some("Catalog" | "Collection")) {
         return Err("the answer isn't a STAC catalog or collection".into());
     }
     check_listing_size(&v, "item")?;
     let mut seen = HashSet::new();
-    Ok(links(&v, "item", from)
+    let mut refused = HashSet::new();
+    let items = links(&v, "item", origin.url())
         .into_iter()
-        .filter(|(url, _)| is_web(url) && crate::address::check(url, Some(from)).is_ok() && seen.insert(url.clone()))
+        .filter(|(url, _)| {
+            if !is_web(url) {
+                return false;
+            }
+            if origin.check(url).is_err() {
+                refused.insert(url.clone());
+                return false;
+            }
+            seen.insert(url.clone())
+        })
         .map(|(url, title)| Child { title: if title.is_empty() { label_of(&url) } else { title }, url })
-        .collect())
+        .collect();
+    Ok((items, refused.len()))
 }
 
 /// Refuses an oversized listing before any children are filtered or silently left out.
