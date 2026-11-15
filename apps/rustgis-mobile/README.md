@@ -332,6 +332,14 @@ its header lists are the `mobile-release` environment's, which only `main` and `
 pull request that changes `apps/rustgis-mobile` builds both with no secrets: the APK signed with a
 throwaway debug key, the iOS app unsigned.
 
+The same run builds the Android App Bundle Google Play takes (`RustGIS-<version>-android.aab`, the
+`rustgis-android-bundle` artifact), signed with the release key as Play's upload key and uploaded
+by hand in the Play Console. `build-apk.sh` makes it when `BUNDLETOOL` names Google's bundletool
+jar: the manifest linked in protobuf form, and the APK's dex, libraries and assets as the bundle's
+one module, signed by `--sign-only` with `jarsigner`. A library with a segment aligned to less
+than 16 KB fails the build, as Play refuses one for apps targeting Android 15 and later. The app
+targets API 36.
+
 The Android release key (`ANDROID_KEYSTORE_BASE64`) can't be replaced: an APK signed with
 another key doesn't install as an update of one signed with it. Keep a copy of the keystore and
 its password outside GitHub. The iOS certificate and profile expire after a year: renew them in
