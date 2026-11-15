@@ -46,6 +46,16 @@ for need in "${needs[@]}"; do
     [ -d "$need" ] || { echo "build-apk: the Android SDK at $sdk has no NDK, build-tools or platform (see README.md)" >&2; exit 1; }
 done
 out=$root/target/android
+# The platform linked against is at least the API level the manifest targets.
+if [ -z "$sign_only" ]; then
+    target_api=$(sed -n 's/.*targetSdkVersion="\([0-9]*\)".*/\1/p' "$root/apps/rustgis-mobile/AndroidManifest.xml")
+    platform_api=$(basename "$platform" | sed 's/^android-//; s/\..*//')
+    case $target_api$platform_api in *[!0-9]* | "") platform_api=0 ;; esac
+    if [ "$platform_api" -lt "${target_api:-0}" ] || [ -z "$target_api" ]; then
+        echo "build-apk: the app targets API $target_api, and the newest platform in $sdk is $(basename "$platform"): install platforms;android-$target_api" >&2
+        exit 1
+    fi
+fi
 
 # Signs the unsigned APK, and the App Bundle when there is one, with the release key; its password
 # is read from the environment, never put on a command line.
@@ -85,7 +95,9 @@ find "$out/apk/lib" -name librustgis_mobile.so -exec "$strip" {} \;
 # Each segment aligned to 16 KB pages, which Android 15 phones may use and Google Play requires.
 readelf=$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf | head -1)
 while IFS= read -r -d '' so; do
-    for align in $("$readelf" -lW "$so" | awk '$1 == "LOAD" { print $NF }'); do
+    # In an assignment of its own, so a readelf that fails stops the script.
+    info=$("$readelf" -lW "$so")
+    for align in $(awk '$1 == "LOAD" { print $NF }' <<< "$info"); do
         if [ $((align)) -lt 16384 ]; then
             echo "build-apk: $so has a segment aligned to $align, less than 16 KB" >&2
             exit 1
