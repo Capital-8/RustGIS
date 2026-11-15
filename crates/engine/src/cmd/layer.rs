@@ -3820,10 +3820,23 @@ pub fn request_origin(p: &Value) -> Result<(Option<&str>, bool), String> {
 pub fn request_origin_for<'a>(s: &Session, p: &'a Value) -> Result<(Option<&'a str>, bool), String> {
     let parsed = request_origin(p)?;
     let Some(from) = p.get("from").and_then(Value::as_str).map(str::trim) else { return Ok(parsed) };
-    let Some(url) = p.get("url").and_then(Value::as_str) else { return Ok(parsed) };
+    let Some(url) = p.get("url").and_then(Value::as_str).map(str::trim) else { return Ok(parsed) };
     let key = (crate::render::rustgis_tiles::logins::inner(url.trim()).to_string(), from.to_string());
     let Some(origin) = s.document_assets.get(&key) else { return Ok(parsed) };
-    origin.check(url)?;
+    let plain = crate::render::rustgis_tiles::logins::inner(url);
+    let selected = if s.policy_user() && plain != url {
+        p.get("connection")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| crate::service_logins::bind_logged_in(s, id, plain).map(|bound| bound == url))
+            .transpose()?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    // Only a native user's explicit, live session login can replace the document's binding.
+    // Its plain destination still has to pass the document's observed network reach.
+    origin.check(if selected { plain } else { url })?;
     Ok((
         Some(from),
         origin.reach() == crate::render::rustgis_tiles::address::Reach::Public
@@ -6280,5 +6293,31 @@ mod tests {
         assert!(super::request_origin_for(&s, &other).unwrap().1);
         let public = json!({"url":asset,"from":from,"fromDocument":true});
         assert!(super::request_origin_for(&s, &public).unwrap().1);
+    }
+    #[test]
+    fn registered_assets_accept_only_an_explicit_live_native_login() {
+        use crate::render::rustgis_tiles::address::Origin;
+        let mut s = Session::new(crate::Project::default());
+        let from = "https://catalog.example/item.json";
+        let asset = "https://assets.example/scene.geojson";
+        s.remember_document_asset(asset, Origin::named(from)).unwrap();
+        let spaced = json!({"url":format!("  {asset}  "),"from":from});
+        assert!(super::request_origin_for(&s, &spaced).is_ok());
+        let connection = s
+            .run("connection.new", &json!({"kind":"ogcapi","address":"https://assets.example","auth":"header","keyName":"X-Key"}))
+            .unwrap();
+        s.run("connection.login", &json!({"id":connection["id"],"apiKey":"synthetic-registered-asset"})).unwrap();
+        let plain = json!({"url":asset,"from":from,"connection":connection["id"]});
+        assert!(super::request_origin_for(&s, &plain).is_ok());
+        let bound = crate::service_logins::request_params(&mut s, &plain).unwrap().into_owned();
+        assert_ne!(bound["url"], plain["url"]);
+        assert!(super::request_origin_for(&s, &bound).is_ok());
+        let mut unselected = bound.clone();
+        unselected.as_object_mut().unwrap().remove("connection");
+        assert!(super::request_origin_for(&s, &unselected).is_err());
+        unselected["connection"] = json!("another-connection");
+        assert!(super::request_origin_for(&s, &unselected).is_err());
+        s.run("connection.logout", &json!({"id":connection["id"]})).unwrap();
+        assert!(super::request_origin_for(&s, &bound).is_err());
     }
 }

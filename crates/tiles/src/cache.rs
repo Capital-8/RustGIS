@@ -387,6 +387,9 @@ fn split_url_parts(url: &str) -> Option<(String, &str, &str)> {
             _ => {}
         }
     }
+    if depth != 0 {
+        return None;
+    }
     let authority = &rest[..sep];
     let mut depth = 0usize;
     let mut host_at = 0usize;
@@ -2048,11 +2051,16 @@ pub fn tiff_header_length(value: &str) -> Option<u64> {
 /// the web), counted as a fetch under way. A request signed for S3 isn't made (its signature is
 /// for a GET): it answers with nothing known.
 pub fn head(url: &str, done: HeadDone) {
+    head_with_ceiling(url, ceiling_for(url), done);
+}
+
+/// Keeps a multi-request reader's original ceiling, narrowed by current restrictions.
+pub(crate) fn head_with_ceiling(url: &str, ceiling: crate::address::Reach, done: HeadDone) {
     if let Err(e) = check_current() {
         done(Err(e));
         return;
     }
-    let ceiling = ceiling_for(url);
+    let ceiling = ceiling.min(ceiling_for(url));
     let still = current_still();
     let done: HeadDone = Box::new(move |r| with_optional_still(still, || done(r)));
     if let Err(e) = crate::address::check_reach(url, ceiling) {
@@ -2130,11 +2138,18 @@ fn fetch_reached(url: String, ceiling: crate::address::Reach, done: FetchedDone,
 /// Like [`fetch_bytes`], counted as a fetch under way (so exports [`wait`] for it) and drawing
 /// again when it lands: for what the map needs before it can ask for tiles (a PMTiles header).
 pub(crate) fn fetch_counted(url: String, done: Done) {
+    let ceiling = ceiling_for(&url);
+    fetch_counted_with_ceiling(url, ceiling, done);
+}
+
+/// Counts a range read while retaining its reader's starting network ceiling.
+pub(crate) fn fetch_counted_with_ceiling(url: String, ceiling: crate::address::Reach, done: Done) {
     IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
-    fetch_bytes(
+    fetch_reached(
         url,
+        ceiling,
         Box::new(move |r| {
-            done(r);
+            done(r.map(|f| f.bytes));
             finished();
         }),
         &[],
@@ -7191,6 +7206,16 @@ mod tests {
     fn switch_delimiters_do_not_split_a_restricted_template_authority() {
         let _turn = turn();
         let template = "http://{switch:127.0.0.1,unused/}/{z}/{x}/{y}.png";
+        restrict_to_public(template);
+        let tile = crate::template::expand(template, crate::template::TileId { z: 0, x: 0, y: 0 }, 256, false, &[]);
+        assert_eq!(ceiling_for(&tile), crate::address::Reach::Public);
+        assert!(matches!(get_tile(&tile, Want::Image), State::Failed(_)));
+    }
+    #[test]
+    fn unclosed_authority_placeholders_do_not_hide_a_local_host() {
+        let _turn = turn();
+        assert!(split_url_parts("http://a{b@10.0.0.5/x").is_none());
+        let template = "http://a{b@10.0.0.5/{z}/{x}/{y}.png";
         restrict_to_public(template);
         let tile = crate::template::expand(template, crate::template::TileId { z: 0, x: 0, y: 0 }, 256, false, &[]);
         assert_eq!(ceiling_for(&tile), crate::address::Reach::Public);

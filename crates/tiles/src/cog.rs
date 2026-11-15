@@ -162,6 +162,8 @@ pub fn is_tile(url: &str) -> bool {
 
 /// What a COG holds, ready to draw from.
 pub struct Info {
+    /// A descendant read never exceeds the ceiling under which its header was requested.
+    reach: crate::address::Reach,
     pub layout: Layout,
     header: Sparse,
     transformer: Transformer,
@@ -282,7 +284,7 @@ impl Tiles {
 
     /// Keeps a tile ready, making room for it past [`BUDGET`] (the tiles used longest ago go);
     /// returns what was kept under its key before.
-    fn keep(&mut self, key: (String, usize, u32), bands: Bands, samples: usize) -> Option<TileState> {
+    fn keep(&mut self, key: (String, usize, u32), bands: Bands, samples: usize, reach: crate::address::Reach) -> Option<TileState> {
         // Kept under this key already: counted once.
         let before = self.map.remove(&key);
         if let Some(TileState::Ready(_, n, used, _)) = &before {
@@ -298,7 +300,6 @@ impl Tiles {
         self.clock += 1;
         self.samples += samples;
         self.order.insert(self.clock, key.clone());
-        let reach = crate::cache::ceiling_for(&key.0);
         self.map.insert(key, TileState::Ready(bands, samples, self.clock, reach));
         before
     }
@@ -438,6 +439,7 @@ fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>)
     let started_reach = crate::cache::ceiling_for(url);
     load(
         url.to_string(),
+        started_reach,
         Box::new(move |r| {
             let r = crate::cache::check_still(&crate::cache::current_still()).and(r);
             let r = crate::logins::check(&key)
@@ -479,7 +481,7 @@ fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>)
 }
 
 /// Reads `len` bytes at `at` of the file at `url`.
-fn read(url: &str, at: u64, len: u64, done: Done) {
+fn read(url: &str, at: u64, len: u64, ceiling: crate::address::Reach, done: Done) {
     if len == 0 {
         done(Ok(Vec::new()));
         return;
@@ -489,7 +491,7 @@ fn read(url: &str, at: u64, len: u64, done: Done) {
         return;
     }
     let end = at.saturating_add(len) - 1;
-    crate::cache::fetch_counted(format!("{url}{RANGE}{at}-{end}"), done);
+    crate::cache::fetch_counted_with_ceiling(format!("{url}{RANGE}{at}-{end}"), ceiling, done);
 }
 
 /// Reads a file's header (then its stretch): the start, then whatever more the IFDs need.
@@ -500,23 +502,24 @@ fn read(url: &str, at: u64, len: u64, done: Done) {
 /// and doesn't say it answers ranges isn't read as a GeoTIFF at all (a server ignoring the range
 /// would send its whole answer); a GeoTIFF mislabelled so on a server that answers ranges is still
 /// read. Without an answer, the first [`HEAD`] bytes are read as for any other file.
-fn load(url: String, done: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
-    if let Err(e) = crate::address::check(&url, None) {
+fn load(url: String, ceiling: crate::address::Reach, done: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
+    if let Err(e) = crate::address::check_reach(&url, ceiling) {
         done(Err(e));
         return;
     }
     if named_tiff(&url) {
-        return read_header(url, HEAD, done);
+        return read_header(url, HEAD, ceiling, done);
     }
     let u = url.clone();
-    crate::cache::head(
+    crate::cache::head_with_ceiling(
         &url,
+        ceiling,
         Box::new(move |h| {
             let h = h.unwrap_or_default();
             if h.content_type.as_deref().is_some_and(not_tiff_type) && !h.accepts_ranges && h.tiff_header_length.is_none() {
                 return done(Err(message_with_address(&u, "not a GeoTIFF")));
             }
-            read_header(u, header_length(h.tiff_header_length), done);
+            read_header(u, header_length(h.tiff_header_length), ceiling, done);
         }),
     );
 }
@@ -541,23 +544,24 @@ fn header_length(announced: Option<u64>) -> u64 {
 }
 
 /// Reads a file's first `len` bytes, then whatever more the IFDs need.
-fn read_header(url: String, len: u64, done: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
+fn read_header(url: String, len: u64, ceiling: crate::address::Reach, done: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
     let u = url.clone();
     read(
         &url,
         0,
         len,
+        ceiling,
         Box::new(move |r| match r {
-            Ok(b) if cog::is_tiff(&b) => step(u, Sparse::default().with(0, b), 0, done),
+            Ok(b) if cog::is_tiff(&b) => step(u, Sparse::default().with(0, b), 0, ceiling, done),
             Ok(_) => done(Err(message_with_address(&u, "not a GeoTIFF"))),
             Err(e) => done(Err(message_with_address(&u, &e))),
         }),
     );
 }
 
-fn step(url: String, have: Sparse, rounds: usize, done: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
+fn step(url: String, have: Sparse, rounds: usize, ceiling: crate::address::Reach, done: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
     match cog::layout(&have) {
-        Ok(Parse::Done(layout)) => stats(url, have, *layout, done),
+        Ok(Parse::Done(layout)) => stats(url, have, *layout, ceiling, done),
         Ok(Parse::NotTiled(why)) => done(Err(format!("{NOT_COG}: {why}"))),
         Ok(Parse::Need(a, b)) => {
             let Some(len) = header_read(&have, a, b, rounds) else {
@@ -569,14 +573,15 @@ fn step(url: String, have: Sparse, rounds: usize, done: Box<dyn FnOnce(Result<Ar
                 &url,
                 a,
                 len,
+                ceiling,
                 Box::new(move |r| match r {
                     // Nothing more to read: the file ends at or before `a`. Read again knowing so, a
                     // tag that points past the end (an optional one, GDAL's metadata or a colour
                     // table) is left out and said, as the whole-file read does; one the image needs
                     // fails to decode. Once only: a file whose length is known isn't asked past it.
-                    Ok(more) if more.is_empty() && !have.len_known() => step(u, have.with_len(a), rounds + 1, done),
+                    Ok(more) if more.is_empty() && !have.len_known() => step(u, have.with_len(a), rounds + 1, ceiling, done),
                     Ok(more) if more.is_empty() => done(Err(message_with_address(&u, "the GeoTIFF is cut short"))),
-                    Ok(more) => step(u, have.with(a, more), rounds + 1, done),
+                    Ok(more) => step(u, have.with(a, more), rounds + 1, ceiling, done),
                     Err(e) => done(Err(message_with_address(&u, &e))),
                 }),
             );
@@ -612,7 +617,13 @@ fn header_read(have: &Sparse, a: u64, b: u64, rounds: usize) -> Option<u64> {
 pub const NOT_COG: &str = "not a cloud-optimised GeoTIFF";
 
 /// Reads the coarsest overview (a few tiles) for the stretch, then the file is ready.
-fn stats(url: String, header: Sparse, layout: Layout, done: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
+fn stats(
+    url: String,
+    header: Sparse,
+    layout: Layout,
+    ceiling: crate::address::Reach,
+    done: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>,
+) {
     let transformer = match layout.crs.transformer() {
         Ok(t) => t,
         Err(e) => {
@@ -664,6 +675,7 @@ fn stats(url: String, header: Sparse, layout: Layout, done: Box<dyn FnOnce(Resul
     };
     let bytes = layout.data_type == "UInt8";
     let info = Arc::new(Info {
+        reach: ceiling,
         layout,
         header,
         transformer,
@@ -1090,6 +1102,7 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
     let nb = info.layout.chunk_bands();
     let per_band = (l.tile_width as usize) * (l.tile_height as usize);
     let samples = per_band * nb;
+    let started_reach = info.reach.min(crate::cache::ceiling_for(&url));
     // A tile the file leaves out (GDAL's sparse files: no bytes) is empty: kept as any other, so
     // a window over it is whole at once rather than asking for it at every draw.
     if len == 0 {
@@ -1099,7 +1112,7 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
             Some(b) => b,
             None => {
                 let b: Bands = Arc::new(vec![vec![f32::NAN; per_band]; nb].into());
-                t.keep(key, b.clone(), samples);
+                t.keep(key, b.clone(), samples, started_reach);
                 b
             }
         };
@@ -1137,11 +1150,11 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
             }
         }
     }
-    let started_reach = crate::cache::ceiling_for(&url);
     read(
         &url,
         at,
         len,
+        started_reach,
         Box::new(move |r| {
             let r = r
                 .and_then(|b| cog::decode_tile_counted(&info.header, &info.layout, level, idx, b).map_err(|e| e.to_string()))
@@ -1156,7 +1169,7 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
                 }
                 let old = match &r {
                     // Over the budget: the tiles used longest ago make room.
-                    Ok(b) => t.keep(key, b.clone(), samples),
+                    Ok(b) => t.keep(key, b.clone(), samples, started_reach),
                     // A failed tile is read again by the next map tile that needs it.
                     Err(_) => t.map.remove(&key),
                 };
@@ -1824,6 +1837,7 @@ mod tests {
         let info = Arc::new(super::Info {
             layout: *layout,
             header: Sparse::default(),
+            reach: crate::address::Reach::Local,
             transformer,
             bounds: [0.0; 4],
             merc: [0.0; 4],
@@ -1915,6 +1929,7 @@ mod tests {
         let info = Arc::new(super::Info {
             layout: *layout,
             header: Sparse::default(),
+            reach: crate::address::Reach::Local,
             transformer,
             bounds: [0.0; 4],
             merc: [0.0; 4],
@@ -2187,16 +2202,16 @@ mod tests {
         let key = |i: u32| ("https://x.org/a.tif".to_string(), 0usize, i);
         let bands: Bands = Arc::new(cog::Tile::default());
         let half = BUDGET / 2;
-        t.keep(key(1), bands.clone(), half);
-        t.keep(key(2), bands.clone(), half);
+        t.keep(key(1), bands.clone(), half, crate::address::Reach::Local);
+        t.keep(key(2), bands.clone(), half, crate::address::Reach::Local);
         // Tile 1 is used again (the view still shows it): tile 2 makes room for tile 3.
         assert!(t.used(&key(1)).is_some());
-        t.keep(key(3), bands.clone(), half);
+        t.keep(key(3), bands.clone(), half, crate::address::Reach::Local);
         assert!(t.used(&key(1)).is_some() && t.used(&key(3)).is_some());
         assert!(t.used(&key(2)).is_none());
         assert_eq!(t.samples, 2 * half);
         // Kept again under its key: counted once, nothing else making room for it.
-        t.keep(key(3), bands.clone(), half);
+        t.keep(key(3), bands.clone(), half, crate::address::Reach::Local);
         assert!(t.used(&key(1)).is_some() && t.used(&key(3)).is_some());
         assert_eq!((t.samples, t.order.len()), (2 * half, 2));
         forget_file_in(&mut t, "https://x.org/a.tif");
@@ -2260,9 +2275,13 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         with_info(url, Box::new(move |r| tx.send(r).unwrap()));
         drain();
-        let info = rx.recv().unwrap().unwrap();
+        assert!(rx.recv().unwrap().is_ok());
         assert!(info_landed(url).is_some());
         let tile_url = "https://cog-reach-change.example/tile.tif";
+        let (tx, rx) = std::sync::mpsc::channel();
+        with_info(tile_url, Box::new(move |r| tx.send(r).unwrap()));
+        drain();
+        let info = rx.recv().unwrap().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         get_tile(info.clone(), tile_url.into(), 0, 0, Box::new(move |r| tx.send(r).unwrap()));
         assert!(!held.lock().unwrap().is_empty());
@@ -2286,5 +2305,52 @@ mod tests {
         forget_file(url);
         forget_file(tile_url);
         forget_file(&anonymous);
+    }
+    #[test]
+    fn every_header_range_retains_its_starting_public_ceiling() {
+        use crate::address::{Origin, Reach};
+        use crate::cache::{Fetched, FetchedDone};
+        let _turn = crate::cache::turn();
+        let file = cog::example(32, 16);
+        let held = Arc::new(Mutex::new(Vec::<(String, Reach, FetchedDone)>::new()));
+        let hold = held.clone();
+        crate::cache::set_fetcher_with_origin(move |url, ceiling, done, _| hold.lock().unwrap().push((url, ceiling, done)));
+        let url = "https://cog-header-ceiling.example/header.tif";
+        crate::cache::restrict_to_public(url);
+        let (tx, rx) = std::sync::mpsc::channel();
+        with_info(url, Box::new(move |r| tx.send(r).unwrap()));
+        let (first, reach, done) = held.lock().unwrap().pop().unwrap();
+        assert_eq!(reach, Reach::Public);
+        crate::cache::allow_named(url);
+        // A short first answer forces a second range while the global setting allows Local.
+        done(Ok(Fetched { bytes: file[..8].to_vec(), origin: Origin::named(&first) }));
+        assert!(!held.lock().unwrap().is_empty());
+        crate::cache::restrict_to_public(url);
+        for _ in 0..100 {
+            let pending = std::mem::take(&mut *held.lock().unwrap());
+            if pending.is_empty() {
+                break;
+            }
+            for (address, reach, done) in pending {
+                assert_eq!(reach, Reach::Public, "{address}");
+                let (a, b) = crate::cache::split_range(&address).1.unwrap();
+                done(Ok(Fetched { bytes: file[a as usize..((b + 1) as usize).min(file.len())].to_vec(), origin: Origin::named(&address) }));
+            }
+        }
+        let info = rx.recv().unwrap().unwrap();
+        assert_eq!(info.reach, Reach::Public);
+        assert!(info_landed(url).is_some());
+        forget_file(url);
+    }
+
+    #[test]
+    fn ready_tiles_keep_the_loading_ceiling_when_a_template_changes() {
+        let _turn = crate::cache::turn();
+        let url = "https://cog-ready-ceiling.example/a.tif";
+        crate::cache::restrict_to_public("https://cog-ready-ceiling.example/{s}.tif");
+        let mut t = Tiles::default();
+        let key = (url.to_string(), 0, 0);
+        t.keep(key.clone(), Arc::new(cog::Tile::default()), 0, crate::address::Reach::Local);
+        assert!(t.used(&key).is_none(), "a late Local completion cannot be relabelled Public");
     }
 }
