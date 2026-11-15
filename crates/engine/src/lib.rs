@@ -676,6 +676,8 @@ struct PutAside {
 pub struct Session {
     pub(crate) boxes: box_edit::Cache,
     policy: policy::State,
+    /// Trusted transport provenance for exact assets selected by the native UI, never serialized.
+    pub(crate) document_assets: std::collections::BTreeMap<(String, String), crate::render::rustgis_tiles::address::Origin>,
     pub project: Project,
     pub path: Option<PathBuf>,
     /// What was run in this session (#797), whatever project was open: kept in memory only, so
@@ -1235,6 +1237,7 @@ impl Session {
             keep_tool: false,
             active_layout: None,
             policy: Default::default(),
+            document_assets: Default::default(),
             trusted_tasks: Default::default(),
             task_running: false,
             trusted_models: Default::default(),

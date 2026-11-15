@@ -533,7 +533,10 @@ mod tests {
         let _turn = crate::cache::turn();
         let file = "test://past-last-band.tif";
         let info = info_of(example_with(&Example { size: 64, tile: 16, ..Example::default() }));
-        super::super::infos().lock().unwrap().insert(file.to_string(), super::super::State::Ready(Arc::new(info)));
+        super::super::infos()
+            .lock()
+            .unwrap()
+            .insert(file.to_string(), super::super::State::Ready(Arc::new(info), crate::cache::ceiling_for(file)));
         let e = window(file, 0, (0, 16), (0, 16), &[usize::MAX], ColorHint::Gray).unwrap_err();
         assert_eq!(e, format!("the GeoTIFF has 1 bands, not {}", usize::MAX));
     }

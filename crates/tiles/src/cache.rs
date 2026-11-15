@@ -374,9 +374,31 @@ impl PublicTemplate {
 
 fn split_url_parts(url: &str) -> Option<(String, &str, &str)> {
     let (scheme, rest) = url.split_once("://")?;
-    let sep = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let mut depth = 0usize;
+    let mut sep = rest.len();
+    for (at, ch) in rest.char_indices() {
+        match ch {
+            '{' => depth = depth.saturating_add(1),
+            '}' => depth = depth.saturating_sub(1),
+            '/' | '?' | '#' if depth == 0 => {
+                sep = at;
+                break;
+            }
+            _ => {}
+        }
+    }
     let authority = &rest[..sep];
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let mut depth = 0usize;
+    let mut host_at = 0usize;
+    for (at, ch) in authority.char_indices() {
+        match ch {
+            '{' => depth = depth.saturating_add(1),
+            '}' => depth = depth.saturating_sub(1),
+            '@' if depth == 0 => host_at = at + 1,
+            _ => {}
+        }
+    }
+    let authority = &authority[host_at..];
     if authority.is_empty() {
         return None;
     }
@@ -3100,7 +3122,7 @@ mod native {
                 super::with_progress(progress, || {
                     let _scope = capture.enter();
                     let r = super::check_current().map_err(Failure::from).and_then(|_| {
-                        get_fetched_omitting(&public_agent(timeout), &url, omit).map(|mut f| {
+                        fetch_answer(&public_agent(timeout), &url, Reach::Public, true, omit).map(|mut f| {
                             f.origin = f.origin.narrow_reach(Reach::Public);
                             f
                         })
@@ -4330,7 +4352,10 @@ mod tests {
         let url = download_address("http://localhost:9/picture.png", 1024);
         native::download_public_within(url, std::time::Duration::from_secs(5), &[], Box::new(move |r| drop(tx.send(r))));
         let err = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap().unwrap_err().message;
-        assert!(err.contains("resolves to this computer or the local network"), "{err}");
+        assert!(
+            err.contains("resolves to this computer or the local network") || err.contains("can't point into the local network"),
+            "{err}"
+        );
     }
 
     /// A public download asked for by a request that has since ended sends nothing, as any
@@ -7161,5 +7186,14 @@ mod tests {
         let agent = native::fixture_agent(listener, listener, false);
         let fetched = native::post_fetched_with(&agent, "http://internal.example/search", "{}", crate::address::Reach::Local).unwrap();
         assert_eq!(fetched.origin.reach(), crate::address::Reach::Local);
+    }
+    #[test]
+    fn switch_delimiters_do_not_split_a_restricted_template_authority() {
+        let _turn = turn();
+        let template = "http://{switch:127.0.0.1,unused/}/{z}/{x}/{y}.png";
+        restrict_to_public(template);
+        let tile = crate::template::expand(template, crate::template::TileId { z: 0, x: 0, y: 0 }, 256, false, &[]);
+        assert_eq!(ceiling_for(&tile), crate::address::Reach::Public);
+        assert!(matches!(get_tile(&tile, Want::Image), State::Failed(_)));
     }
 }

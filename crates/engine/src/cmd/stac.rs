@@ -129,14 +129,26 @@ pub(super) fn collections(s: &mut Session, p: &Value) -> CmdResult {
         } else {
             stac::collections_url(&api)
         };
-        let bytes = crate::render::rustgis_tiles::cache::download_blocking(&url)?;
-        collections_json(&api, &bytes)
+        let fetched = crate::render::rustgis_tiles::cache::download_blocking_with_origin(&url)?;
+        collections_json_from_origin(s, &api, &fetched.bytes, &fetched.origin)
     }
 }
 
-pub(super) fn collections_json(api: &str, bytes: &[u8]) -> CmdResult {
+pub(super) fn collections_json(s: &mut Session, api: &str, bytes: &[u8]) -> CmdResult {
+    collections_json_from_origin(s, api, bytes, &crate::render::rustgis_tiles::address::Origin::named(api))
+}
+
+fn collections_json_from_origin(
+    s: &mut Session,
+    api: &str,
+    bytes: &[u8],
+    origin: &crate::render::rustgis_tiles::address::Origin,
+) -> CmdResult {
     if stac::catalog::is_static(api) {
-        let c = stac::catalog::parse_children(bytes, api)?;
+        let (c, refused) = stac::catalog::parse_children_noted(bytes, origin)?;
+        if refused > 0 {
+            s.warn(format!("{refused} catalog links were refused by the document's network reach"));
+        }
         return Ok(
             json!({"count": c.len(), "static": true, "collections": c.iter().map(|c| json!({"id": c.url, "title": c.title})).collect::<Vec<_>>()}),
         );
@@ -288,10 +300,14 @@ fn search_static(s: &mut Session, p: &Value, root: &str) -> CmdResult {
         let walk = stac::catalog::walk_blocking(root, filter, search.limit);
         let complete = walk.complete();
         let (read, failed) = (walk.reads, walk.failed);
+        let refused = walk.refused();
+        if refused > 0 {
+            s.warn(format!("{refused} catalog links were refused by the document's network reach"));
+        }
         let items = walk.into_items();
         let all = b(p, "properties").unwrap_or(false);
         let mut out = json!({"count": items.len(), "items": items.iter().map(|i| stac::item_json_with(i, all)).collect::<Vec<_>>(),
-            "complete": complete, "read": read, "failed": failed});
+            "complete": complete, "read": read, "failed": failed, "refused": refused});
         if let Some(n) = note {
             out["note"] = json!(n);
         }

@@ -3815,6 +3815,39 @@ pub fn request_origin(p: &Value) -> Result<(Option<&str>, bool), String> {
     Ok((origin, public))
 }
 
+/// Selects observed provenance registered by native UI code for this exact asset and document.
+/// JSON alone cannot grant that provenance; unregistered requests keep the conservative parser.
+pub fn request_origin_for<'a>(s: &Session, p: &'a Value) -> Result<(Option<&'a str>, bool), String> {
+    let parsed = request_origin(p)?;
+    let Some(from) = p.get("from").and_then(Value::as_str).map(str::trim) else { return Ok(parsed) };
+    let Some(url) = p.get("url").and_then(Value::as_str) else { return Ok(parsed) };
+    let key = (crate::render::rustgis_tiles::logins::inner(url.trim()).to_string(), from.to_string());
+    let Some(origin) = s.document_assets.get(&key) else { return Ok(parsed) };
+    origin.check(url)?;
+    Ok((
+        Some(from),
+        origin.reach() == crate::render::rustgis_tiles::address::Reach::Public
+            || p.get("fromDocument").and_then(Value::as_bool) == Some(true),
+    ))
+}
+
+impl Session {
+    /// Records an exact asset's transport-observed provenance from trusted native UI dispatch.
+    /// Non-user ingress cannot populate this runtime-only table, and a full table fails closed.
+    pub fn remember_document_asset(&mut self, url: &str, origin: crate::render::rustgis_tiles::address::Origin) -> Result<(), String> {
+        if !self.policy_user() {
+            return Err("only native UI dispatch records document provenance".into());
+        }
+        origin.check(url)?;
+        let key = (crate::render::rustgis_tiles::logins::inner(url.trim()).to_string(), origin.url().to_string());
+        if self.document_assets.len() >= 16_384 && !self.document_assets.contains_key(&key) {
+            return Err("too many document assets are open in this session".into());
+        }
+        self.document_assets.insert(key, origin);
+        Ok(())
+    }
+}
+
 /// Network reach ceiling implied by `(origin, public)` from [`request_origin`].
 pub fn origin_ceiling(origin: Option<&str>, public: bool) -> crate::render::rustgis_tiles::address::Reach {
     use crate::render::rustgis_tiles::{address, logins};
@@ -3849,7 +3882,7 @@ pub fn mark_url_reach(url: &str, origin: Option<&str>, public: bool) {
 }
 
 fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
-    let (origin, public) = request_origin(p)?;
+    let (origin, public) = request_origin_for(s, p)?;
     if (origin.is_some() || public)
         && let Some(raw) = ps(p, "url").map(str::trim).filter(|u| !u.is_empty())
     {
@@ -3858,7 +3891,7 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
     }
     let bound = crate::service_logins::request_params(s, p)?;
     let p = bound.as_ref();
-    let (origin, public) = request_origin(p).map_err(|e| e.to_string()).map(|(o, pub_)| (o.or(origin), pub_ || public))?;
+    let (origin, public) = request_origin_for(s, p).map_err(|e| e.to_string()).map(|(o, pub_)| (o.or(origin), pub_ || public))?;
     if !s.import_completion(p) {
         no_geolibre_state(p)?;
     }
@@ -6229,5 +6262,23 @@ mod tests {
         let (origin, public) = super::request_origin(&params).unwrap();
         assert!(public);
         assert_eq!(super::origin_ceiling(origin, public), crate::render::rustgis_tiles::address::Reach::Public);
+    }
+    #[test]
+    fn observed_local_asset_reach_cannot_be_granted_by_json() {
+        use crate::render::rustgis_tiles::address::{Origin, Reach};
+        let mut s = Session::new(crate::Project::default());
+        let from = "https://catalog.corp.example/item.json";
+        let asset = "http://10.0.0.5/scene.geojson";
+        let p = json!({"url":asset,"from":from,"fromDocument":false});
+        assert!(super::request_origin_for(&s, &p).unwrap().1);
+        let origin = Origin::connected(from, "10.0.0.5".parse().unwrap()).unwrap();
+        s.remember_document_asset(asset, origin).unwrap();
+        let (origin, public) = super::request_origin_for(&s, &p).unwrap();
+        assert!(!public);
+        assert_eq!(super::origin_ceiling(origin, public), Reach::Local);
+        let other = json!({"url":"http://10.0.0.6/other.geojson","from":from,"fromDocument":false});
+        assert!(super::request_origin_for(&s, &other).unwrap().1);
+        let public = json!({"url":asset,"from":from,"fromDocument":true});
+        assert!(super::request_origin_for(&s, &public).unwrap().1);
     }
 }

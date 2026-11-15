@@ -380,12 +380,17 @@ fn want_thumbs(app: &mut RustGisApp) {
     if st.thumbs.len() > MAX_THUMBS {
         st.thumbs.clear();
     }
+    let mut refused = 0usize;
     for item in st.items.iter().take(MAX_THUMBS / 2) {
         let Some(a) = item.thumbnail() else { continue };
         if st.thumbs.contains_key(&a.href) {
             continue;
         }
-        let ok = !stac::needs_signing(&a.href) && item.check_href(&a.href).is_ok();
+        let allowed = item.check_href(&a.href).is_ok();
+        if !allowed {
+            refused += 1;
+        }
+        let ok = !stac::needs_signing(&a.href) && allowed;
         let address = if ok {
             use rustgis_engine::render::rustgis_tiles::logins;
             if logins::origin(&base).is_some_and(|origin| logins::origin(&a.href).as_deref() == Some(origin.as_str())) {
@@ -409,6 +414,9 @@ fn want_thumbs(app: &mut RustGisApp) {
             Thumb::Loading(slot)
         });
         st.thumbs.insert(a.href.clone(), picture.unwrap_or(Thumb::Failed));
+    }
+    if refused > 0 {
+        session.notify(i18n::fmt("{n} preview links were refused by the document's network reach", &[("n", &refused.to_string())]), false);
     }
 }
 
@@ -505,9 +513,15 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             }
         }
         Asked::Link(url) => landed_link(app, &url, r),
-        Asked::Children(url) => match r.and_then(|f| Ok((f.origin.reach(), catalog::parse_children_from_origin(&f.bytes, &f.origin)?))) {
+        Asked::Children(url) => match r.and_then(|f| Ok((f.origin.reach(), catalog::parse_children_noted(&f.bytes, &f.origin)?))) {
             // A search's count (or a walk's progress), landed first, is kept.
-            Ok((reach, c)) if st.walk.is_some() || (st.counted && !st.items.is_empty()) => {
+            Ok((reach, (c, refused))) if st.walk.is_some() || (st.counted && !st.items.is_empty()) => {
+                if refused > 0 {
+                    app.session.notify(
+                        i18n::fmt("{n} catalog links were refused by the document's network reach", &[("n", &refused.to_string())]),
+                        false,
+                    );
+                }
                 st.node_reach = Some(reach);
                 st.info = previous;
                 st.children = c;
@@ -515,7 +529,13 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                     st.listed = url.clone();
                 }
             }
-            Ok((reach, c)) => {
+            Ok((reach, (c, refused))) => {
+                if refused > 0 {
+                    app.session.notify(
+                        i18n::fmt("{n} catalog links were refused by the document's network reach", &[("n", &refused.to_string())]),
+                        false,
+                    );
+                }
                 st.node_reach = Some(reach);
                 st.info = Some(if c.is_empty() {
                     tl!("No catalogs below this one: Find Items lists its items").to_string()
@@ -571,10 +591,18 @@ fn poll_walk(app: &mut RustGisApp, ctx: &egui::Context) {
         app.ui.stac.walk = Some((walk, fetching));
         return;
     }
+    if walk.refused() > 0 {
+        app.session.notify(
+            i18n::fmt("{n} catalog links were refused by the document's network reach", &[("n", &walk.refused().to_string())]),
+            false,
+        );
+    }
     let st = &mut app.ui.stac;
     let n = walk.items().len().to_string();
     st.info = Some(if walk.complete() {
         i18n::fmt("Showing {n} items", &[("n", &n)])
+    } else if walk.refused() > 0 {
+        i18n::fmt("Showing {n} items ({f} catalog links were refused)", &[("n", &n), ("f", &walk.refused().to_string())])
     } else if walk.reads >= catalog::MAX_READS {
         i18n::fmt(
             "Showing {n} items (stopped after reading {r} documents: pick a catalog further down)",
@@ -726,7 +754,11 @@ fn add_url_from(app: &mut RustGisApp, href: &str, name: &str, connection: Option
     if let Some(connection) = connection {
         p["connection"] = json!(connection);
     }
-    if let Err(e) = app.run("ui.addUrl", p) {
+    let reach = if public { Reach::Public } else { Reach::Local };
+    let result = Origin::with_observed_reach(from, reach)
+        .and_then(|origin| app.session.remember_document_asset(href, origin))
+        .and_then(|()| app.run("ui.addUrl", p));
+    if let Err(e) = result {
         app.ui.stac.error = Some(e);
     }
 }
@@ -3017,5 +3049,67 @@ mod tests {
         let said = app.ui.stac.info.as_deref().unwrap();
         assert!(said.contains("next page link was refused"), "{said}");
         assert!(!said.contains("more match") && !said.contains("narrow the search"), "{said}");
+    }
+    #[test]
+    fn observed_local_hostname_assets_reach_the_downloader() {
+        let _turn = crate::fetching::turn();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+            log.lock().unwrap().push((url, ceiling));
+            done(Err("fixture stops after admission".into()));
+        });
+        let mut app = RustGisApp::with_sample();
+        let raw = json!({"type":"Feature","id":"intranet","geometry":null,"properties":{},"assets":{
+            "data":{"href":"http://10.0.0.5/scene.geojson","type":"application/geo+json","roles":["data"]}
+        }});
+        let origin = Origin::connected("https://catalog.corp.example/item.json", "10.0.0.5".parse().unwrap()).unwrap();
+        let item = stac::parse_item_from_origin(raw.to_string().as_bytes(), &origin).unwrap();
+        add_item_asset(&mut app, &item, None);
+        assert!(app.ui.stac.error.is_none(), "{:?}", app.ui.stac.error);
+        assert!(seen.lock().unwrap().iter().any(|(url, reach)| url.contains("10.0.0.5/scene.geojson") && *reach == Reach::Local));
+    }
+    #[test]
+    fn catalog_child_notices_count_refusals_and_stay_quiet_for_clean_documents() {
+        let mut app = RustGisApp::with_sample();
+        let ctx = egui::Context::default();
+        for (href, refused) in [("http://10.0.0.5/catalog.json", true), ("https://public.example/child.json", false)] {
+            let body = json!({"type":"Catalog","id":"test","links":[{"rel":"child","href":href}]});
+            let answer = Slot::new(std::sync::Mutex::new(Some(Ok(cache::Fetched {
+                bytes: body.to_string().into_bytes(),
+                origin: Origin::named("https://public.example/catalog.json"),
+            }))));
+            let mark = app.session.notice_mark();
+            app.ui.stac.waiting = Some((Asked::Children("https://public.example/catalog.json".into()), answer));
+            poll(&mut app, &ctx);
+            let notices = app.session.notices_since(mark);
+            assert_eq!(notices.len(), usize::from(refused));
+            if refused {
+                assert!(notices[0].text.contains("1 catalog links were refused"));
+            }
+        }
+    }
+
+    #[test]
+    fn preview_notices_report_refused_links_once_and_allow_local_documents() {
+        let _turn = crate::fetching::turn();
+        cache::set_fetcher(|_, done| done(Err("fixture stops after admission".into())));
+        for (from, refused) in [("https://public.example/item.json", true), ("http://localhost/item.json", false)] {
+            let mut app = RustGisApp::with_sample();
+            let body = json!({"type":"Feature","id":"test","properties":{},"assets":{
+                "thumbnail":{"href":"http://10.0.0.5/preview.png","type":"image/png","roles":["thumbnail"]}
+            }});
+            app.ui.stac.items = vec![stac::parse_item_from_origin(body.to_string().as_bytes(), &Origin::named(from)).unwrap()];
+            let mark = app.session.notice_mark();
+            want_thumbs(&mut app);
+            let notices = app.session.notices_since(mark);
+            assert_eq!(notices.len(), usize::from(refused));
+            if refused {
+                assert!(notices[0].text.contains("1 preview links were refused"));
+            }
+            let mark = app.session.notice_mark();
+            want_thumbs(&mut app);
+            assert!(app.session.notices_since(mark).is_empty());
+        }
     }
 }

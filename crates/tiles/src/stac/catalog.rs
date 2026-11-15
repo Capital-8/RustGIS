@@ -62,19 +62,34 @@ pub fn parse_children(bytes: &[u8], from: &str) -> Result<Vec<Child>, String> {
 
 /// Like [`parse_children`], carrying the observed post-redirect [`crate::address::Origin`] and reach.
 pub fn parse_children_from_origin(bytes: &[u8], origin: &crate::address::Origin) -> Result<Vec<Child>, String> {
+    parse_children_noted(bytes, origin).map(|(children, _)| children)
+}
+
+/// Lists children with a count of unique web links refused by the document's observed reach.
+pub fn parse_children_noted(bytes: &[u8], origin: &crate::address::Origin) -> Result<(Vec<Child>, usize), String> {
     let v = super::json(bytes)?;
     if !v.is_object() || !matches!(v.get("type").and_then(Value::as_str), Some("Catalog" | "Collection")) {
         return Err("the answer isn't a STAC catalog or collection".into());
     }
     let mut seen = HashSet::new();
+    let mut refused = HashSet::new();
     let mut out: Vec<Child> = links(&v, "child", origin.url())
         .into_iter()
-        .filter(|(url, _)| is_web(url) && origin.check(url).is_ok() && seen.insert(url.clone()))
+        .filter(|(url, _)| {
+            if !is_web(url) {
+                return false;
+            }
+            if origin.check(url).is_err() {
+                refused.insert(url.clone());
+                return false;
+            }
+            seen.insert(url.clone())
+        })
         .take(MAX_CHILDREN)
         .map(|(url, title)| Child { title: if title.is_empty() { label_of(&url) } else { title }, url })
         .collect();
     out.sort_by_key(|c| c.title.to_lowercase());
-    Ok(out)
+    Ok((out, refused.len()))
 }
 
 /// The items (`item` links) of a catalog's or collection's document fetched from `from`: web
@@ -280,6 +295,7 @@ pub struct Walk {
     asked: Vec<(String, usize, bool)>,
     /// Observed network reach of the root document once it lands.
     root_reach: Option<crate::address::Reach>,
+    refused: HashSet<String>,
     filter: Filter,
     limit: usize,
     found: Vec<Item>,
@@ -300,6 +316,7 @@ impl Walk {
             visited: HashSet::new(),
             asked: Vec::new(),
             root_reach: None,
+            refused: HashSet::new(),
             filter,
             limit: limit.clamp(1, super::MAX_ITEMS),
             found: Vec::new(),
@@ -346,7 +363,12 @@ impl Walk {
 
     /// Whether everything below the start was read (so the items are all that match).
     pub fn complete(&self) -> bool {
-        self.finished() && self.items.is_empty() && self.folders.is_empty() && !self.cut && self.failed == 0
+        self.finished() && self.items.is_empty() && self.folders.is_empty() && !self.cut && self.failed == 0 && self.refused.is_empty()
+    }
+
+    /// Number of distinct document links refused by their supplying origin's reach.
+    pub fn refused(&self) -> usize {
+        self.refused.len()
     }
 
     /// The items found.
@@ -404,7 +426,11 @@ impl Walk {
                     self.cut |= too_many(&v, rel);
                     for (u, _) in links(&v, rel, from) {
                         // A document on the web can't send the walk into the local network.
-                        if !is_web(&u) || self.visited.contains(&u) || origin.check(&u).is_err() {
+                        if !is_web(&u) || self.visited.contains(&u) {
+                            continue;
+                        }
+                        if origin.check(&u).is_err() {
+                            self.refused.insert(u);
                             continue;
                         }
                         if self.items.len() + self.folders.len() >= MAX_QUEUE {
@@ -771,5 +797,33 @@ mod tests {
         let boxed = Filter::from_search(&Search { bbox: Some([5.0, 5.0, 6.0, 6.0]), ..Default::default() }, None).unwrap();
         assert!(boxed.shape.is_none() && !boxed.keeps(&a, None));
         assert!(Filter::from_search(&at(500.0, 0.0), None).is_ok(), "a shape off the globe is refused when it is sent, not here");
+    }
+    #[test]
+    fn refused_children_are_counted_and_make_a_walk_incomplete() {
+        let body = json!({"type":"Catalog","id":"test","links":[
+            {"rel":"child","href":"http://10.0.0.5/catalog.json"},
+            {"rel":"child","href":"http://10.0.0.5/catalog.json"},
+            {"rel":"item","href":"http://127.0.0.1/item.json"}
+        ]})
+        .to_string()
+        .into_bytes();
+        let origin = crate::address::Origin::named("https://public.example/catalog.json");
+        let (children, refused) = parse_children_noted(&body, &origin).unwrap();
+        assert!(children.is_empty());
+        assert_eq!(refused, 1);
+        let mut walk = Walk::new(origin.url(), Filter::default(), 50);
+        let url = walk.next_url().unwrap();
+        walk.land_fetched(&url, Ok(crate::cache::Fetched { bytes: body, origin }));
+        assert!(walk.finished());
+        assert!(!walk.complete());
+        assert_eq!(walk.refused(), 2);
+        let clean = br#"{"type":"Catalog","id":"empty","links":[]}"#;
+        let origin = crate::address::Origin::named("https://public.example/empty.json");
+        assert_eq!(parse_children_noted(clean, &origin).unwrap().1, 0);
+        let mut walk = Walk::new(origin.url(), Filter::default(), 50);
+        let url = walk.next_url().unwrap();
+        walk.land(&url, Ok(clean.to_vec()));
+        assert!(walk.complete());
+        assert_eq!(walk.refused(), 0);
     }
 }
