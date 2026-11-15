@@ -514,34 +514,34 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
         }
         Asked::Link(url) => landed_link(app, &url, r),
         Asked::Children(url) => match r.and_then(|f| Ok((f.origin.reach(), catalog::parse_children_noted(&f.bytes, &f.origin)?))) {
-            // A search's count (or a walk's progress), landed first, is kept.
-            Ok((reach, (c, refused))) if st.walk.is_some() || (st.counted && !st.items.is_empty()) => {
-                if refused > 0 {
+            Ok((reach, listing)) => {
+                if listing.refused > 0 {
                     app.session.notify(
-                        i18n::fmt("{n} catalog links were refused by the document's network reach", &[("n", &refused.to_string())]),
+                        i18n::fmt("{n} catalog links were refused by the document's network reach", &[("n", &listing.refused.to_string())]),
                         false,
                     );
                 }
-                st.node_reach = Some(reach);
-                st.info = previous;
-                st.children = c;
-                if url == st.api.trim() {
-                    st.listed = url.clone();
-                }
-            }
-            Ok((reach, (c, refused))) => {
-                if refused > 0 {
+                if listing.omitted > 0 {
                     app.session.notify(
-                        i18n::fmt("{n} catalog links were refused by the document's network reach", &[("n", &refused.to_string())]),
+                        i18n::fmt(
+                            "{n} catalog links were left out because the listing limit was reached",
+                            &[("n", &listing.omitted.to_string())],
+                        ),
                         false,
                     );
                 }
+                let c = listing.links;
                 st.node_reach = Some(reach);
-                st.info = Some(if c.is_empty() {
-                    tl!("No catalogs below this one: Find Items lists its items").to_string()
+                // A search's count (or a walk's progress), landed first, is kept.
+                st.info = if st.walk.is_some() || (st.counted && !st.items.is_empty()) {
+                    previous
                 } else {
-                    i18n::fmt("{n} catalogs and collections", &[("n", &c.len().to_string())])
-                });
+                    Some(if c.is_empty() {
+                        tl!("No catalogs below this one: Find Items lists its items").to_string()
+                    } else {
+                        i18n::fmt("{n} catalogs and collections", &[("n", &c.len().to_string())])
+                    })
+                };
                 st.children = c;
                 if url == st.api.trim() {
                     st.listed = url.clone();
@@ -3111,5 +3111,23 @@ mod tests {
             want_thumbs(&mut app);
             assert!(app.session.notices_since(mark).is_empty());
         }
+    }
+    #[test]
+    fn partial_catalog_children_remain_visible_with_counted_limit_and_reach_notices() {
+        let mut app = RustGisApp::with_sample();
+        let mut links: Vec<_> = (0..2001).map(|i| json!({"rel":"child","href":format!("https://public.example/{i}.json")})).collect();
+        links.push(json!({"rel":"child","href":"http://10.0.0.5/private.json"}));
+        let text = json!({"type":"Catalog","id":"test","links":links}).to_string();
+        let from = "https://public.example/catalog.json";
+        let answer = Slot::new(std::sync::Mutex::new(Some(Ok(cache::Fetched { bytes: text.into_bytes(), origin: Origin::named(from) }))));
+        app.ui.stac.waiting = Some((Asked::Children(from.into()), answer));
+        let mark = app.session.notice_mark();
+        poll(&mut app, &egui::Context::default());
+        assert!(app.ui.stac.error.is_none());
+        assert_eq!(app.ui.stac.children.len(), 2000);
+        let notices = app.session.notices_since(mark);
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().any(|n| n.text.contains("1 catalog links were refused")));
+        assert!(notices.iter().any(|n| n.text.contains("1 catalog links were left out")));
     }
 }

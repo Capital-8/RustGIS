@@ -145,13 +145,19 @@ fn collections_json_from_origin(
     origin: &crate::render::rustgis_tiles::address::Origin,
 ) -> CmdResult {
     if stac::catalog::is_static(api) {
-        let (c, refused) = stac::catalog::parse_children_noted(bytes, origin)?;
-        if refused > 0 {
-            s.warn(format!("{refused} catalog links were refused by the document's network reach"));
+        let listing = stac::catalog::parse_children_noted(bytes, origin)?;
+        if listing.refused > 0 {
+            s.warn(format!("{} catalog links were refused by the document's network reach", listing.refused));
         }
-        return Ok(
-            json!({"count": c.len(), "static": true, "collections": c.iter().map(|c| json!({"id": c.url, "title": c.title})).collect::<Vec<_>>()}),
-        );
+        if listing.omitted > 0 {
+            s.warn(format!("{} catalog links were left out because the listing limit was reached", listing.omitted));
+        }
+        let c = listing.links;
+        let mut out = json!({"count": c.len(), "static": true, "collections": c.iter().map(|c| json!({"id": c.url, "title": c.title})).collect::<Vec<_>>()});
+        if listing.refused > 0 || listing.omitted > 0 {
+            out["truncated"] = json!(true);
+        }
+        return Ok(out);
     }
     let c = stac::parse_collections(bytes)?;
     Ok(json!({"count": c.len(), "collections": c.iter().map(|c| json!({"id": c.id, "title": c.title})).collect::<Vec<_>>()}))
@@ -1532,5 +1538,29 @@ mod deferred_asset_tests {
         assert_eq!(layer.connection, connection);
         assert_eq!(layer.name, "Downloaded asset");
         assert_eq!(layer.dataset.features.len(), 1);
+    }
+    #[test]
+    fn partial_collection_listings_report_omissions_and_duplicates_stay_quiet() {
+        let api = "https://public.example/catalog.json";
+        let mut session = Session::new(crate::Project::default());
+        for (count, refused) in [(1999, false), (2001, true)] {
+            let mut links: Vec<Value> =
+                (0..count).map(|i| json!({"rel":"child","href":format!("https://public.example/{i}.json")})).collect();
+            links.extend([links[0].clone(), links[1].clone()]);
+            if refused {
+                links.push(json!({"rel":"child","href":"http://10.0.0.5/private.json"}));
+            }
+            let text = json!({"type":"Catalog","id":"test","links":links}).to_string();
+            let mark = session.notice_mark();
+            let result = collections_json(&mut session, api, text.as_bytes()).unwrap();
+            assert_eq!(result["count"], count.min(2000));
+            assert_eq!(result.get("truncated").and_then(Value::as_bool).unwrap_or(false), refused);
+            let notices = session.notices_since(mark);
+            assert_eq!(notices.len(), if refused { 2 } else { 0 });
+            if refused {
+                assert!(notices.iter().any(|n| n.text.contains("1 catalog links were refused")));
+                assert!(notices.iter().any(|n| n.text.contains("1 catalog links were left out")));
+            }
+        }
     }
 }

@@ -1095,6 +1095,19 @@ fn fetch_all_with(get: GetTile, info: Arc<Info>, url: String, level: usize, want
 
 /// One tile of a level, decoded: from the tiles kept, or read.
 fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn FnOnce(Result<Bands, String>) + Send>) {
+    let ceiling = info.reach.min(crate::cache::ceiling_for(&url));
+    get_tile_at(info, url, level, idx, ceiling, then);
+}
+
+/// A retry can narrow its reader's original ceiling, never reconstruct a wider one.
+fn get_tile_at(
+    info: Arc<Info>,
+    url: String,
+    level: usize,
+    idx: u32,
+    ceiling: crate::address::Reach,
+    then: Box<dyn FnOnce(Result<Bands, String>) + Send>,
+) {
     let then = caller_callback(then);
     if let Err(e) = crate::cache::check_still(&crate::cache::current_still()) {
         then(Err(e));
@@ -1115,7 +1128,7 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
     let nb = info.layout.chunk_bands();
     let per_band = (l.tile_width as usize) * (l.tile_height as usize);
     let samples = per_band * nb;
-    let started_reach = info.reach.min(crate::cache::ceiling_for(&url));
+    let started_reach = ceiling.min(info.reach).min(crate::cache::ceiling_for(&url));
     // A tile the file leaves out (GDAL's sparse files: no bytes) is empty: kept as any other, so
     // a window over it is whole at once rather than asking for it at every draw.
     if len == 0 {
@@ -1158,7 +1171,7 @@ fn get_tile(info: Arc<Info>, url: String, level: usize, idx: u32, then: Box<dyn 
                 if *reach == started_reach {
                     w.push(then);
                 } else {
-                    w.push(crate::cache::caller_retry(Box::new(move |_| get_tile(info, url, level, idx, then))));
+                    w.push(crate::cache::caller_retry(Box::new(move |_| get_tile_at(info, url, level, idx, started_reach, then))));
                 }
                 return;
             }
@@ -2427,16 +2440,29 @@ mod tests {
             assert_eq!(public.reach, Reach::Public);
             assert_eq!(*seen.lock().unwrap(), vec![Reach::Local, Reach::Public]);
             if let Ok(local) = local {
-                let mark = seen.lock().unwrap().len();
-                let (local_tx, local_rx) = std::sync::mpsc::channel();
-                get_tile(local, url.clone(), 0, 0, Box::new(move |r| local_tx.send(r).unwrap()));
-                let (public_tx, public_rx) = std::sync::mpsc::channel();
-                get_tile(public, url.clone(), 0, 0, Box::new(move |r| public_tx.send(r).unwrap()));
-                assert_eq!(held.lock().unwrap().len(), 1, "the incompatible tile waiter waits for its own retry");
-                drain();
-                assert!(local_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().is_ok());
-                assert!(public_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().is_ok());
-                assert_eq!(seen.lock().unwrap().get(mark..).unwrap(), &[Reach::Local, Reach::Public]);
+                for narrowed_local_header in [false, true] {
+                    forget_file(&url);
+                    let mark = seen.lock().unwrap().len();
+                    let (local_tx, local_rx) = std::sync::mpsc::channel();
+                    get_tile(local.clone(), url.clone(), 0, 0, Box::new(move |r| local_tx.send(r).unwrap()));
+                    if narrowed_local_header {
+                        crate::cache::restrict_to_public(&url);
+                    }
+                    let (public_tx, public_rx) = std::sync::mpsc::channel();
+                    get_tile(
+                        if narrowed_local_header { local.clone() } else { public.clone() },
+                        url.clone(),
+                        0,
+                        0,
+                        Box::new(move |r| public_tx.send(r).unwrap()),
+                    );
+                    crate::cache::allow_named(&url);
+                    assert_eq!(held.lock().unwrap().len(), 1, "the incompatible tile waiter waits for its own retry");
+                    drain();
+                    assert!(local_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().is_ok());
+                    assert!(public_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().is_ok());
+                    assert_eq!(seen.lock().unwrap().get(mark..).unwrap(), &[Reach::Local, Reach::Public]);
+                }
             }
             forget_file(&url);
         }

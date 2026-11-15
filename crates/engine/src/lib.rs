@@ -678,6 +678,10 @@ pub struct Session {
     policy: policy::State,
     /// Trusted transport provenance for exact assets selected by the native UI, never serialized.
     pub(crate) document_assets: std::collections::BTreeMap<(String, String), crate::render::rustgis_tiles::address::Origin>,
+    /// Project generation and admitted catalog-node provenance, scoped by connection definition.
+    pub(crate) browse_origins: (u64, std::collections::BTreeMap<(String, String, String), crate::render::rustgis_tiles::address::Origin>),
+    /// A native transport answer scoped over one synchronous connection.browse dispatch.
+    pub(crate) browse_response: Option<(String, String, crate::render::rustgis_tiles::address::Origin)>,
     pub project: Project,
     pub path: Option<PathBuf>,
     /// What was run in this session (#797), whatever project was open: kept in memory only, so
@@ -1238,6 +1242,8 @@ impl Session {
             active_layout: None,
             policy: Default::default(),
             document_assets: Default::default(),
+            browse_origins: Default::default(),
+            browse_response: None,
             trusted_tasks: Default::default(),
             task_running: false,
             trusted_models: Default::default(),

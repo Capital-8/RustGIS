@@ -20,9 +20,9 @@ Formats](data-formats.md).
 | Geotagged photos (JPEG with EXIF GPS): points with their thumbnails | Yes | No |
 | Esri File Geodatabase (`.gdb` folder; 3D multipatches as footprints) | Yes (desktop) | No |
 | Through GDAL: AutoCAD DWG, MapInfo TAB, OpenStreetMap XML, File Geodatabases RustGIS can't read itself… | Yes (desktop, when GDAL is installed) | No |
-| PostgreSQL/PostGIS databases, read live (large tables a view at a time) | Yes (desktop) | No |
-| MySQL and MariaDB databases, read live (large tables a view at a time) | Yes (desktop) | No |
-| SQL Server and Azure SQL databases, read live (large tables a view at a time) | Yes (desktop) | No |
+| PostgreSQL/PostGIS databases, read live (large tables a view at a time) | Yes (desktop and phones) | No |
+| MySQL and MariaDB databases, read live (large tables a view at a time) | Yes (desktop and phones) | No |
+| SQL Server and Azure SQL databases, read live (large tables a view at a time) | Yes (desktop and phones) | No |
 | DuckDB databases (`.duckdb`, `.ddb`) and SQL queries | Yes (desktop, when DuckDB is installed) | No |
 | GeoTIFF and cloud-optimised GeoTIFF (`.tif`, `.tiff`) | Yes | Yes |
 | ASCII grid (`.asc`, with an optional `.prj`) | Yes | No |
@@ -634,8 +634,16 @@ page of their own: [Web Data](web-data.md).
 layer's addresses into points: a CSV of addresses without coordinates is added as a standalone table, then each row's address
 fields (`"address"`: a field, or several such as street, city and country, joined with commas)
 are looked up, each distinct address once. The result is a new point layer holding every field
-plus `geocoded`, what the geocoder called the place; rows that weren't found stay in its table
-without a point.
+plus `geocoded`, what the geocoder called the place, and a text field `match_status`:
+
+- `matched`: the geocoder returned a usable point for the row's address.
+- `unmatched`: the row has no usable point, including an empty address or a failed lookup.
+
+Rows that weren't found stay in its table without a point, and a notice counts them; filter
+`match_status = 'unmatched'` to review them. A field of the same name in the input is kept, and
+the new one gets an underscore appended (`match_status_`; filter that one then). `matched` means the geocoder returned a point, not that
+it is the exact address: it may be placed along the street or at a broader place. The geocoders
+don't give a match score, so there is none in the output.
 
 The geocoder is OpenStreetMap's public [Nominatim](https://nominatim.org) by default, or
 [Photon](https://photon.komoot.io) (`"provider": "photon"`). Their usage policies allow light

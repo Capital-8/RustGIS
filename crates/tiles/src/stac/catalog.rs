@@ -62,77 +62,66 @@ pub fn parse_children(bytes: &[u8], from: &str) -> Result<Vec<Child>, String> {
 
 /// Like [`parse_children`], carrying the observed post-redirect [`crate::address::Origin`] and reach.
 pub fn parse_children_from_origin(bytes: &[u8], origin: &crate::address::Origin) -> Result<Vec<Child>, String> {
-    parse_children_noted(bytes, origin).map(|(children, _)| children)
+    parse_children_noted(bytes, origin).map(|listing| listing.links)
 }
 
-/// Lists children with a count of unique web links refused by the document's observed reach.
-pub fn parse_children_noted(bytes: &[u8], origin: &crate::address::Origin) -> Result<(Vec<Child>, usize), String> {
-    let v = super::json(bytes)?;
-    if !v.is_object() || !matches!(v.get("type").and_then(Value::as_str), Some("Catalog" | "Collection")) {
-        return Err("the answer isn't a STAC catalog or collection".into());
-    }
-    check_listing_size(&v, "child")?;
-    let mut seen = HashSet::new();
-    let mut refused = HashSet::new();
-    let mut out: Vec<Child> = links(&v, "child", origin.url())
-        .into_iter()
-        .filter(|(url, _)| {
-            if !is_web(url) {
-                return false;
-            }
-            if origin.check(url).is_err() {
-                refused.insert(url.clone());
-                return false;
-            }
-            seen.insert(url.clone())
-        })
-        .map(|(url, title)| Child { title: if title.is_empty() { label_of(&url) } else { title }, url })
-        .collect();
-    out.sort_by_key(|c| c.title.to_lowercase());
-    Ok((out, refused.len()))
+/// A bounded link listing and the counted reasons it is incomplete.
+#[derive(Debug, Default)]
+pub struct LinkListing {
+    /// Unique accepted web links retained for display.
+    pub links: Vec<Child>,
+    /// Unique links inspected but refused by the document's network reach.
+    pub refused: usize,
+    /// Accepted links beyond the output cap, plus raw links beyond the inspection cap.
+    pub omitted: usize,
+}
+
+/// Lists children, reporting refused links and omissions without discarding usable children.
+pub fn parse_children_noted(bytes: &[u8], origin: &crate::address::Origin) -> Result<LinkListing, String> {
+    let mut listing = parse_links_noted(bytes, origin, "child")?;
+    listing.links.sort_by_key(|c| c.title.to_lowercase());
+    Ok(listing)
 }
 
 /// The items (`item` links) of a catalog's or collection's document fetched from `from`: web
 /// addresses only, in the order the document gives them.
 pub fn parse_item_links(bytes: &[u8], from: &str) -> Result<Vec<Child>, String> {
-    parse_item_links_noted(bytes, &crate::address::Origin::named(from)).map(|(items, _)| items)
+    parse_item_links_noted(bytes, &crate::address::Origin::named(from)).map(|listing| listing.links)
 }
 
-/// Lists item links with a count of unique web links refused by their document's observed reach.
-pub fn parse_item_links_noted(bytes: &[u8], origin: &crate::address::Origin) -> Result<(Vec<Child>, usize), String> {
+/// Lists items, reporting refused links and omissions without discarding usable items.
+pub fn parse_item_links_noted(bytes: &[u8], origin: &crate::address::Origin) -> Result<LinkListing, String> {
+    parse_links_noted(bytes, origin, "item")
+}
+
+/// Inspects bounded input, counts every refusal within that bound, and caps only unique accepted links.
+fn parse_links_noted(bytes: &[u8], origin: &crate::address::Origin, rel: &str) -> Result<LinkListing, String> {
     let v = super::json(bytes)?;
     if !v.is_object() || !matches!(v.get("type").and_then(Value::as_str), Some("Catalog" | "Collection")) {
         return Err("the answer isn't a STAC catalog or collection".into());
     }
-    check_listing_size(&v, "item")?;
+    let mut listing = LinkListing { omitted: of_rel(&v, rel).count().saturating_sub(MAX_LINKS), ..Default::default() };
     let mut seen = HashSet::new();
     let mut refused = HashSet::new();
-    let items = links(&v, "item", origin.url())
-        .into_iter()
-        .filter(|(url, _)| {
-            if !is_web(url) {
-                return false;
-            }
-            if origin.check(url).is_err() {
-                refused.insert(url.clone());
-                return false;
-            }
-            seen.insert(url.clone())
-        })
-        .map(|(url, title)| Child { title: if title.is_empty() { label_of(&url) } else { title }, url })
-        .collect();
-    Ok((items, refused.len()))
-}
-
-/// Refuses an oversized listing before any children are filtered or silently left out.
-fn check_listing_size(v: &Value, rel: &str) -> Result<(), String> {
-    let count = of_rel(v, rel).count();
-    if count > MAX_CHILDREN {
-        return Err(format!(
-            "the catalog lists {count} {rel} links, more than the {MAX_CHILDREN} RustGIS can list; choose a smaller catalog"
-        ));
+    for (url, title) in links(&v, rel, origin.url()) {
+        if !is_web(&url) {
+            continue;
+        }
+        if origin.check(&url).is_err() {
+            refused.insert(url);
+            continue;
+        }
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        if listing.links.len() == MAX_CHILDREN {
+            listing.omitted += 1;
+            continue;
+        }
+        listing.links.push(Child { title: if title.is_empty() { label_of(&url) } else { title }, url });
     }
-    Ok(())
+    listing.refused = refused.len();
+    Ok(listing)
 }
 
 /// The links of a relation, resolved against `from`: (address, title), the first
@@ -835,9 +824,9 @@ mod tests {
         .to_string()
         .into_bytes();
         let origin = crate::address::Origin::named("https://public.example/catalog.json");
-        let (children, refused) = parse_children_noted(&body, &origin).unwrap();
-        assert!(children.is_empty());
-        assert_eq!(refused, 1);
+        let listing = parse_children_noted(&body, &origin).unwrap();
+        assert!(listing.links.is_empty());
+        assert_eq!(listing.refused, 1);
         let mut walk = Walk::new(origin.url(), Filter::default(), 50);
         let url = walk.next_url().unwrap();
         walk.land_fetched(&url, Ok(crate::cache::Fetched { bytes: body, origin }));
@@ -846,7 +835,7 @@ mod tests {
         assert_eq!(walk.refused(), 2);
         let clean = br#"{"type":"Catalog","id":"empty","links":[]}"#;
         let origin = crate::address::Origin::named("https://public.example/empty.json");
-        assert_eq!(parse_children_noted(clean, &origin).unwrap().1, 0);
+        assert_eq!(parse_children_noted(clean, &origin).unwrap().refused, 0);
         let mut walk = Walk::new(origin.url(), Filter::default(), 50);
         let url = walk.next_url().unwrap();
         walk.land(&url, Ok(clean.to_vec()));
@@ -854,22 +843,28 @@ mod tests {
         assert_eq!(walk.refused(), 0);
     }
     #[test]
-    fn oversized_listings_are_refused_with_their_count_before_filtering() {
+    fn listing_limits_keep_unique_links_and_count_every_omission() {
         let origin = crate::address::Origin::named("https://public.example/catalog.json");
         let mut children: Vec<Value> =
             (0..MAX_CHILDREN).map(|i| json!({"rel":"child","href":format!("https://public.example/{i}.json")})).collect();
         children.push(json!({"rel":"child","href":"http://10.0.0.5/catalog.json"}));
         let body = json!({"type":"Catalog","id":"large","links":children});
-        let error = parse_children_noted(body.to_string().as_bytes(), &origin).unwrap_err();
-        assert!(error.contains("2001 child links") && error.contains("2000"), "{error}");
-        children.remove(0);
-        let body = json!({"type":"Catalog","id":"bounded","links":children});
-        let (kept, refused) = parse_children_noted(body.to_string().as_bytes(), &origin).unwrap();
-        assert_eq!((kept.len(), refused), (MAX_CHILDREN - 1, 1));
+        let listing = parse_children_noted(body.to_string().as_bytes(), &origin).unwrap();
+        assert_eq!((listing.links.len(), listing.refused, listing.omitted), (MAX_CHILDREN, 1, 0));
+        children.push(json!({"rel":"child","href":"https://public.example/extra.json"}));
+        let body = json!({"type":"Catalog","id":"limited","links":children});
+        let listing = parse_children_noted(body.to_string().as_bytes(), &origin).unwrap();
+        assert_eq!((listing.links.len(), listing.refused, listing.omitted), (MAX_CHILDREN, 1, 1));
+        let mut duplicates: Vec<Value> =
+            (0..MAX_CHILDREN - 1).map(|i| json!({"rel":"child","href":format!("https://public.example/{i}.json")})).collect();
+        duplicates.extend([duplicates[0].clone(), duplicates[1].clone()]);
+        let body = json!({"type":"Catalog","id":"duplicates","links":duplicates});
+        let listing = parse_children_noted(body.to_string().as_bytes(), &origin).unwrap();
+        assert_eq!((listing.links.len(), listing.refused, listing.omitted), (MAX_CHILDREN - 1, 0, 0));
         let items: Vec<Value> =
             (0..MAX_LINKS + 1).map(|i| json!({"rel":"item","href":format!("https://public.example/{i}.json")})).collect();
         let body = json!({"type":"Catalog","id":"items","links":items});
-        let error = parse_item_links(body.to_string().as_bytes(), origin.url()).unwrap_err();
-        assert!(error.contains("5001 item links") && error.contains("2000"), "{error}");
+        let listing = parse_item_links_noted(body.to_string().as_bytes(), &origin).unwrap();
+        assert_eq!((listing.links.len(), listing.refused, listing.omitted), (MAX_CHILDREN, 0, MAX_LINKS + 1 - MAX_CHILDREN));
     }
 }
