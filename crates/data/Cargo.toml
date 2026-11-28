@@ -104,7 +104,7 @@ proptest = { workspace = true }
 # Writing LERC blobs with masks, band sets and padded strips that GDAL never writes.
 lerc-writer = "0.5"
 # Building FlatGeobuf geometries no writer makes (the version flatgeobuf uses).
-flatbuffers = "24.12"
+flatbuffers = "25.12"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Writing Zstandard-compressed GeoTIFFs.
